@@ -706,6 +706,24 @@ class TestTheMChampion:
         assert "'v3meta_stack'" in why
         assert "refuses at registration" in why
 
+    def test_a_magnitude_head_is_never_seated_from_v1(
+        self, v2_root: Path, v1_root: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """`alpha-engine-config-I12121`: the one port of v1's served model is
+        a head fitted to `abs_forward_return`. It resolves and it produces,
+        and the seat is still deferred, naming the arm and its target —
+        seating it would publish |return| as `predicted_alpha`."""
+        name = "v3meta_volatility_head"
+        _file_m(v2_root, name, _m_head(name, M_HEADS[name]) + "  target: abs_forward_return\n")
+        arm_id = _m_ids(v2_root)[name]
+        _produce(v2_root, arm_id)
+        assert main(_argv(v2_root, v1_root)) == 0
+        assert not LocalStore(v2_root).exists(champion_key("m"))
+        result = _printed_result(capsys)
+        assert result["pointers"]["m"] == "deferred"
+        assert arm_id in result["deferred"]["m"]
+        assert "abs_forward_return" in result["deferred"]["m"]
+
     def test_two_unrelated_ports_of_one_model_are_not_resolved_by_guessing(
         self, v2_root: Path, v1_root: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:

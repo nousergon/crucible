@@ -42,10 +42,14 @@ from crucible.serving import (
 from crucible.slots.cycle import MissingArtifactError
 from crucible.slots.inputs import ARM_PREDICTIONS_SCHEMA_VERSION
 from crucible.store import LocalStore
+from tests.support.servable import m_arm_id, seed_m_recipe
 
 DAY = "2026-08-28"
 OTHER_DAY = "2026-08-27"
-ARM = "m:ridge_21d:0123456789ab"
+#: Derived from the recipe `_seat_champion` files, because publishing a feed
+#: reads the champion's recipe and refuses one no recipe declares
+#: (`alpha-engine-config-I12121`).
+ARM = m_arm_id("ridge_21d")
 
 SCHEMA_PATH = (
     pathlib.Path(__file__).resolve().parents[1]
@@ -99,6 +103,8 @@ def store(tmp_path) -> LocalStore:
 
 def _seat_champion(store: LocalStore, pointer: ChampionPointer | None = None) -> ChampionPointer:
     pointer = pointer or _pointer()
+    if pointer.slot == "m":
+        seed_m_recipe(store, "ridge_21d")
     write_champion(store, pointer, expected=read_champion_etag(store, pointer.slot))
     store.put_bytes(pointer.manifest_key, _manifest())
     return pointer

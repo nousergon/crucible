@@ -148,7 +148,7 @@ def _seed_slot_for_promote(store: LocalStore, slot: str) -> None:
     from crucible.slots import get_slot
     from tests.support.manifests import write_grade_manifest
     from tests.support.panels import trading_days
-    from tests.support.servable import seed_arm_predictions
+    from tests.support.servable import m_recipe, seed_arm_predictions
 
     spec = get_slot(slot)
     dates = trading_days(40, FRIDAY)
@@ -160,7 +160,10 @@ def _seed_slot_for_promote(store: LocalStore, slot: str) -> None:
         register, record = register.register(
             slot=slot,
             name=name,
-            spec={"name": name},
+            # An M arm under its recipe's own spec, so `seed_arm_predictions`
+            # files the recipe whose signed target `promote` reads
+            # (`alpha-engine-config-I12121`).
+            spec=m_recipe(name).spec if slot == "m" else {"name": name},
             created_date=dates[0],
             filed_on=dates[0],
         )

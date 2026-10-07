@@ -42,7 +42,7 @@ from crucible.slots import get_slot
 from crucible.slots.model import SERVABLE_AS_OF_PRECONDITION, evaluate_servable_as_of
 from crucible.store import LocalStore
 from tests.support.panels import trading_days
-from tests.support.servable import seed_arm_predictions
+from tests.support.servable import m_recipe, seed_arm_predictions, seed_m_recipe
 
 CODE_SHA = "a" * 40
 SEAT_MANIFEST = "runs/promote/seed/m/run.json"
@@ -55,7 +55,9 @@ def _slot(dates: list[str]) -> tuple[ArmRegister, dict[str, str]]:
         register, record = register.register(
             slot="m",
             name=name,
-            spec={"name": name},
+            # The recipe's own spec, so the id is the one the recipe the
+            # `arena` fixture files derives (`alpha-engine-config-I12121`).
+            spec=m_recipe(name).spec,
             created_date=dates[0],
             filed_on=dates[0],
         )
@@ -115,6 +117,8 @@ def arena(tmp_path):
     store = LocalStore(tmp_path)
     dates = trading_days(40)
     register, ids = _slot(dates)
+    for name in ids:
+        seed_m_recipe(store, name)
     as_of = dates[-1]
     pointer_bytes = _seat_incumbent_and_serve_it(store, ids["champ"], as_of)
     return store, dates, register, ids, as_of, pointer_bytes
