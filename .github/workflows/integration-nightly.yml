@@ -275,5 +275,5 @@ jobs:
     # case it already covered. This workflow's concurrency never cancels a
     # superseded run, so a `cancelled` need here is a timeout or a human.
     if: ${{ always() && (failure() || contains(needs.*.result, 'cancelled')) }}
-    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@ee2330a9eee50368ea6ba6df504d86c63d647f33
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@cf43be1630466f8ec6c6b5c0709931fabeda27ad
     secrets: inherit

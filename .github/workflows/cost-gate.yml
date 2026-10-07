@@ -127,5 +127,5 @@ jobs:
     # was cancelled (superseded, or by a human), and never weaker than the
     # `failure()` arm this job already had.
     if: ${{ always() && github.event_name != 'pull_request' && (failure() || (contains(needs.*.result, 'cancelled') && !cancelled())) }}
-    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@ee2330a9eee50368ea6ba6df504d86c63d647f33
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@cf43be1630466f8ec6c6b5c0709931fabeda27ad
     secrets: inherit
