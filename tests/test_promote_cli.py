@@ -29,7 +29,7 @@ from crucible.promote import (
 from crucible.store import LocalStore
 from tests.support.manifests import write_grade_manifest
 from tests.support.panels import trading_days
-from tests.support.servable import seed_arm_predictions
+from tests.support.servable import m_recipe, seed_arm_predictions, seed_m_recipe
 
 DAY = "2026-08-28"
 
@@ -70,10 +70,13 @@ def _seed(tmp_path, arms: tuple[tuple[str, float], ...]):
         register, record = register.register(
             slot="m",
             name=name,
-            spec={"name": name},
+            # The recipe's own spec, and the recipe filed: seating an M arm
+            # reads its recipe's target (`alpha-engine-config-I12121`).
+            spec=m_recipe(name).spec,
             created_date=dates[0],
             filed_on=dates[0],
         )
+        seed_m_recipe(store, name)
         ids[name] = record.arm_id
         series = ArmSeries(arm_id=record.arm_id, scores={d: value for d in dates})
         store.put_bytes(

@@ -52,6 +52,7 @@ from crucible.slots.model import (
     SLOT,
     FeatureLayerSource,
     FitReconstructionError,
+    UnsignedChampionTargetError,
     design_panel,
     load_model_recipes,
     predict_cross_section,
@@ -106,9 +107,11 @@ def store(tmp_path) -> LocalStore:
     return backing
 
 
-def _write_recipe(directory, name, *, features, inputs=()):
+def _write_recipe(directory, name, *, features, inputs=(), target=None):
     directory.mkdir(parents=True, exist_ok=True)
     lines = ["slot: m", f"name: {name}", "spec:", f"  features: [{', '.join(features)}]"]
+    if target is not None:
+        lines.append(f"  target: {target}")
     if inputs:
         lines.append("  inputs:")
         lines += [f"    - {entry}" for entry in inputs]
@@ -329,6 +332,31 @@ class TestEveryOtherFailureIsLoudAndServesNothing:
         with pytest.raises(MissingArtifactError, match="never been fitted"):
             _serve(store, settings)
         self._assert_failed_without_a_feed(store)
+
+    def test_a_champion_fitted_to_an_unsigned_target_is_refused(self, store, settings) -> None:
+        """`alpha-engine-config-I12121`, the live 2026-10-07 shape: the pointer
+        names a magnitude head (`target: abs_forward_return`) that has a fit
+        of record and features for the session — everything a feed needs but
+        a signed target. The run fails naming the arm and its target, before
+        any scoring, and writes neither the feed nor a cross-section."""
+        _write_recipe(
+            settings.strategy_dir / "arms" / SLOT,
+            "vol_head",
+            features=[BASE_COLUMN],
+            target="abs_forward_return",
+        )
+        _fit_on_the_arc(store, settings, arm="vol_head")
+        head = _recipes(settings)["vol_head"]
+        _seat(store, head.arm_id)
+
+        with pytest.raises(UnsignedChampionTargetError) as refused:
+            _serve(store, settings)
+
+        assert head.arm_id in str(refused.value)
+        assert "abs_forward_return" in str(refused.value)
+        assert DAILY_SERVE_JOB in str(refused.value)
+        self._assert_failed_without_a_feed(store)
+        assert not store.exists(arm_predictions_key(head.arm_id, SERVE_DAY))
 
     def test_a_champion_no_recipe_declares_is_refused(self, store, settings) -> None:
         _fit_on_the_arc(store, settings)

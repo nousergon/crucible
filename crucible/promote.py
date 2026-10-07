@@ -528,6 +528,10 @@ def revert_champion(
             f"{state.retired_date}. Reverting to a retired arm is a registration "
             "decision, not a pointer decision — register it again if it should serve."
         )
+    # `alpha-engine-config-I12121`: the operator path is held to the same
+    # target rule as the evidence path. The 2026-10-07 M pointer named a
+    # magnitude head seated by exactly this function, and nothing checked.
+    _refuse_unsigned_champion(store, spec, arm_id, how="operator revert")
 
     decided_at = _utc(now)
     pointer = ChampionPointer(
@@ -695,9 +699,49 @@ def _write_pointer_if_moved(
         attestation=attestation,
     )
     if spec.slot == PREDICTIONS_FEED_SLOT:
+        _refuse_unsigned_champion(store, spec, decision.champion, how="promotion on evidence")
         _refuse_unservable_champion(store, spec, decision)
     write_champion(store, pointer, expected=expected)
     return pointer
+
+
+def _refuse_unsigned_champion(store: Store, spec: SlotSpec, arm_id: str, *, how: str) -> None:
+    """Refuse to seat an M arm whose fit target is not a signed forward return.
+
+    `alpha-engine-config-I12121`. The M pointer is half of what the trader
+    sizes on: the arm it names is republished as `predicted_alpha`. An arm
+    fitted to ``abs_forward_return`` (or to anything else outside
+    :data:`~crucible.slots.model.SIGNED_FORWARD_RETURN_TARGETS`) predicts a
+    magnitude, and seating it makes every name read as a long. Grading cannot
+    prevent this — it scores every arm against the signed return, and a
+    magnitude head merely scores badly — and an operator revert never
+    consults grading at all, so the refusal sits on the pointer write itself,
+    on BOTH writers. An arm no recipe declares is refused too: its target
+    cannot be read, so it cannot be shown to be signed.
+
+    A RAISE before :func:`~crucible.champion.write_champion`, so the pointer
+    is left exactly as it was. Only the feed slot carries fit targets; the
+    other slots' arms are not M recipes and are not checked here.
+    """
+    if spec.slot != PREDICTIONS_FEED_SLOT:
+        return
+    # Local, as in `_refuse_unservable_champion`: the M module imports the
+    # whole fitting stack, and only this one check is wanted from it.
+    from crucible.slots.model import (  # noqa: PLC0415
+        UnsignedChampionTargetError,
+        require_signed_champion,
+    )
+
+    try:
+        require_signed_champion(
+            arm_id,
+            action=f"seat {arm_id!r} as slot {spec.slot} champion by {how}",
+            store=store,
+        )
+    except UnsignedChampionTargetError as exc:
+        raise PromotionRefused(
+            f"slot {spec.slot}: {exc} The pointer at {champion_key(spec.slot)} is left unchanged."
+        ) from exc
 
 
 def _refuse_unservable_champion(store: Store, spec: SlotSpec, decision: PointerDecision) -> None:

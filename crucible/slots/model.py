@@ -163,6 +163,13 @@ __all__ = [
     "SlotRecipes",
     "SlotUnservableError",
     "UnresolvedInputError",
+    "UnsignedChampionTargetError",
+    "DEFAULT_TARGET",
+    "SIGNED_FORWARD_RETURN_TARGETS",
+    "effective_target",
+    "require_signed_champion",
+    "require_signed_target",
+    "resolve_arm_recipe",
     "UpProbabilityCalibration",
     "calibrate_up_probability",
     "design_panel",
@@ -2859,6 +2866,106 @@ FACTOR_RESIDUAL_TARGET = "factor_residual_forward_return"
 #: The fit targets a recipe may declare. `None` on the recipe means the first.
 TARGETS: tuple[str, ...] = ("forward_return", "abs_forward_return", FACTOR_RESIDUAL_TARGET)
 
+#: The slot's default fit target — what a recipe that declares no ``target``
+#: is fitted to. Named so the "absent means signed forward return" reading is
+#: stated once, where :data:`SIGNED_FORWARD_RETURN_TARGETS` can include it.
+DEFAULT_TARGET: str = TARGETS[0]
+
+#: The fit targets whose output is a SIGNED forward return — the only kind of
+#: number that may be published as `predicted_alpha` and sized on by the
+#: trader (`alpha-engine-config-I12121`).
+#:
+#: * :data:`DEFAULT_TARGET` (``forward_return``, and a recipe that declares no
+#:   target at all): the session's signed forward return.
+#: * :data:`FACTOR_RESIDUAL_TARGET`: the same return net of its point-in-time
+#:   factor exposure — still signed, still directional.
+#:
+#: ``abs_forward_return`` is NOT a member, and nothing unsigned ever may be.
+#: It is a magnitude head (v1's volatility L1): it predicts how FAR a name
+#: moves, never which way, so its output is non-negative by construction. On
+#: 2026-10-07 the M pointer named exactly such an arm
+#: (`m:v3meta_volatility_head:97645d421bea`, seated by an operator revert),
+#: and `serve.daily` published its |return| forecasts as `predicted_alpha` —
+#: a book that reads every name as a long. Grading cannot catch this (it
+#: scores every arm against the signed return, and a magnitude head merely
+#: scores badly); only a refusal on the pointer write and on the feed can.
+#:
+#: An ALLOWLIST, deliberately: a target added to :data:`TARGETS` later is
+#: refused as a champion until someone states here that it is signed.
+SIGNED_FORWARD_RETURN_TARGETS: frozenset[str] = frozenset({DEFAULT_TARGET, FACTOR_RESIDUAL_TARGET})
+
+
+class UnsignedChampionTargetError(RuntimeError):
+    """An M arm cannot be shown to emit a signed forward return.
+
+    Raised when the arm's recipe declares a target outside
+    :data:`SIGNED_FORWARD_RETURN_TARGETS`, and when no recipe in the strategy
+    tree declares the arm at all — an arm whose target cannot be read cannot
+    be shown to be signed, and the champion pointer and the predictions feed
+    are the two surfaces the trader sizes on (`alpha-engine-config-I12121`).
+    Always a raise: refusing by returning would be indistinguishable at the
+    call site from a write that happened.
+    """
+
+
+def effective_target(recipe: ModelRecipe) -> str:
+    """The target ``recipe`` is fitted to, with the slot default made explicit."""
+    return recipe.target if recipe.target is not None else DEFAULT_TARGET
+
+
+def require_signed_target(recipe: ModelRecipe, *, action: str) -> None:
+    """Refuse ``action`` when ``recipe`` is not fitted to a signed forward return.
+
+    ``action`` names what was about to happen (seating the arm as champion,
+    publishing its feed), so the refusal says what it stopped.
+    """
+    target = effective_target(recipe)
+    if target in SIGNED_FORWARD_RETURN_TARGETS:
+        return
+    raise UnsignedChampionTargetError(
+        f"refusing to {action}: arm {recipe.arm_id!r} declares target={target!r}, which "
+        f"is not a signed forward return (signed targets: "
+        f"{sorted(SIGNED_FORWARD_RETURN_TARGETS)}). Its output would be published as "
+        "`predicted_alpha` and sized on by the trader, and an unsigned magnitude reads "
+        "every name as a long."
+    )
+
+
+def resolve_arm_recipe(
+    arm_id: str, *, store: Any = None, strategy_dir: Path | str | None = None
+) -> ModelRecipe:
+    """The M recipe that declares exactly ``arm_id``, from the strategy tree.
+
+    Reads the checkout's ``arms/m/`` when ``strategy_dir`` is given, and the
+    tree synced into ``store`` otherwise — the resolution order
+    :func:`_load_slot` uses. Matched on the full arm id, so a recipe file of
+    the same NAME whose spec has since changed (a different arm) never stands
+    in for it. No match raises :class:`UnsignedChampionTargetError`: the
+    arm's target cannot be read, so it cannot be shown to be signed.
+    """
+    directory = Path(strategy_dir) / "arms" / SLOT if strategy_dir is not None else None
+    recipes = read_model_recipes(directory, store=None if directory is not None else store)
+    for recipe in recipes:
+        if recipe.arm_id == arm_id:
+            return recipe
+    source = str(directory) if directory is not None else strategy_arms_prefix(SLOT)
+    raise UnsignedChampionTargetError(
+        f"arm {arm_id!r} is declared by no M recipe under {source!r} (declared: "
+        f"{sorted(r.arm_id for r in recipes)}), so its fit target cannot be read and it "
+        "cannot be shown to emit a signed forward return. An arm the strategy tree does "
+        "not declare is refused as champion and refused a predictions feed."
+    )
+
+
+def require_signed_champion(
+    arm_id: str, *, action: str, store: Any = None, strategy_dir: Path | str | None = None
+) -> ModelRecipe:
+    """:func:`resolve_arm_recipe` then :func:`require_signed_target`; the recipe."""
+    recipe = resolve_arm_recipe(arm_id, store=store, strategy_dir=strategy_dir)
+    require_signed_target(recipe, action=action)
+    return recipe
+
+
 #: The shortest factor-beta window a recipe may declare. An order-of-magnitude
 #: guard, not a tuned value: the attribution spec carries six factors, and a
 #: regression with an intercept needs `k + 2` sessions merely to be
@@ -4505,7 +4612,10 @@ def produce(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
     # `None` when the slot has no champion, which is a true statement and
     # deliberately a different one from a key that was written.
     result["champion_feed"] = publish_predictions_feed(
-        ctx.store, trading_day=result["trading_day"], ctx=ctx
+        ctx.store,
+        trading_day=result["trading_day"],
+        ctx=ctx,
+        strategy_dir=getattr(settings, "strategy_dir", None),
     )
     return result
 
@@ -4802,6 +4912,14 @@ def serve_daily(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
             f"{sorted(r.arm_id for r in recipes)}). Its fit cannot be re-derived without "
             "its recipe, and a feed for any other arm would fail the trader's contract."
         )
+    # `alpha-engine-config-I12121`: refused BEFORE any scoring, so a champion
+    # fitted to an unsigned target fails this run with nothing written — no
+    # carried-forward cross-section and no feed. `publish_predictions_feed`
+    # makes the same refusal at the write; this one names the job.
+    require_signed_target(
+        champion,
+        action=f"serve {DAILY_SERVE_JOB} --slot {SLOT} for {trading_day} from this champion",
+    )
 
     strategy_dir = getattr(settings, "strategy_dir", None)
     scored: dict[str, str] = {}
@@ -4833,7 +4951,9 @@ def serve_daily(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
         produce_arm_predictions(ctx, fit=fit, panel=panel, trading_day=trading_day)
         scored[recipe.arm_id] = anchor
 
-    feed = publish_predictions_feed(ctx.store, trading_day=trading_day, ctx=ctx)
+    feed = publish_predictions_feed(
+        ctx.store, trading_day=trading_day, ctx=ctx, strategy_dir=strategy_dir
+    )
     ctx.record_rows(rows_in=len(scored) + len(reused), rows_out=1)
     ctx.record_metric(
         _daily_feed_metric(

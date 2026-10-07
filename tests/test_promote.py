@@ -35,7 +35,7 @@ from crucible.promote import (
 )
 from crucible.slots import get_slot, is_control_arm
 from crucible.store import LocalStore
-from tests.support.servable import seed_arm_predictions
+from tests.support.servable import m_recipe, seed_arm_predictions, seed_m_recipe
 
 #: `alpha-engine-config-I10506`: a real-shaped, non-placeholder sha for
 #: every test that reaches the pointer write — `run_promotion`/
@@ -185,7 +185,11 @@ def register_with(
         reg, record = reg.register(
             slot=slot,
             name=name,
-            spec={"name": name},
+            # An M arm is registered under the spec of the recipe
+            # `seed_m_recipe` files, so the id the register holds is the id
+            # that recipe derives — seating an M arm reads its recipe's target
+            # (`alpha-engine-config-I12121`).
+            spec=m_recipe(name).spec if slot == "m" else {"name": name},
             created_date=created,
             filed_on=created,
             control=name in control_names,
@@ -678,6 +682,7 @@ class TestChampionPointer:
         dates = trading_days(40)
         reg, ids = register_with("m", ["champ", "chal"], dates[0])
         store = LocalStore(tmp_path)
+        seed_m_recipe(store, "champ")
         revert_champion(
             spec=spec,
             register=reg,
@@ -772,11 +777,13 @@ class TestCodeShaIsRequiredNotDefaulted:
         spec = get_slot("m")
         dates = trading_days(40)
         reg, ids = register_with("m", ["champ", "chal"], dates[0])
+        store = LocalStore(tmp_path)
+        seed_m_recipe(store, "champ")
         with pytest.raises(PromotionRefused, match="code_sha"):
             revert_champion(
                 spec=spec,
                 register=reg,
-                store=LocalStore(tmp_path),
+                store=store,
                 arm_id=ids["champ"],
                 as_of=dates[-1],
                 operator="cipher813",
