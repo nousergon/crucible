@@ -78,7 +78,7 @@ from crucible.models import (
 )
 from crucible.release_history import UNDECLARED, ReleaseInForce
 from crucible.required import require_env
-from crucible.slots import SLOTS
+from crucible.slots import SLOTS, owed_slot_manifests
 from crucible.slots.cycle import MIN_ACTIVE_ARMS_FINDING_METRIC
 from crucible.store import Store
 from crucible.synthetic import (
@@ -679,6 +679,24 @@ def _arc_declared_members(
     return frozenset(members)
 
 
+def _absence_subject(
+    name: str, trading_day: dt.date, missing_slots: Sequence[str], delivered: set[str | None]
+) -> str:
+    """What an ABSENCE page says is missing: the whole job, or the owed slots.
+
+    A per-slot reason names the delivered slots too, so "S never fired" and
+    "nothing fired" read differently on the page that carries them.
+    """
+    prefix = manifest_prefix(name, trading_day.isoformat())
+    if not missing_slots:
+        return f"no manifest under {prefix}"
+    present = sorted(d for d in delivered if d is not None)
+    return (
+        f"no manifest for slot(s) {', '.join(missing_slots)} under {prefix} "
+        f"(delivered: {', '.join(present) or 'none'})"
+    )
+
+
 # ── The two page conditions ───────────────────────────────────────────────
 
 
@@ -788,8 +806,24 @@ def evaluate_absence(
                     raise StoreAccessError(read.problem)
                 access_faults.append(read.problem)
                 continue
-            if any(is_manifest_key(k) for k in read.keys or ()):
-                continue
+            delivered = {parsed[2] for parsed in map(parse_manifest_key, read.keys or ()) if parsed}
+            # WHICH SLOTS (alpha-engine-config-I12054). A job that owes one
+            # manifest per slot — `serve.daily`, one schedule per slot under
+            # one job name — is absent for every owed slot with no manifest of
+            # its own, whatever the other slots delivered. Before this, M's
+            # manifest cleared a day on which `serve-daily-s` never fired and
+            # the S link the daily shadow books read went unpaged. The owed
+            # set is the job's own declaration (`owed_slot_manifests`), so one
+            # page per job and day still names every missing slot.
+            owed = owed_slot_manifests(name)
+            missing_slots: list[str] = []
+            if owed is None:
+                if delivered:
+                    continue
+            else:
+                missing_slots = sorted(owed - delivered)
+                if not missing_slots:
+                    continue
             # WHICH RELEASE. A `scheduler` / `github-actions` row is due on a
             # day only if the release in force at its deadline declared it
             # (alpha-engine-config-I10718): `gate.close` paged for 2026-09-03
@@ -814,7 +848,7 @@ def evaluate_absence(
                     job=name,
                     trading_day=trading_day,
                     reason=(
-                        f"no manifest under {manifest_prefix(name, trading_day.isoformat())}; due "
+                        _absence_subject(name, trading_day, missing_slots, delivered) + "; due "
                         f"{component.deadline.describe(trading_day)} "
                         f"({due.strftime('%Y-%m-%dT%H:%M:%SZ')}), now "
                         f"{moment.strftime('%Y-%m-%dT%H:%M:%SZ')}"

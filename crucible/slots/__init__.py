@@ -102,6 +102,7 @@ __all__ = [
     "attribution_factor_symbols",
     "declared_benchmark_symbols",
     "daily_servers",
+    "owed_slot_manifests",
     "dispatchable_slots",
     "history_producer",
     "get_slot",
@@ -364,6 +365,32 @@ def daily_servers() -> dict[str, ModuleType]:
         if callable(getattr(module, "serve_daily", None)):
             found[slot] = module
     return found
+
+
+def owed_slot_manifests(job: str) -> frozenset[str] | None:
+    """The slots a SCHEDULED job owes one manifest EACH per trading day, or
+    ``None`` for a job whose one manifest per day is owed whatever it carries.
+
+    `alpha-engine-config-I12054`. `serve.daily` runs once per slot under one
+    job name, discriminated by slot, and each slot has its own schedule — so
+    its absence is a per-slot question. `crucible.alerts.evaluate_absence`
+    used to answer it with "is ANY manifest under the day's prefix", and M's
+    manifest then cleared a day on which `serve-daily-s` never fired.
+
+    Read off :func:`daily_servers`, the same declaration the CLI's `--slot`
+    choices are, never a list in the alerter: the day a slot's daily entry
+    point lands, its absence is graded with no second list to update.
+
+    `experiment.run`/`experiment.grade` answer ``None`` on purpose: they are
+    `dispatch: arc` rows, and which slots the arc that ran actually planned is
+    the arc's own record (`crucible.alerts._arc_declared_members`), not this
+    function's to restate.
+    """
+    from crucible.slots.cycle import DAILY_SERVE_JOB  # noqa: PLC0415 - lazy, as above
+
+    if job == DAILY_SERVE_JOB:
+        return frozenset(daily_servers())
+    return None
 
 
 def history_producer(module: ModuleType) -> Any:
