@@ -1602,10 +1602,8 @@ class TestACostCeilingIsNeverMetByAnUnreadableApi:
         )
         assert clause.unmeasurable and not clause.met
         assert "absent as a cost-allocation tag" in clause.detail
-        assert (
-            "aws ce update-cost-allocation-tags-status "
-            "--cost-allocation-tags-status TagKey=system,Status=Active" in clause.detail
-        )
+        assert "Cost allocation tags" in clause.detail
+        assert "update-cost-allocation-tags-status" not in clause.detail
 
     def test_a_tag_filtered_zero_with_the_key_inactive_names_the_command(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1625,7 +1623,7 @@ class TestACostCeilingIsNeverMetByAnUnreadableApi:
         )
         assert clause.unmeasurable and not clause.met
         assert "Inactive as a cost-allocation tag" in clause.detail
-        assert "TagKey=system,Status=Active" in clause.detail
+        assert "Cost allocation tags" in clause.detail
 
     def test_a_tag_filtered_zero_with_the_key_active_reads_forward_indexing(
         self, monkeypatch: pytest.MonkeyPatch
