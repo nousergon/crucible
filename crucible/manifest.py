@@ -535,7 +535,7 @@ MONEY_PATH_CLAIM_BACKOFF_S = 0.25
 MONEY_PATH_ORDER_MAX_WAIT_S = 5.0
 
 #: The claim object's declared shape. Small and self-describing: an operator
-#: looking at `money_path/claims/` can see which run took which index, and the
+#: looking at `runs/_money_path/claims/` can see which run took which index, and the
 #: exhaustion message below names the holder from it.
 MONEY_PATH_CLAIM_SCHEMA_VERSION = "money_path_claim.v1"
 

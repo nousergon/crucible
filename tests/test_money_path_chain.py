@@ -38,6 +38,7 @@ from crucible.explain import (
     verify_money_path_chain,
 )
 from crucible.keys import (
+    MONEY_PATH_CLAIMS_PREFIX,
     TRADER_EVIDENCE_KEY,
     champion_key,
     execution_shortfall_key,
@@ -886,10 +887,10 @@ class TestTheLocalBackendCreatesAtomically:
             store.compare_and_swap(money_path_claim_key(1), ETAG_ABSENT, b'{"b": 2}')
         assert store.get_bytes(money_path_claim_key(1)) == b'{"a": 1}'
         # No temp file left beside it, won or lost.
-        assert list(store.list_keys("money_path/")) == [money_path_claim_key(1)]
+        assert list(store.list_keys(MONEY_PATH_CLAIMS_PREFIX)) == [money_path_claim_key(1)]
 
     def test_the_claim_key_is_dateless_and_sorts_in_chain_order(self) -> None:
-        assert money_path_claim_key(11) == "money_path/claims/00000011.json"
+        assert money_path_claim_key(11) == "runs/_money_path/claims/00000011.json"
         assert money_path_claim_key(9) < money_path_claim_key(10)
         with pytest.raises(ValueError):
             money_path_claim_key(-1)

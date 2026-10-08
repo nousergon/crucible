@@ -1392,9 +1392,13 @@ def backfill_key(trading_day: str, run_id: str) -> str:
 # -- the money-path chain's index claims (alpha-engine-config-I12020) --------
 
 #: Where a money-path manifest writer claims its chain index before writing.
-#: Outside `runs/` on purpose: `crucible.manifest.money_path_manifests` lists
-#: `runs/` to find the chain, and a claim is not a manifest.
-MONEY_PATH_CLAIMS_PREFIX = "money_path/claims/"
+#: Under `runs/`, beside :data:`DISPATCH_ROOT`, because `runs/*` is what every
+#: identity that writes a money-path manifest is already granted — a new
+#: top-level prefix would be an IAM change in nous-ergon-ops
+#: (`tests/crossrepo/test_crucible_store_prefix_grants.py`). A claim is not a
+#: manifest, and `money_path_manifests` admits only keys
+#: :func:`is_manifest_key` accepts, so the chain listing skips it.
+MONEY_PATH_CLAIMS_PREFIX = "runs/_money_path/claims/"
 
 
 def money_path_claim_key(index: int) -> str:
