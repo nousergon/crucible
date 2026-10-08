@@ -3434,9 +3434,7 @@ def _clause_v2_resources_tagged_and_versioned(
                 f"{key} (commit {reading.commit}): `{V2_TAG_ACCEPTANCE_CLAUSE_ID}` met and "
                 f"store versioning {reading.store_versioning}, but `{TAG_KEY}` is "
                 f"{activation.status} as a cost-allocation tag in Billing -- every resource "
-                "carries the tag and Cost Explorer indexes none of it. Activate it with "
-                "`aws ce update-cost-allocation-tags-status --cost-allocation-tags-status "
-                f"TagKey={TAG_KEY},Status=Active`",
+                f"carries the tag and Cost Explorer indexes none of it. {TAG_ACTIVATION_HINT}",
                 (*evidence, "ce:ListCostAllocationTags"),
             )
         return Clause(
@@ -6883,6 +6881,16 @@ COST_TRAILING_DAYS = 30
 COST_LEADING_DAYS = 7
 
 
+#: How to activate the cost-allocation tag, printed by every clause that finds
+#: it inactive. Never the `aws ce` CLI: that is a billed Cost Explorer request,
+#: and the fleet makes none (alpha-engine-config-I12168, 2026-10-08).
+TAG_ACTIVATION_HINT = (
+    f"Activate `{TAG_KEY}` in the AWS Billing console under Cost allocation tags. "
+    "Do not use the Cost Explorer CLI or API for it: those requests are billed, and the "
+    "fleet makes zero Cost Explorer calls."
+)
+
+
 def _ce_client() -> Any:
     """The spend source: the expense collector's rollup, never Cost Explorer
     itself (`crucible.cost.CollectorSpendClient`, alpha-engine-config-I11707)."""
@@ -7094,9 +7102,7 @@ def _clause_aws_cost_within_ceiling(
                 f"{reading.start.isoformat()}..{reading.end.isoformat()}: `{TAG_KEY}` is "
                 f"{tag_status.status} as a cost-allocation tag in Billing, so Cost "
                 "Explorer does not index spend under this filter at all, regardless of "
-                "whether the resources carry it — activate it with `aws ce "
-                f"update-cost-allocation-tags-status --cost-allocation-tags-status "
-                f"TagKey={TAG_KEY},Status=Active`",
+                f"whether the resources carry it. {TAG_ACTIVATION_HINT}",
                 (*evidence, "ce:ListCostAllocationTags"),
             )
         since = tag_status.last_updated_date or "an unknown date"
