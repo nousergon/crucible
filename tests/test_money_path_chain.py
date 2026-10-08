@@ -22,12 +22,14 @@ much as calls `Store.etag`.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from crucible import manifest as manifest_module
 from crucible.explain import (
     ChainVerification,
     MoneyPathChainError,
@@ -36,11 +38,13 @@ from crucible.explain import (
     verify_money_path_chain,
 )
 from crucible.keys import (
+    MONEY_PATH_CLAIMS_PREFIX,
     TRADER_EVIDENCE_KEY,
     champion_key,
     execution_shortfall_key,
     holdout_unseal_key,
     manifest_key,
+    money_path_claim_key,
     predictions_key,
     shadow_books_key,
     strategy_holdout_key,
@@ -48,6 +52,8 @@ from crucible.keys import (
     trader_reconciliation_key,
 )
 from crucible.manifest import (
+    MONEY_PATH_CLAIM_ATTEMPTS,
+    MONEY_PATH_CLAIM_BACKOFF_S,
     RUN_MANIFEST_SCHEMA_VERSION,
     ManifestValidationError,
     money_path_writes,
@@ -56,7 +62,7 @@ from crucible.manifest import (
     write_manifest,
 )
 from crucible.models import MoneyPathLink
-from crucible.store import LocalStore, sha256_hex
+from crucible.store import ETAG_ABSENT, LocalStore, PointerConflictError, sha256_hex
 
 TRADING_DAY = "2026-08-28"
 CALENDAR_DAY = "2026-08-31"
@@ -618,3 +624,273 @@ class TestExplainVerifiesTheChain:
         store.put_bytes(keys[0], json.dumps(tampered, indent=2, sort_keys=True).encode("utf-8"))
         node = explain(store, predictions_key(TRADING_DAY))
         assert "produced by" in render(node) or "run 01JG" in render(node)
+
+
+# ── concurrent writers: one index, one writer (alpha-engine-config-I12020) ──
+
+
+class _FakeClock:
+    """A wall clock that only moves when the code under test sleeps, so an
+    interleaving that depends on time is replayed exactly, every run."""
+
+    def __init__(self, now: str) -> None:
+        self.now = dt.datetime.fromisoformat(now.replace("Z", "+00:00"))
+        self.sleeps: list[float] = []
+
+    def __call__(self) -> dt.datetime:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += dt.timedelta(seconds=seconds)
+
+
+def _promote(run_id: str, slot: str, *, finished: str) -> dict[str, Any]:
+    """A `promote` manifest for one slot — the shape of the 2026-10-07 pair."""
+    manifest = _manifest(run_id, outputs=[champion_key(slot)], finished=finished)
+    manifest["discriminator"] = slot
+    return manifest
+
+
+def _key_of(manifest: dict[str, Any]) -> str:
+    return manifest_key(
+        manifest["job"], manifest["trading_day"], discriminator=manifest.get("discriminator")
+    )
+
+
+def _claim(store: LocalStore, index: int) -> dict[str, Any]:
+    return json.loads(store.get_bytes(money_path_claim_key(index)))
+
+
+class TestConcurrentWritersCannotShareAnIndex:
+    """The 2026-10-07 fork: `promote` for slots m and s, dispatched ~3 s
+    apart, both read head index 10 and both wrote index 11. The verifier
+    caught it and the trader refused its session. Every test here replays an
+    interleaving DETERMINISTICALLY — by running the winner's whole write
+    inside the loser's head read — rather than hoping two threads collide."""
+
+    GENESIS_RUN = "01JG0000000000000000000001"
+
+    def _genesis(self, store: LocalStore, clock: _FakeClock) -> dict[str, Any]:
+        return write_manifest(
+            store,
+            manifest_key("holdout", TRADING_DAY),
+            _manifest(
+                self.GENESIS_RUN,
+                job="holdout",
+                outputs=[strategy_holdout_key()],
+                finished="2026-08-31T13:00:00Z",
+            ),
+            sleep=clock.sleep,
+            clock=clock,
+        )
+
+    def _race(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        store: LocalStore,
+        clock: _FakeClock,
+        *,
+        loser: dict[str, Any],
+        winner: dict[str, Any],
+    ) -> dict[str, Any]:
+        """``loser`` reads the head; before it can claim, ``winner`` reads the
+        SAME head and completes its whole write. Returns what ``loser`` wrote."""
+        real = manifest_module.money_path_manifests
+        interleaved: list[bool] = []
+
+        def head_read_then_winner_lands(s: Any) -> list[tuple[str, dict[str, Any]]]:
+            snapshot = real(s)
+            if not interleaved:
+                interleaved.append(True)
+                write_manifest(s, _key_of(winner), winner, sleep=clock.sleep, clock=clock)
+            return snapshot
+
+        monkeypatch.setattr(manifest_module, "money_path_manifests", head_read_then_winner_lands)
+        return write_manifest(store, _key_of(loser), loser, sleep=clock.sleep, clock=clock)
+
+    def test_two_writers_reading_one_head_produce_a_contiguous_verifying_chain(
+        self, store, monkeypatch
+    ) -> None:
+        clock = _FakeClock("2026-08-31T14:00:00Z")
+        self._genesis(store, clock)
+        winner = _promote("01JG0000000000000000000002", "m", finished="2026-08-31T13:59:58Z")
+        loser = _promote("01JG0000000000000000000003", "s", finished="2026-08-31T13:59:59Z")
+
+        written = self._race(monkeypatch, store, clock, loser=loser, winner=winner)
+
+        verdict = verify_money_path_chain(store)
+        assert verdict.status == "ok", verdict.reason
+        assert [(r.index, r.run_id) for r in verdict.records] == [
+            (0, self.GENESIS_RUN),
+            (1, winner["run_id"]),
+            (2, loser["run_id"]),
+        ]
+        # The loser re-read the head and chained to the WINNER, by digest.
+        assert written["money_path_link"]["prev_run_id"] == winner["run_id"]
+        assert written["money_path_link"]["prev_sha256"] == sha256_hex(
+            store.get_bytes(_key_of(winner))
+        )
+        # One claim per index, each naming the run that owns it.
+        assert _claim(store, 1)["run_id"] == winner["run_id"]
+        assert _claim(store, 2)["run_id"] == loser["run_id"]
+        assert _claim(store, 2)["manifest_key"] == _key_of(loser)
+        # One lost claim, one backoff.
+        assert clock.sleeps == [MONEY_PATH_CLAIM_BACKOFF_S]
+
+    def test_a_loser_that_would_sort_before_the_winner_is_restamped_forward(
+        self, store, monkeypatch
+    ) -> None:
+        """Same `finished` second, and the LOSER's run_id sorts first (it
+        started first). Without a restamp it would hold index 2 and sort
+        before index 1 — the verifier orders by `(finished, run_id)` and
+        would call that a fork one step later."""
+        clock = _FakeClock("2026-08-31T14:00:00.400000Z")
+        self._genesis(store, clock)
+        winner = _promote("01JG0000000000000000000003", "m", finished="2026-08-31T14:00:00Z")
+        loser = _promote("01JG0000000000000000000002", "s", finished="2026-08-31T14:00:00Z")
+
+        written = self._race(monkeypatch, store, clock, loser=loser, winner=winner)
+
+        # Moved FORWARD past the winner's second, never backward.
+        assert written["finished"] == "2026-08-31T14:00:01Z"
+        assert written["finished"] > winner["finished"]
+        verdict = verify_money_path_chain(store)
+        assert verdict.status == "ok", verdict.reason
+        assert [r.run_id for r in verdict.records] == [
+            self.GENESIS_RUN,
+            winner["run_id"],
+            loser["run_id"],
+        ]
+
+    def test_a_record_already_sorting_after_its_head_keeps_its_finished(self, store) -> None:
+        clock = _FakeClock("2026-08-31T14:00:00Z")
+        self._genesis(store, clock)
+        manifest = _promote("01JG0000000000000000000002", "m", finished="2026-08-31T13:30:00Z")
+        written = write_manifest(store, _key_of(manifest), manifest, sleep=clock.sleep, clock=clock)
+        assert written["finished"] == "2026-08-31T13:30:00Z"
+        assert clock.sleeps == []
+
+    def test_a_head_stamped_far_past_this_clock_is_refused_not_waited_for(self, store) -> None:
+        clock = _FakeClock("2026-08-31T12:00:00Z")
+        self._genesis(store, clock)  # finished 13:00:00, an hour ahead of the clock
+        manifest = _promote("01JG0000000000000000000002", "m", finished="2026-08-31T12:00:00Z")
+        with pytest.raises(MoneyPathChainError, match="check this host's clock"):
+            write_manifest(store, _key_of(manifest), manifest, sleep=clock.sleep, clock=clock)
+        assert not store.exists(_key_of(manifest))
+        assert not store.exists(money_path_claim_key(1))
+
+    def test_an_index_that_stays_claimed_exhausts_the_retries_and_writes_nothing(
+        self, store
+    ) -> None:
+        """A writer that claimed index 1 and died before its manifest landed.
+        Every attempt reads head 0, every attempt loses index 1; after the
+        bounded budget the write RAISES — it never writes over an index it
+        does not own — and the message names the holder and the remedy."""
+        clock = _FakeClock("2026-08-31T14:00:00Z")
+        self._genesis(store, clock)
+        orphan = _promote("01JG0000000000000000000009", "s", finished="2026-08-31T13:30:00Z")
+        store.compare_and_swap(
+            money_path_claim_key(1),
+            ETAG_ABSENT,
+            json.dumps(
+                {"index": 1, "run_id": orphan["run_id"], "manifest_key": _key_of(orphan)}
+            ).encode("utf-8"),
+        )
+        blocked = _promote("01JG000000000000000000000A", "m", finished="2026-08-31T13:45:00Z")
+
+        with pytest.raises(MoneyPathChainError, match="could not claim") as caught:
+            write_manifest(store, _key_of(blocked), blocked, sleep=clock.sleep, clock=clock)
+
+        assert orphan["run_id"] in str(caught.value)
+        assert "is NOT in the chain" in str(caught.value)
+        assert "re-running THAT job" in str(caught.value)
+        assert not store.exists(_key_of(blocked))
+        assert len(clock.sleeps) == MONEY_PATH_CLAIM_ATTEMPTS - 1
+        assert clock.sleeps == [
+            MONEY_PATH_CLAIM_BACKOFF_S * 2**n for n in range(MONEY_PATH_CLAIM_ATTEMPTS - 1)
+        ]
+
+        # The remedy the message names: re-running the claim holder's job for
+        # that day rewrites the same key, reuses its claim and unblocks.
+        write_manifest(store, _key_of(orphan), orphan, sleep=clock.sleep, clock=clock)
+        write_manifest(store, _key_of(blocked), blocked, sleep=clock.sleep, clock=clock)
+        verdict = verify_money_path_chain(store)
+        assert verdict.status == "ok", verdict.reason
+        assert [r.run_id for r in verdict.records] == [
+            self.GENESIS_RUN,
+            orphan["run_id"],
+            blocked["run_id"],
+        ]
+
+
+class TestARerunReplacesItsOwnRecordAtItsOwnIndex:
+    """Same job, same trading day, same key: the rerun replaces its record
+    rather than following it, so it must be allowed to reuse the index its
+    first run claimed."""
+
+    def test_a_rerun_of_the_head_reuses_its_claim_and_the_chain_verifies(self, store) -> None:
+        clock = _FakeClock("2026-08-31T15:00:00Z")
+        first_m = _promote("01JG0000000000000000000001", "m", finished="2026-08-31T13:00:00Z")
+        write_manifest(store, _key_of(first_m), first_m, sleep=clock.sleep, clock=clock)
+        first_s = _promote("01JG0000000000000000000002", "s", finished="2026-08-31T13:10:00Z")
+        write_manifest(store, _key_of(first_s), first_s, sleep=clock.sleep, clock=clock)
+
+        rerun_s = _promote("01JG0000000000000000000003", "s", finished="2026-08-31T14:00:00Z")
+        written = write_manifest(store, _key_of(rerun_s), rerun_s, sleep=clock.sleep, clock=clock)
+
+        assert written["money_path_link"]["index"] == 1
+        assert written["money_path_link"]["prev_run_id"] == first_m["run_id"]
+        assert json.loads(store.get_bytes(_key_of(rerun_s)))["run_id"] == rerun_s["run_id"]
+        # The claim still names the key; it is the KEY's index, not a run's.
+        assert _claim(store, 1)["manifest_key"] == _key_of(first_s)
+        assert clock.sleeps == []
+        verdict = verify_money_path_chain(store)
+        assert verdict.status == "ok", verdict.reason
+        assert [r.run_id for r in verdict.records] == [first_m["run_id"], rerun_s["run_id"]]
+
+    def test_a_rerun_of_a_head_somebody_has_claimed_past_is_refused(self, store) -> None:
+        """A successor that claimed index 1 computed its `prev_sha256` over
+        the head's CURRENT bytes. Rewriting the head under it would break that
+        link, so the rerun does not get its old index while the successor's
+        claim stands."""
+        clock = _FakeClock("2026-08-31T15:00:00Z")
+        first_m = _promote("01JG0000000000000000000001", "m", finished="2026-08-31T13:00:00Z")
+        write_manifest(store, _key_of(first_m), first_m, sleep=clock.sleep, clock=clock)
+        store.compare_and_swap(
+            money_path_claim_key(1),
+            ETAG_ABSENT,
+            json.dumps(
+                {
+                    "index": 1,
+                    "run_id": "01JG0000000000000000000002",
+                    "manifest_key": manifest_key("promote", TRADING_DAY, discriminator="s"),
+                }
+            ).encode("utf-8"),
+        )
+        before = store.get_bytes(_key_of(first_m))
+
+        rerun_m = _promote("01JG0000000000000000000003", "m", finished="2026-08-31T14:00:00Z")
+        with pytest.raises(MoneyPathChainError, match="could not claim"):
+            write_manifest(store, _key_of(rerun_m), rerun_m, sleep=clock.sleep, clock=clock)
+        assert store.get_bytes(_key_of(first_m)) == before
+
+
+class TestTheLocalBackendCreatesAtomically:
+    """The claims rest on create-if-absent. On S3 that is `IfNoneMatch='*'`;
+    locally it is an `os.link` exclusive create, which is atomic at the
+    filesystem rather than a check-then-write."""
+
+    def test_a_create_over_an_existing_key_loses_and_leaves_the_bytes(self, store) -> None:
+        store.compare_and_swap(money_path_claim_key(1), ETAG_ABSENT, b'{"a": 1}')
+        with pytest.raises(PointerConflictError, match="already exists"):
+            store.compare_and_swap(money_path_claim_key(1), ETAG_ABSENT, b'{"b": 2}')
+        assert store.get_bytes(money_path_claim_key(1)) == b'{"a": 1}'
+        # No temp file left beside it, won or lost.
+        assert list(store.list_keys(MONEY_PATH_CLAIMS_PREFIX)) == [money_path_claim_key(1)]
+
+    def test_the_claim_key_is_dateless_and_sorts_in_chain_order(self) -> None:
+        assert money_path_claim_key(11) == "runs/_money_path/claims/00000011.json"
+        assert money_path_claim_key(9) < money_path_claim_key(10)
+        with pytest.raises(ValueError):
+            money_path_claim_key(-1)
