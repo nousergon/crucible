@@ -46,6 +46,7 @@ __all__ = [
     "INTEGRATION_STORE_SUBPREFIX",
     "MANIFEST_BASENAME",
     "MIGRATIONS_ROOT",
+    "MONEY_PATH_CLAIMS_PREFIX",
     "POINTER_KEY",
     "PREDICTIONS_PREFIX",
     "PUBLIC_JSON_KEY",
@@ -119,6 +120,7 @@ __all__ = [
     "manifest_prefix",
     "manifest_ran_on",
     "migration_key",
+    "money_path_claim_key",
     "morning_history_row_key",
     "morning_report_key",
     "morning_trigger_key",
@@ -1385,6 +1387,28 @@ def backfill_key(trading_day: str, run_id: str) -> str:
     if not run_id:
         raise ValueError("run_id must be non-empty — see manifest_key's discriminator for why.")
     return f"backfills/{trading_day}/{run_id}.json"
+
+
+# -- the money-path chain's index claims (alpha-engine-config-I12020) --------
+
+#: Where a money-path manifest writer claims its chain index before writing.
+#: Outside `runs/` on purpose: `crucible.manifest.money_path_manifests` lists
+#: `runs/` to find the chain, and a claim is not a manifest.
+MONEY_PATH_CLAIMS_PREFIX = "money_path/claims/"
+
+
+def money_path_claim_key(index: int) -> str:
+    """The claim object for money-path chain index ``index``.
+
+    Dateless: a chain index is a position in one fleet-wide sequence, not a
+    property of any trading day. Zero-padded so a listing sorts in chain
+    order. Created with `Store.compare_and_swap(..., ETAG_ABSENT, ...)` by
+    `crucible.manifest.write_manifest` and never rewritten — the first
+    writer to create it owns that index.
+    """
+    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+        raise ValueError(f"a money-path chain index is a non-negative int, not {index!r}")
+    return f"{MONEY_PATH_CLAIMS_PREFIX}{index:08d}.json"
 
 
 # -- fleet ledger -----------------------------------------------------------

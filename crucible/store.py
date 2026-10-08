@@ -486,7 +486,18 @@ class LocalStore(Store):
         for the backend whose stated purpose is "a developer runs the whole
         thing against a directory": the production pointer lives in S3, where
         :class:`S3Store` makes this atomic at the service.
+
+        **The CREATE case is atomic here too** (`alpha-engine-config-I12020`).
+        With ``expected`` = :data:`ETAG_ABSENT` the payload is written to an
+        exclusive temp file and published with ``os.link``, which fails if the
+        key already exists — the filesystem's own create-if-absent, so two
+        local writers racing to create one key cannot both win. That is what
+        the money-path chain's index claims rely on. It also reads no version
+        token: a create has nothing to compare against, and the chain's
+        writer must never call :meth:`etag` (`nous-ergon-ops-I1145`).
         """
+        if expected == ETAG_ABSENT:
+            return self._create_if_absent(key, payload)
         current = self.etag(key)
         if current != expected:
             raise PointerConflictError(
@@ -500,6 +511,25 @@ class LocalStore(Store):
         with open(tmp, "xb") as fh:
             fh.write(payload)
         os.replace(tmp, path)
+        return sha256_hex(payload)
+
+    def _create_if_absent(self, key: str, payload: bytes) -> str:
+        """Publish ``payload`` at ``key`` only if nothing is there; atomically."""
+        path = self._path(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.create.tmp")
+        with open(tmp, "xb") as fh:
+            fh.write(payload)
+        try:
+            os.link(tmp, path)
+        except FileExistsError as exc:
+            raise PointerConflictError(
+                f"{key!r} already exists, not at the expected version (absent): the "
+                "create-if-absent write lost. Re-read it and decide — a retry here would "
+                "overwrite whatever the winning writer just published."
+            ) from exc
+        finally:
+            tmp.unlink()
         return sha256_hex(payload)
 
     def presigned_url(self, key: str, expires_s: int) -> str:
