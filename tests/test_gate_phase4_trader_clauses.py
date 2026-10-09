@@ -34,6 +34,7 @@ from crucible.gate import (
     PHASE4_DELIVERABLES,
     RECONCILIATION_FAULT,
     SCRIPTED_FAULTS,
+    SHADOW_BOOK_SETTLEMENT_LAG_SESSIONS,
     TRADER_RECONCILE_JOB,
     _clause_broker_reconciliation_control_arm_passed,
     _clause_execution_shortfall_row_graded,
@@ -447,6 +448,83 @@ class TestShadowBooksClause:
         _put(store, shadow_books_key("2026-09-11"), _shadow_doc(books))
         clause = _shadow_clause(store)
         assert not clause.met and controls[0] in clause.detail
+
+
+def _dated_shadow_doc(day: str, days: list[str], *, skip: str | None = None) -> dict:
+    """`_shadow_doc` filed for ``day``: both arms advanced on ``days`` (CHALLENGER
+    missing ``skip``), the shape `run_shadow_books` writes for that session."""
+    challenger_days = [d for d in days if d != skip]
+    doc = _shadow_doc([_book(ARM, days=days), _book(CHALLENGER, days=challenger_days)])
+    return {**doc, "trading_day": day, "calendar_date": day}
+
+
+class TestShadowBooksAreReadAtTheirSettlementLag:
+    """C29 (2026-10-03 run), `alpha-engine-config-I10653`: the book for ``D`` is
+    advanced only after ``D+1`` closes and the box runs it the morning after, so
+    the evening reading of ``D`` finds ``D-2`` at the newest. Before this the
+    clause asked for `shadow_books/{D}.json`, which no reading of ``D`` could find.
+    """
+
+    #: Evening of Friday 2026-09-11 on the box schedule: the 09-10 session
+    #: (09-11 10:45 ET, bound to the last closed session) has served 09-10, and
+    #: the 09-11 11:00 ET shadow-book run advanced 09-09's book as of 09-10.
+    SERVED = ["2026-09-08", "2026-09-09", "2026-09-10"]
+    ADVANCED = ["2026-09-08", "2026-09-09"]
+
+    def test_the_lag_is_two_sessions(self) -> None:
+        assert SHADOW_BOOK_SETTLEMENT_LAG_SESSIONS == 2
+
+    def test_the_book_the_box_schedule_files_by_the_evening_reading_is_met(self, store) -> None:
+        _put(store, TRADER_EVIDENCE_KEY, _evidence(self.SERVED))
+        _put(store, shadow_books_key("2026-09-09"), _dated_shadow_doc("2026-09-09", self.ADVANCED))
+        clause = _shadow_clause(store)
+        assert clause.met and not clause.unmeasurable, clause.detail
+        assert shadow_books_key("2026-09-09") in clause.evidence
+        assert "on all 2 served day(s)" in clause.detail
+
+    def test_a_served_day_missed_before_the_settled_book_is_still_unmet(self, store) -> None:
+        _put(store, TRADER_EVIDENCE_KEY, _evidence(self.SERVED))
+        _put(
+            store,
+            shadow_books_key("2026-09-09"),
+            _dated_shadow_doc("2026-09-09", self.ADVANCED, skip="2026-09-09"),
+        )
+        clause = _shadow_clause(store)
+        assert not clause.met
+        assert CHALLENGER in clause.detail and "2026-09-09" in clause.detail
+
+    def test_the_newest_book_is_read_not_the_best_older_one(self, store) -> None:
+        """A failing newer book is not hidden by a passing older one."""
+        _put(store, TRADER_EVIDENCE_KEY, _evidence(self.SERVED))
+        _put(store, shadow_books_key("2026-09-09"), _dated_shadow_doc("2026-09-09", self.ADVANCED))
+        _put(
+            store,
+            shadow_books_key("2026-09-10"),
+            _dated_shadow_doc("2026-09-10", self.SERVED, skip="2026-09-09"),
+        )
+        clause = _shadow_clause(store)
+        assert not clause.met
+        assert shadow_books_key("2026-09-10") in clause.detail
+
+    def test_a_book_older_than_the_lag_is_unmet_naming_every_key_looked_for(self, store) -> None:
+        _put(store, TRADER_EVIDENCE_KEY, _evidence(self.SERVED))
+        _put(store, shadow_books_key("2026-09-08"), _dated_shadow_doc("2026-09-08", ["2026-09-08"]))
+        clause = _shadow_clause(store)
+        assert not clause.met and not clause.unmeasurable
+        for day in ("2026-09-09", "2026-09-10", "2026-09-11"):
+            assert shadow_books_key(day) in clause.evidence
+        assert "2026-09-09..2026-09-11" in clause.detail
+
+    def test_the_lag_walks_back_over_a_holiday(self, store) -> None:
+        """Tuesday 2026-09-08's reading: the sessions before it are 09-04 and 09-03
+        (Labor Day 09-07 is not one)."""
+        _put(store, TRADER_EVIDENCE_KEY, _evidence(["2026-09-03", "2026-09-04"]))
+        _put(store, shadow_books_key("2026-09-03"), _dated_shadow_doc("2026-09-03", ["2026-09-03"]))
+        clause = _clause_shadow_books_cover_every_active_arm(
+            store, [dt.date(2026, 9, 1), dt.date(2026, 9, 8)]
+        )
+        assert clause.met, clause.detail
+        assert shadow_books_key("2026-09-03") in clause.evidence
 
 
 # ── registration and fault 5 ────────────────────────────────────────────────
