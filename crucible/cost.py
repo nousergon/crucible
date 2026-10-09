@@ -22,7 +22,8 @@ exception class, and `crucible.gate` turns that into an UNMEASURABLE clause
 naming the class rather than a met one.
 
 **Tag-filtered and unfiltered are the same reader.** Phase 2 grades the spend
-carrying `system=crucible-v2`; phase 4 grades the account total. A second
+carrying `system=crucible-v2`; phase 4 grades an independently reconciled
+allocation for harness, trader and shared costs (I12022). A second
 function for the second question is how two spellings of one reading drift
 apart, so the tag filter is a parameter and the ceiling belongs to the caller.
 
@@ -405,6 +406,28 @@ class CollectorSpendClient:
         self._now = now or (lambda: dt.datetime.now(dt.UTC))
         self._max_age = max_age
         self._days: dict[dt.date, dict[str, Any]] | None = None
+        self._scope: str | None = None
+        self._allocation: dict[str, Any] | None = None
+        self._allocated_amounts: dict[dt.date, float] | None = None
+
+    @property
+    def cache_namespace(self) -> str:
+        return f"{self._bucket}/{self._key}:{self._scope or 'account'}"
+
+    @property
+    def scope_label(self) -> str | None:
+        return f"allocated {self._scope}" if self._scope else None
+
+    def for_scope(self, scope: str) -> CollectorSpendClient:
+        """Keep the account reader intact while projecting a verified allocation."""
+        import copy  # noqa: PLC0415 - only a scoped projection needs a clone
+
+        if scope != "crucible-and-trader":
+            raise CostUnreadableError(f"undeclared cost scope {scope!r}")
+        scoped = copy.copy(self)
+        scoped._scope = scope
+        scoped._allocated_amounts = None
+        return scoped
 
     def _load(self) -> dict[dt.date, dict[str, Any]]:
         if self._days is not None:
@@ -444,6 +467,7 @@ class CollectorSpendClient:
                 "the collector's series is truncated (Cost Explorer returned a second page it "
                 "did not fetch); a missing day is not a free day"
             )
+        self._allocation = detail.get("cost_allocation")
         self._days = {dt.date.fromisoformat(d["date"]): d for d in series.get("days") or []}
         return self._days
 
@@ -455,6 +479,60 @@ class CollectorSpendClient:
             raise CostUnreadableError(
                 f"the expense collector's series has no {day.isoformat()}; it covers {covers}"
             )
+        if self._scope is not None:
+            if tagged:
+                raise CostUnreadableError("a component allocation cannot also be tag-filtered")
+            if self._allocated_amounts is None:
+                from crucible.cost_allocation import CostAllocation  # noqa: PLC0415 - scoped only
+
+                if self._allocation is None:
+                    raise CostUnreadableError(
+                        "cost_allocation.v1 is absent: trader and shared allocation is unknown"
+                    )
+                try:
+                    allocation = CostAllocation.model_validate(self._allocation)
+                    self._allocated_amounts = allocation.amounts(days, scope=self._scope)
+                except ValueError as exc:
+                    from pydantic import ValidationError  # noqa: PLC0415 - scoped only
+
+                    if isinstance(exc, ValidationError):
+                        # Paths/types only: validation inputs may contain private resource IDs.
+                        errors = exc.errors(
+                            include_url=False, include_context=False, include_input=False
+                        )
+                        diagnostic = "; ".join(
+                            ".".join(
+                                str(part)
+                                if isinstance(part, int)
+                                or part
+                                in {
+                                    "schema_version",
+                                    "inventory_complete",
+                                    "inventory_evidence",
+                                    "covered_components",
+                                    "declared_scopes",
+                                    "days",
+                                    "date",
+                                    "account_usd",
+                                    "members",
+                                    "id",
+                                    "scope",
+                                    "component",
+                                    "kind",
+                                    "usd",
+                                    "evidence",
+                                }
+                                else "unknown_field"
+                                for part in error["loc"]
+                            )
+                            + ": "
+                            + error["type"]
+                            for error in errors[:5]
+                        )
+                    else:
+                        diagnostic = str(exc)  # contract errors are static, never member inputs
+                    raise CostUnreadableError(f"invalid cost allocation: {diagnostic}") from exc
+            return self._allocated_amounts[day], bool(entry.get("estimated", False))
         by_system = entry.get("by_system_usd") or {}
         amount = (
             float(by_system.get(TAG_VALUE, 0.0))
@@ -574,7 +652,9 @@ def month_to_date_usd(
         start=start,
         end=end,
         amount_usd=sum(amounts),
-        tag_filter=f"{TAG_KEY}={TAG_VALUE}" if tagged else None,
+        tag_filter=(
+            getattr(client, "scope_label", None) or (f"{TAG_KEY}={TAG_VALUE}" if tagged else None)
+        ),
     )
 
 
@@ -610,7 +690,9 @@ def trailing_daily_usd(
         start=start,
         end=today,
         amounts_usd=tuple(amounts),
-        tag_filter=f"{TAG_KEY}={TAG_VALUE}" if tagged else None,
+        tag_filter=(
+            getattr(client, "scope_label", None) or (f"{TAG_KEY}={TAG_VALUE}" if tagged else None)
+        ),
     )
 
 
@@ -639,7 +721,9 @@ def closed_month_usd(
         end=end,
         amount_usd=amount,
         estimated=estimated,
-        tag_filter=f"{TAG_KEY}={TAG_VALUE}" if tagged else None,
+        tag_filter=(
+            getattr(client, "scope_label", None) or (f"{TAG_KEY}={TAG_VALUE}" if tagged else None)
+        ),
     )
 
 
@@ -715,7 +799,14 @@ def _get_cost_and_usage(
     }
     if tagged:
         request["Filter"] = {"Tags": {"Key": TAG_KEY, "Values": [TAG_VALUE]}}
-    key = ("get_cost_and_usage", start.isoformat(), end.isoformat(), granularity, tagged)
+    key = (
+        "get_cost_and_usage",
+        getattr(client, "cache_namespace", "legacy"),
+        start.isoformat(),
+        end.isoformat(),
+        granularity,
+        tagged,
+    )
 
     def fetch() -> dict[str, Any]:
         try:
