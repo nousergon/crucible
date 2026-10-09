@@ -38,9 +38,22 @@ updates:
     # this entry when an arcticdb release drops the `pandas<3` bound — that is
     # the only event that makes the update possible, and it is visible on
     # arcticdb's PyPI metadata (`requires_dist`).
+    #
+    # `nousergon-lib` is ignored for a different reason: it is pinned in TWO
+    # places that must move together -- `nousergon-lib[github-app,gates]` in
+    # `dependencies` and `nousergon-lib[arcticdb]` in the `arcticdb` extra --
+    # and Dependabot bumps each requirement separately. Either bump alone is
+    # unsatisfiable (`crucible[arcticdb] depends on nousergon-lib[arcticdb]==
+    # 0.124.165 and your project depends on nousergon-lib==0.124.167`), so the
+    # weekly `uv` job went red on run 37654309287 (2026-10-07) with
+    # `dependency_file_not_resolvable` on both requirements. First-party bumps
+    # here are deliberate and land with the feature that needs the new release
+    # and the regenerated `uv.lock` (see #336, #365, #378), never as a bot
+    # PR. Remove this entry if the two pins are ever collapsed into one.
     ignore:
       - dependency-name: pandas
         versions: [">=3"]
+      - dependency-name: nousergon-lib
     groups:
       minor-and-patch:
         update-types:
