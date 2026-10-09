@@ -37,6 +37,7 @@ __all__ = [
     "BOARD_HTML_KEY",
     "CONSOLE_JSON_KEY",
     "CONSOLE_KEY",
+    "DAILY_CHAIN_LOCK_KEY",
     "DATA_BUCKET_KEY_HELPERS",
     "DISPATCH_EXIT_SUFFIX",
     "DISPATCH_ROOT",
@@ -1399,6 +1400,19 @@ def backfill_key(trading_day: str, run_id: str) -> str:
 #: manifest, and `money_path_manifests` admits only keys
 #: :func:`is_manifest_key` accepts, so the chain listing skips it.
 MONEY_PATH_CLAIMS_PREFIX = "runs/_money_path/claims/"
+
+
+#: The ONE lease every `data.daily` and `serve.daily` run holds while it
+#: decides and writes (`crucible.daily_chain`, alpha-engine-config-I12020).
+#: Those runs have several starters — the collection's completion event, the
+#: 21:15 ET `data-daily` backstop and the three `serve-daily-*` backstops — and
+#: `serve.daily --slot m` writes the money-path feed, so two of them deciding
+#: "not done yet" at the same moment would be two writers of one session.
+#: Fleet-wide and dateless on purpose: the money-path chain they extend is one
+#: sequence, not one per trading day. Under `runs/` for the reason
+#: :data:`MONEY_PATH_CLAIMS_PREFIX` is: every identity that writes these
+#: manifests is already granted it, and a lease is not a manifest.
+DAILY_CHAIN_LOCK_KEY = "runs/_locks/daily_chain.json"
 
 
 def money_path_claim_key(index: int) -> str:

@@ -114,6 +114,19 @@ components:
     # The 21:00 ET `alerts.sweep` therefore no longer grades day d's absence
     # on day d; the next evening's pass does, through `days_to_evaluate`'s
     # catch-up. A run that STARTS and fails still pages from the box on exit.
+    #
+    # The schedule is the BACKSTOP, not the only starter
+    # (alpha-engine-config-I12020). On 2026-10-07/08 D32 landed at 04:07Z and
+    # 03:18Z, after this schedule had failed with no retry, and two sessions
+    # were lost. nous-ergon-ops `crucible-v2.yaml` also dispatches
+    # `data.daily --skip-if-ok --then-serve` when `ne-data-collection-eod`
+    # (scheduled run or heal) SUCCEEDS, so the compile and the serve chain run
+    # when the data lands. Same job, same dispatcher, same box shell, so the
+    # value below stays `scheduler`: the event is a second firing of the
+    # declared starter's dispatch, not a new kind of starter.
+    # `crucible.daily_chain` holds the two rules that make several starters
+    # safe: `--skip-if-ok` never redoes an `ok` day, and one lease means one
+    # writer at a time.
     deadline:
       anchor: close_plus
       cadence: daily
@@ -329,6 +342,13 @@ components:
     # same feature layer and can fire with M. `--slot s` reads both of their
     # outputs, so it fires after them; one that fires early fails loud on the
     # absent M predictions or U cut rather than recording a partial session.
+    #
+    # Those schedules are backstops now (alpha-engine-config-I12020): the
+    # normal producer is `data.daily --then-serve`, which runs M, U, S in that
+    # order on one box as soon as the compile is `ok`. Every starter passes
+    # `--skip-if-ok` and holds the daily-chain lease (`crucible.daily_chain`),
+    # so a backstop over a served slot files a no-op, and M and U firing
+    # together at 22:15 ET run one after the other rather than at once.
     #
     # 7h = 23:00 ET: 45 min past the M firing for a run that fits each served
     # arm once (the fit of record, re-derived and proven) and scores one
