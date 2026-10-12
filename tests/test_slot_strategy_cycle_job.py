@@ -1351,6 +1351,82 @@ class TestAWeeklyBookIsAttributedOverTheSessionItEarned:
             assert row["contribution_return"] != pytest.approx(row["exposure"] * entered), row
 
 
+class TestANameThePanelDroppedIsAttributedOnlyIfHeld:
+    """`alpha-engine-config-I12020`: the 2026-10-09 S grade failed with
+    ``holding 'OLN' has no row in the price panel``.
+
+    The 10-09 panel carried no row for OLN, PSKY or WBD at all — their whole
+    history left with them when they left the price universe — while the
+    09-18 and 10-02 sessions had recorded all three as PRICED names. The S
+    universe is the union of every recorded session's priced names, so all
+    three entered the attribution loop; every one of them was ineligible and
+    carried weight 0.0 on every session. A name the book never held is not a
+    position, and there is nothing to attribute. A name it DID hold still has
+    no return series, and that still fails the slot.
+    """
+
+    @staticmethod
+    def _drop_from_panel(store, tickers) -> None:
+        key = data_panel_key(AS_OF.isoformat())
+        panel = pd.read_parquet(__import__("io").BytesIO(store.get_bytes(key)))
+        store.put_bytes(key, panel[~panel["ticker"].isin(tickers)].to_parquet(index=False))
+
+    @staticmethod
+    def _held_names(monkeypatch, store, settings) -> set[str]:
+        """Every name any constructed book weighted, measured off a real grade."""
+        held: set[str] = set()
+        real = strategy_module.construct_book
+
+        def spy(**kwargs):
+            constructed = real(**kwargs)
+            tickers = kwargs["universe"].tickers
+            for weights in constructed.weights:
+                held.update(t for t, w in zip(tickers, weights, strict=True) if float(w) != 0.0)
+            return constructed
+
+        monkeypatch.setattr(strategy_module, "construct_book", spy)
+        _result, manifest, _ctx = _run_grade(store, settings)
+        monkeypatch.setattr(strategy_module, "construct_book", real)
+        assert manifest["status"] == "ok", manifest.get("reason")
+        return held - {"SPY", strategy_module.CASH_TICKER}
+
+    def test_a_never_held_name_missing_from_the_panel_does_not_fail_the_grade(
+        self, world, monkeypatch
+    ) -> None:
+        """OLN's shape exactly: priced by M, outside U's cut, so ineligible on
+        every session and pinned to weight zero by the solver."""
+        store, settings, _root, days = world
+        _run_produce(store, settings, days)
+        priced = set(
+            load_store_document(store, arm_predictions_key(M_CHAMPION, days[0].isoformat()))[
+                "predicted_alpha"
+            ]
+        )
+        cut = set(
+            load_store_document(store, shadow_key(U_CHAMPION, days[0].isoformat()))["selection"]
+        )
+        ineligible = sorted(priced - cut)
+        assert ineligible, "the fixture must price a name outside the U cut"
+        assert not set(ineligible) & self._held_names(monkeypatch, store, settings)
+        self._drop_from_panel(store, ineligible)
+
+        _result, manifest, _ctx = _run_grade(store, settings)
+
+        assert manifest["status"] == "ok", manifest.get("reason")
+
+    def test_a_held_name_missing_from_the_panel_still_fails_the_grade(
+        self, world, monkeypatch
+    ) -> None:
+        store, settings, _root, days = world
+        _run_produce(store, settings, days)
+        held = sorted(self._held_names(monkeypatch, store, settings))
+        assert held, "the fixture's book must hold at least one name"
+        self._drop_from_panel(store, held)
+
+        with pytest.raises(MissingArtifactError, match="has no row in the price panel"):
+            _run_grade(store, settings)
+
+
 class TestTheInputsAreNamedWhenTheyAreAbsent:
     """Every refusal on this path names the KEY the operator's next action is
     about. A reason that does not name it sends them looking."""
