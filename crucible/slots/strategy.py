@@ -1136,6 +1136,14 @@ def _attribute_book(
     fit = fit.tail(COVARIANCE_LOOKBACK_TRADING_DAYS)
     fit_days = [str(day) for day in fit.index]
 
+    # Every name the book carried a non-zero weight in on ANY session — not
+    # just the last, because an earlier session's realized return was earned
+    # on that session's weights.
+    ever_held = {
+        ticker
+        for i, ticker in enumerate(universe.tickers)
+        if any(float(w[i]) != 0.0 for w in constructed.weights)
+    }
     holding_returns: dict[str, list[float]] = {}
     for ticker in universe.tickers:
         if ticker == CASH_TICKER:
@@ -1145,6 +1153,16 @@ def _attribute_book(
             holding_returns[ticker] = [0.0] * len(fit_days)
             continue
         if ticker not in returns.columns:
+            if ticker not in ever_held:
+                # `alpha-engine-config-I12020`: a name the universe carries
+                # because a recorded session PRICED it, at weight zero on every
+                # session, is not a position — there is nothing to attribute,
+                # and leaving it out of the fit changes no number (each name's
+                # loadings are its own regression, and `portfolio_risk` weights
+                # it zero). The 2026-10-09 panel dropped OLN, PSKY and WBD's
+                # entire history once they left the price universe; all three
+                # were ineligible, never held, and failed the whole S grade.
+                continue
             raise MissingArtifactError(
                 f"attribution over the book graded {as_of}: holding {ticker!r} has no row "
                 "in the price panel this book was constructed over. A book position with "
@@ -1191,7 +1209,11 @@ def _attribute_book(
         factor_returns[name] = factor_return_series(fdef, fit_proxy)
         attributed_factor_returns[name] = factor_return_series(fdef, earned_proxy)
 
-    weights = dict(zip(universe.tickers, constructed.weights[-1], strict=True))
+    weights = {
+        ticker: weight
+        for ticker, weight in zip(universe.tickers, constructed.weights[-1], strict=True)
+        if ticker in holding_returns
+    }
     return compute_factor_attribution(
         trading_day=settle_days[-1],
         window_sessions=len(fit_days),
