@@ -21,7 +21,6 @@ import json
 import pytest
 
 from crucible.champion import (
-    ATTESTATION_METRIC,
     ChampionUnusableError,
     _assert_attested,
     champion_key,
@@ -34,7 +33,7 @@ from crucible.promote import (
 )
 from crucible.slots import get_slot
 from crucible.store import LocalStore
-from tests.support.manifests import write_grade_manifest
+from tests.support.manifests import attestation_row, write_grade_manifest
 from tests.test_promote import (
     CODE_SHA,
     _cycle_for,
@@ -45,29 +44,8 @@ from tests.test_promote import (
 )
 
 
-def _row(arm_id: str, status: str, *, kind: str = "pit_parity") -> dict:
-    """An `ATTESTATION_METRIC` row in the shape `crucible.slots.strategy.grade` files."""
-    return {
-        "name": ATTESTATION_METRIC,
-        "module": "crucible.slots.s",
-        "metric_type": "gauge",
-        "value": 1.0,
-        "unit": "ratio",
-        "n_floor": 1,
-        "status": "OK" if status == "PASS" else "FAIL",
-        "status_reason": f"{arm_id}: pit_parity {status}",
-        "source_path": "experiments/x/",
-        "last_updated_utc": "2026-10-09T18:00:00Z",
-        "arm_id": arm_id,
-        "attestation": {
-            "kind": kind,
-            "status": status,
-            "reason": f"fixture {status}",
-            "mean_delta": 0.0,
-            "ci": [0.0, 0.0],
-            "coverage_fraction": 1.0,
-        },
-    }
+def _row(arm_id: str, status: str) -> dict:
+    return attestation_row(arm_id, status)
 
 
 class TestReadGradedAttestation:

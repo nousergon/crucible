@@ -52,6 +52,35 @@ def write_grade_manifest(
     return key
 
 
+def attestation_row(arm_id: str, status: str = "PASS", *, kind: str = "pit_parity") -> dict:
+    """One `crucible.champion.ATTESTATION_METRIC` row, in the shape
+    `crucible.slots.strategy.grade` files for each graded S arm and
+    `crucible.promote.read_graded_attestation` reads back."""
+    from crucible.champion import ATTESTATION_METRIC
+
+    return {
+        "name": ATTESTATION_METRIC,
+        "module": "crucible.slots.s",
+        "metric_type": "gauge",
+        "value": 1.0,
+        "unit": "ratio",
+        "n_floor": 1,
+        "status": "OK" if status == "PASS" else "FAIL",
+        "status_reason": f"{arm_id}: pit_parity {status}",
+        "source_path": "experiments/fixture/",
+        "last_updated_utc": "2026-10-09T18:00:00Z",
+        "arm_id": arm_id,
+        "attestation": {
+            "kind": kind,
+            "status": status,
+            "reason": f"fixture {status}",
+            "mean_delta": 0.0,
+            "ci": [0.0, 0.0],
+            "coverage_fraction": 1.0,
+        },
+    }
+
+
 def only_manifest(store: Store, job: str, trading_day: str) -> tuple[str, dict]:
     """The ONE manifest ``job`` filed for ``trading_day``, and its key.
 
