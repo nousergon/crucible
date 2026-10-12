@@ -55,6 +55,9 @@ from nousergon_lib.arena.arms import EVENT_RETIRED, ArmEvent, ImmutableArmError
 from crucible.arena_io import read_arena_cycle
 from crucible.calendar import TRADING_DAYS_PER_WEEK, assert_trading_day
 from crucible.champion import (
+    ATTESTATION_METRIC,
+    ATTESTATION_PASS,
+    ATTESTED_SLOTS,
     PROMOTION_SOURCES,
     ChampionPointer,
     read_champion,
@@ -99,6 +102,7 @@ __all__ = [
     "load_arm_register",
     "load_slot_inputs",
     "paired_days_required",
+    "read_graded_attestation",
     "read_graded_cycle",
     "retirement_log_key",
     "revert_champion",
@@ -166,6 +170,121 @@ def paired_days_required(spec: SlotSpec) -> int:
     return spec.promote_min_weeks * TRADING_DAYS_PER_WEEK
 
 
+def _read_ok_grade_manifest(store: Store, slot: str, as_of: str) -> tuple[str, dict[str, Any]]:
+    """``(key, manifest)`` of the `experiment.grade` run for ``(slot, as_of)``,
+    refused unless it exists and finished ``ok``. Shared by
+    :func:`read_graded_cycle` and :func:`read_graded_attestation`: both act on
+    what that run measured, and neither may act on a run nothing vouches for.
+    """
+    grade_manifest_key = _promote_manifest_key("experiment.grade", as_of, discriminator=slot)
+    try:
+        grade_manifest = load_store_document(store, grade_manifest_key)
+    except KeyError as exc:
+        raise PromotionRefused(
+            f"slot {slot!r} has no `experiment.grade` run manifest at {grade_manifest_key!r} "
+            f"for {as_of}. `promote` acts on the cycle `experiment.grade` computed rather "
+            "than recomputing it, so deciding the pointer "
+            "without a manifest attesting to that run would decide it on an artifact "
+            "nothing vouches for. Run `experiment.grade --slot "
+            f"{slot} --date {as_of}` first; the weekly arc already does, at 14:00."
+        ) from exc
+    if grade_manifest.get("status") != "ok":
+        raise PromotionRefused(
+            f"slot {slot!r}'s `experiment.grade` run for {as_of} did not succeed — "
+            f"status={grade_manifest.get('status')!r}, reason="
+            f"{grade_manifest.get('reason') or '<none>'!r}, run_id="
+            f"{grade_manifest.get('run_id')!r}, at {grade_manifest_key!r}. Acting on a cycle "
+            "a FAILED grade run may have partially written would decide the pointer on "
+            "evidence nobody vouched for."
+        )
+    return grade_manifest_key, grade_manifest
+
+
+def read_graded_attestation(store: Store, slot: str, as_of: str, arm_id: str) -> dict[str, Any]:
+    """The `pit_parity` attestation `experiment.grade` MEASURED for ``arm_id``
+    on ``as_of``, shaped for the champion pointer — or a refusal.
+
+    Plan §9.1: an S champion with no attestation `PASS` renders UNVERIFIED,
+    and `crucible.champion._assert_attested` refuses it at the reader. Neither
+    pointer writer used to attach one: `crucible.cli._promote` passed no
+    ``attestation=`` on either path, so every S pointer this harness could
+    write was one the trader would refuse — the 2026-10-07 operator revert
+    wrote exactly that, and the 2026-10-12 session was refused on it.
+
+    The attestation is READ, never computed here and never typed by an
+    operator: the grade run measured it (``ATTESTATION_METRIC`` rows on its
+    own manifest, one per graded arm) and this returns that measurement,
+    with ``key`` naming the manifest it came from. Refused, loudly, when the
+    grade run is absent or failed, when it attested no such arm, when it
+    attested it more than once, or when the verdict is not ``PASS`` — a
+    pointer the reader will refuse is not written in the first place.
+    """
+    grade_manifest_key, grade_manifest = _read_ok_grade_manifest(store, slot, as_of)
+    rows = [
+        row
+        for row in grade_manifest.get("metrics") or ()
+        if row.get("name") == ATTESTATION_METRIC and row.get("arm_id") == arm_id
+    ]
+    if len(rows) != 1:
+        raise PromotionRefused(
+            f"slot {slot!r}: the `experiment.grade` run for {as_of} at {grade_manifest_key!r} "
+            f"carries {len(rows)} {ATTESTATION_METRIC!r} row(s) for {arm_id!r}, not one. "
+            "Plan §9.1: a champion without a measured attestation PASS renders UNVERIFIED, "
+            "and the trader refuses it. Grade the arm on this day first "
+            f"(`experiment.grade --slot {slot} --date {as_of}`) and seat it from that run."
+        )
+    verdict = rows[0].get("attestation") or {}
+    status = verdict.get("status")
+    if verdict.get("kind") != "pit_parity" or status != ATTESTATION_PASS:
+        raise PromotionRefused(
+            f"slot {slot!r}: {arm_id} was graded on {as_of} with a {verdict.get('kind')!r} "
+            f"attestation of {status!r}, not {ATTESTATION_PASS!r} "
+            f"({verdict.get('reason') or 'no reason recorded'}; mean delta "
+            f"{verdict.get('mean_delta')!r}, interval {verdict.get('ci')!r}, coverage "
+            f"{verdict.get('coverage_fraction')!r}). Plan §9.1: it would render UNVERIFIED, "
+            "and the trader refuses a pointer that does — so it is not written."
+        )
+    return {
+        "kind": "pit_parity",
+        "status": status,
+        "key": grade_manifest_key,
+        "reason": (
+            f"measured by experiment.grade run {grade_manifest.get('run_id')} on {as_of}: "
+            f"{verdict.get('reason')} (mean delta {verdict.get('mean_delta')!r}, interval "
+            f"{verdict.get('ci')!r}, coverage {verdict.get('coverage_fraction')!r})"
+        ),
+    }
+
+
+def _attestation_for(
+    store: Store,
+    spec: SlotSpec,
+    *,
+    as_of: str,
+    arm_id: str,
+    attestation: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """The attestation a pointer for ``arm_id`` carries, resolved for both writers.
+
+    Outside :data:`~crucible.champion.ATTESTED_SLOTS`, whatever the caller
+    passed (normally ``None``). Inside, the caller's own attestation if it
+    passed one that is ``PASS``, else the one :func:`read_graded_attestation`
+    reads off the grade run — and a refusal either way rather than a pointer
+    `crucible.champion._assert_attested` would refuse.
+    """
+    if spec.slot not in ATTESTED_SLOTS:
+        return attestation
+    if attestation is None:
+        return read_graded_attestation(store, spec.slot, as_of, arm_id)
+    if attestation.get("status") != ATTESTATION_PASS:
+        raise PromotionRefused(
+            f"slot {spec.slot!r}: the attestation supplied for {arm_id} is "
+            f"{attestation.get('status')!r}, not {ATTESTATION_PASS!r}. Plan §9.1: the "
+            "pointer would render UNVERIFIED and the trader refuses it."
+        )
+    return attestation
+
+
 def read_graded_cycle(store: Store, slot: str, as_of: str) -> ArenaCycle:
     """The cycle `experiment.grade` computed for ``(slot, as_of)`` — READ, never recomputed.
 
@@ -196,27 +315,7 @@ def read_graded_cycle(store: Store, slot: str, as_of: str) -> ArenaCycle:
     15:00 (plan §4.4), so the ordinary absent case is "grade has not run yet
     today", named in the refusal.
     """
-    grade_manifest_key = _promote_manifest_key("experiment.grade", as_of, discriminator=slot)
-    try:
-        grade_manifest = load_store_document(store, grade_manifest_key)
-    except KeyError as exc:
-        raise PromotionRefused(
-            f"slot {slot!r} has no `experiment.grade` run manifest at {grade_manifest_key!r} "
-            f"for {as_of}. `promote` acts on the cycle `experiment.grade` computed rather "
-            "than recomputing it, so deciding the pointer "
-            "without a manifest attesting to that run would decide it on an artifact "
-            "nothing vouches for. Run `experiment.grade --slot "
-            f"{slot} --date {as_of}` first; the weekly arc already does, at 14:00."
-        ) from exc
-    if grade_manifest.get("status") != "ok":
-        raise PromotionRefused(
-            f"slot {slot!r}'s `experiment.grade` run for {as_of} did not succeed — "
-            f"status={grade_manifest.get('status')!r}, reason="
-            f"{grade_manifest.get('reason') or '<none>'!r}, run_id="
-            f"{grade_manifest.get('run_id')!r}, at {grade_manifest_key!r}. Acting on a cycle "
-            "a FAILED grade run may have partially written would decide the pointer on "
-            "evidence nobody vouched for."
-        )
+    grade_manifest_key, grade_manifest = _read_ok_grade_manifest(store, slot, as_of)
     cycle_key = arena_cycle_key(slot, as_of)
     claimed = {output.get("key") for output in grade_manifest.get("outputs") or ()}
     if cycle_key not in claimed:
@@ -532,6 +631,10 @@ def revert_champion(
     # target rule as the evidence path. The 2026-10-07 M pointer named a
     # magnitude head seated by exactly this function, and nothing checked.
     _refuse_unsigned_champion(store, spec, arm_id, how="operator revert")
+    # An operator revert names the arm, never its attestation: for an
+    # attested slot the pointer carries what `experiment.grade` measured for
+    # that arm on this day, or nothing is written.
+    attestation = _attestation_for(store, spec, as_of=as_of, arm_id=arm_id, attestation=attestation)
 
     decided_at = _utc(now)
     pointer = ChampionPointer(
@@ -680,6 +783,13 @@ def _write_pointer_if_moved(
             }
         )
 
+    # The engine only promotes an arm whose `pit_parity_attested` serving
+    # precondition passed, so on an attested slot this reads that same PASS
+    # back off the grade run — and refuses rather than writing a pointer the
+    # trader would refuse, if it somehow is not there.
+    attestation = _attestation_for(
+        store, spec, as_of=decision.as_of, arm_id=decision.champion, attestation=attestation
+    )
     pointer = ChampionPointer(
         slot=spec.slot,
         arm_id=decision.champion,

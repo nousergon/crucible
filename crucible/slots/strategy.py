@@ -2102,7 +2102,7 @@ def resolve_session(store: Any, *, trading_day: str, ctx: Any = None) -> Resolve
     )
     cut: set[str] | None = None
     eligibility_source = (
-        f"absent — {u_pointer} names no arm, so every name the M champion priced is "
+        f"{_ABSENT_SOURCE_PREFIX}{u_pointer} names no arm, so every name the M champion priced is "
         "eligible. A recorded absence, not a cut that happened to include everything."
     )
     if u_champion:
@@ -2136,6 +2136,30 @@ def resolve_session(store: Any, *, trading_day: str, ctx: Any = None) -> Resolve
                 f"    crucible serve.daily --slot u --date {trading_day}"
             )
 
+    return _resolved_session(
+        trading_day=trading_day,
+        predicted=predicted,
+        cut=cut,
+        alpha_source=arm_predictions_key(champion, trading_day),
+        eligibility_source=eligibility_source,
+    )
+
+
+def _resolved_session(
+    *,
+    trading_day: str,
+    predicted: Mapping[str, float],
+    cut: set[str] | None,
+    alpha_source: str,
+    eligibility_source: str,
+) -> ResolvedSession:
+    """A :class:`ResolvedSession` from an alpha cross-section and an eligibility cut.
+
+    The one place the document is assembled, shared by :func:`resolve_session`
+    (the decision-date resolution) and :func:`re_resolve_session` (the
+    attestation's re-read of the same sources), so the two passes
+    :func:`pit_parity` compares can differ only in the bytes they read.
+    """
     tickers = tuple(sorted(predicted))
     eligibility = tuple(True if cut is None else t in cut for t in tickers)
     return ResolvedSession(
@@ -2148,7 +2172,7 @@ def resolve_session(store: Any, *, trading_day: str, ctx: Any = None) -> Resolve
         # per-name bound to `max_sector_pct`, `min_position_pct` and the
         # optimizer, which are the constraints that DO have declared values.
         stance_caps=tuple(1.0 for _ in tickers),
-        alpha_source=arm_predictions_key(champion, trading_day),
+        alpha_source=alpha_source,
         eligibility_source=eligibility_source,
         sectors_source=(
             "absent — the v2 price panel carries no sector column and the feature "
@@ -2160,6 +2184,99 @@ def resolve_session(store: Any, *, trading_day: str, ctx: Any = None) -> Resolve
             "recorded absence: the binding per-name constraints this cycle are "
             "`min_position_pct`, `max_sector_pct` and the optimizer's own."
         ),
+    )
+
+
+#: How :func:`resolve_session` spells "no U champion, no cut" in
+#: ``eligibility_source``. Read back by :func:`re_resolve_session`.
+_ABSENT_SOURCE_PREFIX = "absent — "
+
+
+def re_resolve_session(store: Any, *, recorded: ResolvedSession) -> ResolvedSession:
+    """Re-read the SAME sources ``recorded`` was resolved from, as they stand today.
+
+    The contamination half of the §9.1 attestation (:func:`_attest`). Its
+    question is "has anything this session was constructed from been REVISED
+    since the decision date?", so the second pass must read the artifacts the
+    session recorded — ``alpha_source`` and ``eligibility_source`` — and
+    nothing else.
+
+    It used to call :func:`resolve_session`, which re-reads the CURRENT M and
+    U champion pointers. Once either pointer moved, the second pass built the
+    book on a different model's predictions and a different selection's cut,
+    and the delta measured the champion change rather than any revision:
+    measured on the 2026-10-09 S grade, after M moved from
+    `v3meta_volatility_head` to `residual_momentum` and U from
+    `attractiveness_momzero` to `attractiveness`, every S arm rendered FAIL
+    ("MATERIAL contamination", mean delta +0.0296/session) while not one
+    recorded input had been revised. A check that fails every arm whenever an
+    upstream champion moves is not measuring contamination, and an operator
+    taught to read its FAIL as noise is an operator who will read a real one
+    the same way.
+
+    Every guard the decision-date read applies is applied again here
+    (`read_arm_predictions`' point-in-time and identity checks, the U feed's
+    slot/session check). A source this reader does not recognise raises, and
+    :func:`_attest` records that as reduced COVERAGE — `PARTIAL`, a refusal —
+    never as a clean pass.
+    """
+    from crucible.documents import load_store_document  # noqa: PLC0415 - avoids a cycle
+    from crucible.keys import (  # noqa: PLC0415 - avoids a cycle
+        ARM_PREDICTIONS_PREFIX,
+        arm_id_from_segment,
+        shadow_key,
+        universe_members_key,
+    )
+    from crucible.slots.cycle import MissingArtifactError  # noqa: PLC0415 - avoids a cycle
+    from crucible.slots.inputs import read_arm_predictions  # noqa: PLC0415 - avoids a cycle
+
+    day = recorded.trading_day
+    alpha_source = recorded.alpha_source
+    segment = alpha_source.removeprefix(ARM_PREDICTIONS_PREFIX).removesuffix(f"/{day}.json")
+    m_arm = arm_id_from_segment(segment) if segment and "/" not in segment else None
+    if m_arm is None or arm_predictions_key(m_arm, day) != alpha_source:
+        raise MissingArtifactError(
+            f"session {day} recorded alpha_source {alpha_source!r}, which is not an "
+            "arm-predictions key for that session; the attestation cannot re-read a "
+            "source it cannot name."
+        )
+    predicted = read_arm_predictions(store, arm_id=m_arm, trading_day=day)
+
+    eligibility_source = recorded.eligibility_source
+    cut: set[str] | None
+    if eligibility_source.startswith(_ABSENT_SOURCE_PREFIX):
+        cut = None
+    elif eligibility_source == universe_members_key(day):
+        feed = load_store_document(store, eligibility_source)
+        if feed.get("slot") != "u" or feed.get("trading_day") != day:
+            raise MissingArtifactError(
+                f"{eligibility_source} now serves slot {feed.get('slot')!r}, session "
+                f"{feed.get('trading_day')!r}; session {day} recorded it as its U cut."
+            )
+        cut = {str(t) for t in feed["members"]}
+    elif eligibility_source.startswith("experiments/") and eligibility_source.endswith(
+        f"/{day}/shadow.json"
+    ):
+        u_segment = eligibility_source.removeprefix("experiments/").removesuffix(
+            f"/{day}/shadow.json"
+        )
+        if shadow_key(arm_id_from_segment(u_segment), day) != eligibility_source:
+            raise MissingArtifactError(
+                f"session {day} recorded eligibility_source {eligibility_source!r}, which "
+                "is not a shadow key for that session."
+            )
+        cut = {str(t) for t in load_store_document(store, eligibility_source)["selection"]}
+    else:
+        raise MissingArtifactError(
+            f"session {day} recorded eligibility_source {eligibility_source!r}, which this "
+            "reader does not recognise; the attestation cannot re-read it."
+        )
+    return _resolved_session(
+        trading_day=day,
+        predicted=predicted,
+        cut=cut,
+        alpha_source=alpha_source,
+        eligibility_source=eligibility_source,
     )
 
 
@@ -2788,6 +2905,40 @@ def _attestation_precondition(verdict: PitParityVerdict) -> ServingPrecondition:
     )
 
 
+def _attestation_metric(arm_id: str, verdict: PitParityVerdict) -> dict[str, Any]:
+    """One arm's measured §9.1 verdict, as a row on THIS grade run's manifest.
+
+    The precondition above decides whether the arm may be promoted this
+    cycle; this row is what a pointer for the arm CARRIES. The arena cycle
+    records only the arms a precondition refused, so without this row a PASS
+    existed nowhere a pointer writer could read it, and no S pointer ever
+    carried one — `crucible.promote.read_graded_attestation` reads it back,
+    on both the evidence path and the operator revert.
+
+    ``status`` is the manifest's coverage vocabulary — ``OK`` only for
+    ``PASS``, ``FAIL`` for every refusal including ``PARTIAL`` and
+    ``UNKNOWN`` — and the verdict itself, in its own closed vocabulary,
+    travels unchanged under ``attestation``.
+    """
+    from crucible.champion import ATTESTATION_METRIC  # noqa: PLC0415 - avoids a cycle
+    from crucible.keys import experiments_prefix  # noqa: PLC0415 - avoids a cycle
+
+    return {
+        "name": ATTESTATION_METRIC,
+        "module": f"crucible.slots.{SLOT}",
+        "metric_type": "gauge",
+        "value": float(verdict.coverage_fraction or 0.0),
+        "unit": "ratio",
+        "n_floor": 1,
+        "status": "OK" if verdict.status == "PASS" else "FAIL",
+        "status_reason": f"{arm_id}: pit_parity {verdict.status}: {verdict.reason}"[:500],
+        "source_path": experiments_prefix(arm_id),
+        "last_updated_utc": _utc_now(),
+        "arm_id": arm_id,
+        "attestation": verdict.to_dict(),
+    }
+
+
 def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
     """Construct every registered S arm's book and run the slot's arena cycle.
 
@@ -2962,6 +3113,7 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
             adv_cache=adv_cache,
         )
         preconditions[spec.arm_id] = [_attestation_precondition(attestation)]
+        ctx.record_metric(_attestation_metric(spec.arm_id, attestation))
         graded[spec.arm_id] = {
             "sessions": int(constructed.evidence["sessions"]),
             "cost_model": constructed.evidence["cost_model"]["name"],
@@ -3067,11 +3219,14 @@ def _attest(
     """The §9.1 contamination attestation, measured rather than asserted.
 
     The point-in-time pass is the book built from what each session RECORDED.
-    The second pass re-resolves each session's inputs from the upstream
-    artifacts AS THEY STAND TODAY and builds the same book from those — so the
-    per-date delta between the two is exactly the effect of any upstream
-    revision since the session, which is the contamination
-    `crucible.keys.session_inputs_key` exists to make measurable.
+    The second pass re-reads the SAME upstream artifacts each session recorded
+    (:func:`re_resolve_session`) AS THEY STAND TODAY and builds the same book
+    from those — so the per-date delta between the two is exactly the effect
+    of any upstream revision since the session, which is the contamination
+    `crucible.keys.session_inputs_key` exists to make measurable. Never the
+    CURRENT champion pointers: a champion change is not a revision of what the
+    session saw, and measuring it renders every arm FAIL the cycle after an
+    upstream promotion.
 
     A session that cannot be re-resolved today reduces COVERAGE rather than
     being dropped from the pairing: :func:`pit_parity` refuses a pairing whose
@@ -3082,7 +3237,7 @@ def _attest(
     current: list[ResolvedSession] = []
     for session in resolved:
         try:
-            current.append(resolve_session(ctx.store, trading_day=session.trading_day))
+            current.append(re_resolve_session(ctx.store, recorded=session))
         except Exception:  # noqa: BLE001 - see below
             # The ONLY swallow on this path, and it is not a degrade. What is
             # absorbed: "one session's upstream artifacts are no longer
