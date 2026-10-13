@@ -17,6 +17,7 @@ make that claim. Real NYSE sessions throughout (`tests/conftest.py`'s
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import json
 import math
@@ -60,6 +61,7 @@ from crucible.slots.strategy import (
     ExitRuleSpec,
     PitParityVerdict,
     RegisteredStrategyArm,
+    ResolvedSession,
     SlotStrategies,
     StrategyRecipe,
     SupersededArmUndeclaredError,
@@ -68,6 +70,7 @@ from crucible.slots.strategy import (
     load_strategy_slot,
     parse_strategy_document,
     produce,
+    re_resolve_session,
     registration_specs,
     resolve_session,
 )
@@ -467,6 +470,117 @@ class TestTheEvidenceReachesARealManifest:
             "the two passes disagreed before anything was revised — the attestation is "
             "measuring something other than upstream revision"
         )
+
+
+class TestTheAttestationMeasuresRevisionNotAChampionChange:
+    """The 2026-10-09 S grade rendered every arm `FAIL` ("MATERIAL
+    contamination", mean delta +0.0296/session) with not one recorded input
+    revised: M's champion had moved from `v3meta_volatility_head` to
+    `residual_momentum` and U's from `attractiveness_momzero` to
+    `attractiveness`, and the re-resolution read the CURRENT pointers — so the
+    second pass built its book on a different model's alpha and a different
+    selection's cut. `re_resolve_session` re-reads the sources each session
+    RECORDED; a revision of those still moves the delta
+    (`test_the_grade_is_point_in_time_not_reconstructed`)."""
+
+    NEW_M = "m:fixture_successor:dddddddddddd"
+    NEW_U = "u:fixture_successor:eeeeeeeeeeee"
+
+    def _move_both_champions(self, store, days) -> None:
+        rng = np.random.default_rng(41)
+        for day in days:
+            recorded = load_store_document(store, arm_predictions_key(M_CHAMPION, day.isoformat()))
+            names = sorted(recorded["predicted_alpha"])
+            store.put_bytes(
+                arm_predictions_key(self.NEW_M, day.isoformat()),
+                json.dumps(
+                    {
+                        **recorded,
+                        "arm_id": self.NEW_M,
+                        "predicted_alpha": {t: float(rng.normal(0.0, 0.02)) for t in names},
+                    }
+                ).encode("utf-8"),
+            )
+            shadow = load_store_document(store, shadow_key(U_CHAMPION, day.isoformat()))
+            store.put_bytes(
+                shadow_key(self.NEW_U, day.isoformat()),
+                json.dumps({**shadow, "arm_id": self.NEW_U, "selection": names[-8:]}).encode(
+                    "utf-8"
+                ),
+            )
+        for slot, arm in (("m", self.NEW_M), ("u", self.NEW_U)):
+            store.put_bytes(
+                champion_key(slot),
+                json.dumps(
+                    {"schema_version": "champion_pointer.v1", "slot": slot, "arm_id": arm}
+                ).encode("utf-8"),
+            )
+
+    def test_an_upstream_champion_change_alone_is_not_contamination(self, world) -> None:
+        store, settings, _root, days = world
+        _run_produce(store, settings, days)
+        self._move_both_champions(store, days)
+
+        result, manifest, _ctx = _run_grade(store, settings)
+
+        assert manifest["status"] == "ok", manifest.get("reason")
+        for arm_id, graded in result["strategy_grades"].items():
+            assert graded["attestation"] == "PASS", (arm_id, graded)
+            assert graded["attestation_mean_delta"] == 0.0, (arm_id, graded)
+
+    def test_re_resolution_reads_the_recorded_sources_not_the_pointers(self, world) -> None:
+        store, settings, _root, days = world
+        _run_produce(store, settings, days)
+        arm_id = registration_specs(load_strategy_slot(strategy_dir=settings.strategy_dir))[
+            0
+        ].arm_id
+        recorded = ResolvedSession.from_dict(
+            load_store_document(store, session_inputs_key(arm_id, days[0].isoformat()))
+        )
+        self._move_both_champions(store, days)
+
+        again = re_resolve_session(store, recorded=recorded)
+
+        assert again == recorded
+
+    def test_an_unrecognised_recorded_source_is_refused_not_guessed(self, world) -> None:
+        store, settings, _root, days = world
+        _run_produce(store, settings, days)
+        arm_id = registration_specs(load_strategy_slot(strategy_dir=settings.strategy_dir))[
+            0
+        ].arm_id
+        recorded = ResolvedSession.from_dict(
+            load_store_document(store, session_inputs_key(arm_id, days[0].isoformat()))
+        )
+        with pytest.raises(MissingArtifactError, match="does not recognise"):
+            re_resolve_session(
+                store, recorded=dataclasses.replace(recorded, eligibility_source="somewhere/else")
+            )
+
+
+class TestTheGradeFilesEachArmsAttestation:
+    """The arena cycle records only the arms a precondition REFUSED, so a
+    PASS existed nowhere a pointer writer could read it. Each graded arm's
+    verdict is now a row on the grade run's own manifest, which
+    `crucible.promote.read_graded_attestation` reads back."""
+
+    def test_every_graded_arm_has_one_attestation_row(self, world) -> None:
+        from crucible.champion import ATTESTATION_METRIC
+        from crucible.promote import read_graded_attestation
+
+        store, settings, _root, days = world
+        _run_produce(store, settings, days)
+        result, manifest, _ctx = _run_grade(store, settings)
+
+        rows = [m for m in manifest["metrics"] if m["name"] == ATTESTATION_METRIC]
+        assert sorted(r["arm_id"] for r in rows) == sorted(result["strategy_grades"])
+        for row in rows:
+            graded = result["strategy_grades"][row["arm_id"]]
+            assert row["attestation"]["kind"] == "pit_parity"
+            assert row["attestation"]["status"] == graded["attestation"]
+            assert row["status"] == ("OK" if graded["attestation"] == "PASS" else "FAIL")
+            attestation = read_graded_attestation(store, SLOT, AS_OF.isoformat(), row["arm_id"])
+            assert attestation["status"] == "PASS"
 
 
 class TestParticipationAwareGradingEndToEnd:
@@ -1349,6 +1463,82 @@ class TestAWeeklyBookIsAttributedOverTheSessionItEarned:
                 entered -= float(returns.loc[decision, row["short_proxy"]])
             assert row["contribution_return"] == pytest.approx(row["exposure"] * earned), row
             assert row["contribution_return"] != pytest.approx(row["exposure"] * entered), row
+
+
+class TestANameThePanelDroppedIsAttributedOnlyIfHeld:
+    """`alpha-engine-config-I12020`: the 2026-10-09 S grade failed with
+    ``holding 'OLN' has no row in the price panel``.
+
+    The 10-09 panel carried no row for OLN, PSKY or WBD at all — their whole
+    history left with them when they left the price universe — while the
+    09-18 and 10-02 sessions had recorded all three as PRICED names. The S
+    universe is the union of every recorded session's priced names, so all
+    three entered the attribution loop; every one of them was ineligible and
+    carried weight 0.0 on every session. A name the book never held is not a
+    position, and there is nothing to attribute. A name it DID hold still has
+    no return series, and that still fails the slot.
+    """
+
+    @staticmethod
+    def _drop_from_panel(store, tickers) -> None:
+        key = data_panel_key(AS_OF.isoformat())
+        panel = pd.read_parquet(__import__("io").BytesIO(store.get_bytes(key)))
+        store.put_bytes(key, panel[~panel["ticker"].isin(tickers)].to_parquet(index=False))
+
+    @staticmethod
+    def _held_names(monkeypatch, store, settings) -> set[str]:
+        """Every name any constructed book weighted, measured off a real grade."""
+        held: set[str] = set()
+        real = strategy_module.construct_book
+
+        def spy(**kwargs):
+            constructed = real(**kwargs)
+            tickers = kwargs["universe"].tickers
+            for weights in constructed.weights:
+                held.update(t for t, w in zip(tickers, weights, strict=True) if float(w) != 0.0)
+            return constructed
+
+        monkeypatch.setattr(strategy_module, "construct_book", spy)
+        _result, manifest, _ctx = _run_grade(store, settings)
+        monkeypatch.setattr(strategy_module, "construct_book", real)
+        assert manifest["status"] == "ok", manifest.get("reason")
+        return held - {"SPY", strategy_module.CASH_TICKER}
+
+    def test_a_never_held_name_missing_from_the_panel_does_not_fail_the_grade(
+        self, world, monkeypatch
+    ) -> None:
+        """OLN's shape exactly: priced by M, outside U's cut, so ineligible on
+        every session and pinned to weight zero by the solver."""
+        store, settings, _root, days = world
+        _run_produce(store, settings, days)
+        priced = set(
+            load_store_document(store, arm_predictions_key(M_CHAMPION, days[0].isoformat()))[
+                "predicted_alpha"
+            ]
+        )
+        cut = set(
+            load_store_document(store, shadow_key(U_CHAMPION, days[0].isoformat()))["selection"]
+        )
+        ineligible = sorted(priced - cut)
+        assert ineligible, "the fixture must price a name outside the U cut"
+        assert not set(ineligible) & self._held_names(monkeypatch, store, settings)
+        self._drop_from_panel(store, ineligible)
+
+        _result, manifest, _ctx = _run_grade(store, settings)
+
+        assert manifest["status"] == "ok", manifest.get("reason")
+
+    def test_a_held_name_missing_from_the_panel_still_fails_the_grade(
+        self, world, monkeypatch
+    ) -> None:
+        store, settings, _root, days = world
+        _run_produce(store, settings, days)
+        held = sorted(self._held_names(monkeypatch, store, settings))
+        assert held, "the fixture's book must hold at least one name"
+        self._drop_from_panel(store, held)
+
+        with pytest.raises(MissingArtifactError, match="has no row in the price panel"):
+            _run_grade(store, settings)
 
 
 class TestTheInputsAreNamedWhenTheyAreAbsent:

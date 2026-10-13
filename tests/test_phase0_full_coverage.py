@@ -535,7 +535,8 @@ class TestTheTagKeyMustBeActiveInBilling:
         clause = _clause(_seed(tmp_path, reading=_reading()), "v2_resources_tagged_and_versioned")
         assert not clause.met and not clause.unmeasurable
         assert "Inactive as a cost-allocation tag" in clause.detail
-        assert "update-cost-allocation-tags-status" in clause.detail
+        assert "Cost allocation tags" in clause.detail
+        assert "update-cost-allocation-tags-status" not in clause.detail
 
     def test_a_key_billing_has_never_seen_is_unmet_too(self, tmp_path, monkeypatch) -> None:
         self._patch(monkeypatch, _CostExplorer(None))

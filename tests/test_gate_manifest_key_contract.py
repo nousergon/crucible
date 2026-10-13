@@ -74,11 +74,20 @@ class _StubSlotModule:
         reads it — which is exactly what this contract's `promote` handler
         does.
         """
+        from crucible.champion import ATTESTED_SLOTS
         from crucible.keys import arena_cycle_key
+        from crucible.promote import load_arm_register
+        from tests.support.manifests import attestation_row
 
         ctx.record_rows(rows_in=0, rows_out=0)
         key = arena_cycle_key(self._slot, ctx.trading_day.isoformat())
         ctx.record_output(key, ctx.store.get_bytes(key), schema_version="arena_cycle.v1")
+        if self._slot in ATTESTED_SLOTS:
+            # The real S grade files one measured `pit_parity` row per graded
+            # arm, and `promote` reads the promoted arm's back off this
+            # manifest before it writes an S pointer.
+            for arm_id in load_arm_register(ctx.store, self._slot).all_arms():
+                ctx.record_metric(attestation_row(arm_id))
         return {"arena_cycle_key": key}
 
 
@@ -146,9 +155,9 @@ def _seed_slot_for_promote(store: LocalStore, slot: str) -> None:
     from crucible.arena_io import write_arena_cycle
     from crucible.promote import arm_register_key, arm_series_key
     from crucible.slots import get_slot
-    from tests.support.manifests import write_grade_manifest
+    from tests.support.manifests import attestation_row, write_grade_manifest
     from tests.support.panels import trading_days
-    from tests.support.servable import seed_arm_predictions
+    from tests.support.servable import m_recipe, seed_arm_predictions
 
     spec = get_slot(slot)
     dates = trading_days(40, FRIDAY)
@@ -160,7 +169,10 @@ def _seed_slot_for_promote(store: LocalStore, slot: str) -> None:
         register, record = register.register(
             slot=slot,
             name=name,
-            spec={"name": name},
+            # An M arm under its recipe's own spec, so `seed_arm_predictions`
+            # files the recipe whose signed target `promote` reads
+            # (`alpha-engine-config-I12121`).
+            spec=m_recipe(name).spec if slot == "m" else {"name": name},
             created_date=dates[0],
             filed_on=dates[0],
         )
@@ -193,7 +205,12 @@ def _seed_slot_for_promote(store: LocalStore, slot: str) -> None:
             incumbent=baseline,
         ),
     )
-    write_grade_manifest(store, slot, FRIDAY.isoformat())
+    write_grade_manifest(
+        store,
+        slot,
+        FRIDAY.isoformat(),
+        metrics=[attestation_row(arm_id) for arm_id in series_by_arm] if slot == "s" else None,
+    )
 
 
 def _seed_non_slot_stages(store: LocalStore, registry: dict[str, Any]) -> None:

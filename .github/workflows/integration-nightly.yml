@@ -209,7 +209,7 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -275,5 +275,5 @@ jobs:
     # case it already covered. This workflow's concurrency never cancels a
     # superseded run, so a `cancelled` need here is a timeout or a human.
     if: ${{ always() && (failure() || contains(needs.*.result, 'cancelled')) }}
-    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@ee2330a9eee50368ea6ba6df504d86c63d647f33
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@6aeb9f99ea103d58ee7b024b8afa952ec98c357b
     secrets: inherit

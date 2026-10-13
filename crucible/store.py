@@ -45,6 +45,8 @@ __all__ = [
     "DryRunWriteRefusedError",
     "LocalStore",
     "PointerConflictError",
+    "READ_CACHE_DIR_VAR",
+    "S3ReadCache",
     "S3Store",
     "Store",
     "active_capture_ledger",
@@ -55,6 +57,7 @@ __all__ = [
     "is_capturing",
     "open_store",
     "parse_store_scheme",
+    "read_cache_from_env",
     "read_only",
     "resolve_store_uri",
     "sha256_hex",
@@ -486,7 +489,18 @@ class LocalStore(Store):
         for the backend whose stated purpose is "a developer runs the whole
         thing against a directory": the production pointer lives in S3, where
         :class:`S3Store` makes this atomic at the service.
+
+        **The CREATE case is atomic here too** (`alpha-engine-config-I12020`).
+        With ``expected`` = :data:`ETAG_ABSENT` the payload is written to an
+        exclusive temp file and published with ``os.link``, which fails if the
+        key already exists — the filesystem's own create-if-absent, so two
+        local writers racing to create one key cannot both win. That is what
+        the money-path chain's index claims rely on. It also reads no version
+        token: a create has nothing to compare against, and the chain's
+        writer must never call :meth:`etag` (`nous-ergon-ops-I1145`).
         """
+        if expected == ETAG_ABSENT:
+            return self._create_if_absent(key, payload)
         current = self.etag(key)
         if current != expected:
             raise PointerConflictError(
@@ -500,6 +514,25 @@ class LocalStore(Store):
         with open(tmp, "xb") as fh:
             fh.write(payload)
         os.replace(tmp, path)
+        return sha256_hex(payload)
+
+    def _create_if_absent(self, key: str, payload: bytes) -> str:
+        """Publish ``payload`` at ``key`` only if nothing is there; atomically."""
+        path = self._path(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.create.tmp")
+        with open(tmp, "xb") as fh:
+            fh.write(payload)
+        try:
+            os.link(tmp, path)
+        except FileExistsError as exc:
+            raise PointerConflictError(
+                f"{key!r} already exists, not at the expected version (absent): the "
+                "create-if-absent write lost. Re-read it and decide — a retry here would "
+                "overwrite whatever the winning writer just published."
+            ) from exc
+        finally:
+            tmp.unlink()
         return sha256_hex(payload)
 
     def presigned_url(self, key: str, expires_s: int) -> str:
@@ -544,6 +577,115 @@ class LocalStore(Store):
             key = path.relative_to(self.root).as_posix()
             if key.startswith(prefix):
                 yield key
+
+
+# ── The job-scoped read-through cache (alpha-engine-config-I11792) ──────────
+
+#: The environment variable that turns the S3 read-through cache on, naming the
+#: directory it keeps bodies in. Unset (the default everywhere but the three
+#: GitHub-hosted grading jobs that declare it) means no cache at all: every
+#: read is the plain GET it always was.
+READ_CACHE_DIR_VAR = "CRUCIBLE_S3_READ_CACHE_DIR"
+
+
+class S3ReadCache:
+    """Each object body crosses the wire at most once per job, never stale.
+
+    Measured 2026-10-09 in the crucible store bucket's access logs
+    (`alpha-engine-config-I11792`): `gate-close.yml`'s `gate-publish` job read
+    the same `runs/experiment.backfill/**/run.json` manifests — 20-30 MB each —
+    12 times in one run, once per `crucible gate --gate <phase>` process the
+    job's loop spawns, about a minute apart. 2.29 GB downloaded for a 0.18 GB
+    unique set, all of it billed internet egress because the runner is not in
+    AWS. `board.yml` and the `gate-close` job read it twice per process.
+
+    So the cache is keyed by S3 key and validated by ETag, and it lives on
+    DISK in a directory the job names, because the repeats are across
+    processes, not within one:
+
+    * The first read is a plain GET; the body and its ETag are kept.
+    * Every later read — in this process or another one sharing the
+      directory — is a CONDITIONAL GET (`IfNoneMatch=<etag>`). An unchanged
+      object answers `304 Not Modified` with no body, and the kept bytes are
+      returned. A changed one answers 200 with the new body, which replaces
+      the entry.
+
+    That is why this is not a staleness trade: every read still asks S3, and
+    S3 decides whether the bytes changed. What is saved is the body, which is
+    the egress, not the request. A write through the same store drops the
+    entry as well, so a reader never needs the conditional GET to notice its
+    own write.
+
+    Opt-in through :data:`READ_CACHE_DIR_VAR` rather than on by default: the
+    box jobs run in-VPC where a re-read costs nothing, and the test suite's
+    fake clients do not speak `IfNoneMatch`.
+    """
+
+    def __init__(self, root: Path | str) -> None:
+        self.root = Path(root)
+        self._memory: dict[str, tuple[str, bytes]] = {}
+
+    def _path(self, bucket: str, s3_key: str) -> Path:
+        digest = hashlib.sha256(f"{bucket}/{s3_key}".encode()).hexdigest()
+        return self.root / digest
+
+    def lookup(self, bucket: str, s3_key: str) -> tuple[str, bytes] | None:
+        """The kept ``(etag, body)`` for this object, or ``None``.
+
+        An unreadable or malformed entry is a miss, never an error: the cost
+        of a bad entry is one ordinary GET.
+        """
+        mem_key = f"{bucket}/{s3_key}"
+        if mem_key in self._memory:
+            return self._memory[mem_key]
+        try:
+            raw = self._path(bucket, s3_key).read_bytes()
+        except OSError:
+            return None
+        header, sep, body = raw.partition(b"\n")
+        if not sep or not header:
+            return None
+        entry = (header.decode("ascii", errors="replace"), body)
+        self._memory[mem_key] = entry
+        return entry
+
+    def keep(self, bucket: str, s3_key: str, etag: str, body: bytes) -> None:
+        """Keep ``body`` under ``etag``. A failure to write leaves no entry."""
+        if not etag or "\n" in etag:
+            return
+        self._memory[f"{bucket}/{s3_key}"] = (etag, body)
+        path = self._path(bucket, s3_key)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+            tmp.write_bytes(etag.encode("ascii") + b"\n" + body)
+            os.replace(tmp, path)
+        except (OSError, UnicodeEncodeError):
+            tmp.unlink(missing_ok=True)
+
+    def forget(self, bucket: str, s3_key: str) -> None:
+        self._memory.pop(f"{bucket}/{s3_key}", None)
+        try:
+            self._path(bucket, s3_key).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+#: One cache per directory per process, so every :class:`S3Store` a process
+#: builds (`open_store` and `crucible.config` each construct their own) shares
+#: the same in-memory layer.
+_READ_CACHES: dict[str, S3ReadCache] = {}
+
+
+def read_cache_from_env() -> S3ReadCache | None:
+    """The cache :data:`READ_CACHE_DIR_VAR` names, or ``None`` when unset."""
+    root = os.environ.get(READ_CACHE_DIR_VAR, "").strip()
+    if not root:
+        return None
+    cache = _READ_CACHES.get(root)
+    if cache is None:
+        cache = _READ_CACHES[root] = S3ReadCache(root)
+    return cache
 
 
 class S3Store(Store):
@@ -598,6 +740,11 @@ class S3Store(Store):
     def _error_code(exc: Any) -> str:
         return str(exc.response.get("Error", {}).get("Code", ""))
 
+    def _forget_cached(self, key: str) -> None:
+        cache = read_cache_from_env()
+        if cache is not None:
+            cache.forget(self.bucket, self._s3_key(key))
+
     def put_bytes(
         self,
         key: str,
@@ -621,14 +768,29 @@ class S3Store(Store):
             Metadata={"sha256": sha256_hex(payload)},
             **lock_kwargs,
         )
+        self._forget_cached(key)
         return sha256_hex(payload)
 
     def get_bytes(self, key: str) -> bytes:
         from botocore.exceptions import ClientError  # noqa: PLC0415
 
+        s3_key = self._s3_key(key)
+        cache = read_cache_from_env()
+        kept = cache.lookup(self.bucket, s3_key) if cache is not None else None
         try:
-            return self.client.get_object(Bucket=self.bucket, Key=self._s3_key(key))["Body"].read()
+            if kept is None:
+                resp = self.client.get_object(Bucket=self.bucket, Key=s3_key)
+            else:
+                resp = self.client.get_object(Bucket=self.bucket, Key=s3_key, IfNoneMatch=kept[0])
+            body: bytes = resp["Body"].read()
+            if cache is not None:
+                cache.keep(self.bucket, s3_key, str(resp.get("ETag", "")).strip('"'), body)
+            return body
         except ClientError as exc:
+            if kept is not None and self._error_code(exc) in ("304", "NotModified"):
+                return kept[1]
+            if cache is not None and self._error_code(exc) in ("NoSuchKey", "404"):
+                cache.forget(self.bucket, s3_key)
             if self._error_code(exc) in ("NoSuchKey", "404"):
                 raise KeyError(
                     f"{key!r} is not present in s3://{self.bucket}/{self.prefix}"
@@ -730,6 +892,7 @@ class S3Store(Store):
                     f"{expected[:12]!r}. Re-read the pointer and decide."
                 ) from exc
             raise
+        self._forget_cached(key)
         return str(resp.get("ETag", "")).strip('"')
 
 

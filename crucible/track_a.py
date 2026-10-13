@@ -20,12 +20,14 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+from collections.abc import Callable
 from typing import Any
 
 from crucible.backfill import run_backfill
 from crucible.calendar import is_trading_day, resolve_trading_day
 from crucible.components import NYSE_TZ
 from crucible.config import settings as resolve_settings
+from crucible.daily_chain import already_ok, daily_chain_lock, run_serve_chain
 from crucible.data import (
     ArcticPriceSource,
     PriceSource,
@@ -204,6 +206,112 @@ def _expected_symbols(declared: DeclaredUniverse | None, ctx: Any) -> list[str] 
 
 
 def handle_data_daily(args: argparse.Namespace) -> int:
+    """`data.daily`, under the daily-chain lease, then optionally the serve chain.
+
+    alpha-engine-config-I12020: the compile decides and writes while holding
+    :func:`crucible.daily_chain.daily_chain_lock`, so two starters of the same
+    session (the collection's completion event and the 21:15 ET backstop)
+    can never both decide it is not done. ``--then-serve`` then runs
+    `serve.daily --skip-if-ok` for M, U and S in order — but only once THIS
+    day's `data.daily` manifest reads `ok`: a failed compile leaves the serve
+    to its own backstops, each of which fails loud on its own manifest.
+    """
+    today = _today()
+    config = _settings(args)
+    store = config.store()
+    dry_run = bool(getattr(args, "dry_run", False))
+    with _daily_chain_lease(store, "data.daily", args):
+        code = _data_daily_body(args, config, store, today)
+    if not getattr(args, "then_serve", False):
+        return code
+    day = args.trading_day.isoformat()
+    if not already_ok(store, "data.daily", day):
+        print(
+            f"--then-serve: data.daily for {day} is not `ok`, so the serve chain is left "
+            "to the serve-daily backstops; nothing was served from an absent compile."
+        )
+        return code
+    codes = run_serve_chain(
+        args.trading_day,
+        store=getattr(args, "store", None),
+        run_mode=getattr(args, "run_mode", None),
+        dry_run=dry_run,
+    )
+    print(json.dumps({"serve_chain": codes}, indent=2))
+    failed = sorted(slot for slot, slot_code in codes.items() if slot_code != 0)
+    if failed:
+        print(
+            f"--then-serve: serve.daily failed for slot(s) {failed} on {day}; "
+            "each filed its own manifest."
+        )
+        return 1
+    return code
+
+
+def _daily_chain_lease(store: Any, job: str, args: argparse.Namespace) -> Any:
+    """The daily-chain lease (`crucible.daily_chain.daily_chain_lock`).
+
+    Taken on a dry run too: the capturing store RECORDS the lease writes
+    instead of performing them, so a rehearsal reports the same key set the
+    real run writes (alpha-engine-config-I11012) and writes nothing.
+    """
+    label = f"{job}[{args.slot}]" if getattr(args, "slot", None) else job
+    return daily_chain_lock(store, job=label, trading_day=args.trading_day.isoformat())
+
+
+def _already_ok_noop(job: str, canonical: str) -> tuple[Callable[[Any], None], str]:
+    """`--skip-if-ok` found the day done: the body of its `ok` no-op manifest.
+
+    The caller files it through `run_job` under a discriminator led by the
+    calendar day it ran on, so it can never overwrite the canonical manifest
+    it found, and a dispatch that ended here is still cleared by a manifest of
+    its own (`evaluate_dispatch_absence`). The `run_job` call stays at the call
+    site so its job name is a literal the manifest-contract scan can read.
+    """
+    detail = (
+        f"{canonical} already reads `ok`; --skip-if-ok leaves it as it is. This firing "
+        "had nothing to do, which is a complete result (rule 2)."
+    )
+
+    def _noop(ctx: Any) -> None:
+        ctx.record_metric(
+            {
+                "name": f"{job}.already_ok_noop",
+                "module": "crucible.track_a",
+                "metric_type": "gauge",
+                "value": 1.0,
+                "unit": "count",
+                "n_floor": 0,
+                "status": "OK",
+                "status_reason": detail,
+                "source_path": canonical,
+                "last_updated_utc": ctx.started.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        )
+
+    return _noop, detail
+
+
+def _data_daily_body(args: argparse.Namespace, config: Any, store: Any, today: dt.date) -> int:
+    day = args.trading_day.isoformat()
+    skip_if_ok = bool(getattr(args, "skip_if_ok", False))
+    # alpha-engine-config-I12020. Checked INSIDE the lease, so the answer
+    # cannot change between reading it and acting on it. Only the canonical
+    # key counts: a holiday or already-ok no-op is filed under a
+    # discriminator and is not evidence that the day was compiled.
+    if skip_if_ok and already_ok(store, "data.daily", day):
+        noop, detail = _already_ok_noop("data.daily", manifest_key("data.daily", day))
+        ctx = run_job(
+            "data.daily",
+            noop,
+            store=store,
+            trading_day=args.trading_day,
+            run_mode=getattr(args, "run_mode", None),
+            dry_run=bool(getattr(args, "dry_run", False)),
+            discriminator=calendar_day_discriminator(today, suffix="already-ok"),
+        )
+        print(json.dumps({"run_id": ctx.run_id, "outputs": [], "detail": detail}, indent=2))
+        return 0
     # `data.daily`'s EventBridge schedule fires every weekday close, and a
     # market holiday (Thanksgiving, Independence Day observed, ...) is still
     # a weekday: without this guard the job resolves `trading_day` back to
@@ -225,10 +333,14 @@ def handle_data_daily(args: argparse.Namespace) -> int:
     # record exists to distinguish a holiday no-op from a `data.daily` that
     # has stopped working, and the alerting absence check has nothing to see
     # either way.
-    today = _today()
-    config = _settings(args)
-    store = config.store()
-    if getattr(args, "date", None) is None and not is_trading_day(today):
+    #
+    # With `--skip-if-ok` the guard is SUBSUMED rather than applied: its whole
+    # job was to keep a holiday firing from overwriting the prior session's
+    # good manifest, which the check above now does for any firing — and a
+    # firing after midnight ET on a Friday (a late collection; measured
+    # 2026-10-07/08 at 04:07Z and 03:18Z) is a Saturday whose session is
+    # Friday's, still owed its compile.
+    if not skip_if_ok and getattr(args, "date", None) is None and not is_trading_day(today):
         detail = (
             f"{today.isoformat()} is not an NYSE trading day; the schedule fired on a "
             f"holiday. Nothing to compile for trading_day {args.trading_day.isoformat()}."
@@ -899,7 +1011,35 @@ def handle_serve_daily(args: argparse.Namespace) -> int:
     config = _settings(args)
     store = config.store()
     today = _today()
-    if getattr(args, "date", None) is None and not is_trading_day(today):
+    # alpha-engine-config-I12020: the same lease `data.daily` holds, so M, U
+    # and S never write at the same time whichever starters fired them (the
+    # 22:15 ET M and U backstops fire together), and `--skip-if-ok` is decided
+    # inside it.
+    with _daily_chain_lease(store, "serve.daily", args):
+        return _serve_daily_body(args, config, store, today, servers)
+
+
+def _serve_daily_body(
+    args: argparse.Namespace, config: Any, store: Any, today: dt.date, servers: dict[str, Any]
+) -> int:
+    day = args.trading_day.isoformat()
+    skip_if_ok = bool(getattr(args, "skip_if_ok", False))
+    if skip_if_ok and already_ok(store, "serve.daily", day, discriminator=args.slot):
+        noop, detail = _already_ok_noop(
+            "serve.daily", manifest_key("serve.daily", day, discriminator=args.slot)
+        )
+        ctx = run_job(
+            "serve.daily",
+            noop,
+            store=store,
+            trading_day=args.trading_day,
+            run_mode=getattr(args, "run_mode", None),
+            dry_run=bool(getattr(args, "dry_run", False)),
+            discriminator=f"{args.slot}.{today.isoformat()}-already-ok",
+        )
+        print(json.dumps({"run_id": ctx.run_id, "outputs": [], "detail": detail}, indent=2))
+        return 0
+    if not skip_if_ok and getattr(args, "date", None) is None and not is_trading_day(today):
         # `data.daily`'s holiday guard, for the same reason: the weekday
         # schedule fires on a market holiday, `--date` then resolves to the
         # prior session, and re-serving it would overwrite that session's real
@@ -1249,6 +1389,34 @@ HANDLERS = {
 
 def add_track_a_arguments(name: str, sub: argparse.ArgumentParser) -> None:
     """Track-A-only flags for one subcommand."""
+    if name in ("data.daily", "serve.daily"):
+        # alpha-engine-config-I12020. Opt-in, and declared in the dispatch's
+        # own argv (nous-ergon-ops `crucible-v2.yaml`), because a day now has
+        # several starters and every one of them but the first must find it
+        # done. Without the flag a run behaves exactly as before, so an
+        # operator's deliberate rerun of an `ok` day is never skipped.
+        sub.add_argument(
+            "--skip-if-ok",
+            dest="skip_if_ok",
+            action="store_true",
+            help=(
+                "If this job's canonical manifest for the trading day (and slot) "
+                "already reads `ok`, file an `ok` no-op manifest of its own and write "
+                "nothing else. A `failed` or absent manifest is re-run. Decided under "
+                "the daily-chain lease, so two starters cannot both decide it is not done."
+            ),
+        )
+    if name == "data.daily":
+        sub.add_argument(
+            "--then-serve",
+            dest="then_serve",
+            action="store_true",
+            help=(
+                "Once this trading day's data.daily manifest reads `ok`, run "
+                "`serve.daily --skip-if-ok` for slots m, u and s, one at a time, in "
+                "this process. Nothing is served when the compile did not succeed."
+            ),
+        )
     if name in ("data.daily", "data.weekly", "data.heal"):
         sub.add_argument(
             "--source",

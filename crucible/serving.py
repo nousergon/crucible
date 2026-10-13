@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
@@ -67,8 +68,10 @@ from crucible.slots.inputs import ARM_PREDICTIONS_SCHEMA_VERSION, PREDICTION_STD
 from crucible.store import Store
 
 __all__ = [
+    "MIN_NAMES_FOR_SIGN_CHECK",
     "PREDICTIONS_FEED_SCHEMA_VERSION",
     "PREDICTIONS_FEED_SLOT",
+    "OneSidedCrossSectionError",
     "PredictionsFeed",
     "PredictionsFeedContractError",
     "publish_predictions_feed",
@@ -84,6 +87,22 @@ PREDICTIONS_FEED_SCHEMA_VERSION = "predictions_feed.v1"
 #: and S serves a book rather than a cross-section.
 PREDICTIONS_FEED_SLOT = "m"
 
+#: The smallest cross-section the feed writer holds to the two-sided sign
+#: check (:func:`_assert_two_sided`). At or above this many names, a batch in
+#: which NO name is below zero, or NO name is above zero, is refused.
+#:
+#: `alpha-engine-config-I12121`: the M pointer named an arm fitted to
+#: ``abs_forward_return`` — an unsigned magnitude — and `serve.daily`
+#: published its output as `predicted_alpha`, so every name in the book read
+#: as a long. The target check on the pointer and on the feed is the primary
+#: guard; this one is the independent witness on the numbers themselves, for
+#: whatever produces a one-sided cross-section next (a new unsigned head, a
+#: sign flip, a clamp). A real directional model scoring a broad universe
+#: does not call every name up, or every name down; across fifty names, a
+#: one-sided batch is a producer defect, not an opinion. Below fifty the
+#: check is not applied — a handful of names can legitimately share a sign.
+MIN_NAMES_FOR_SIGN_CHECK = 50
+
 
 class PredictionsFeedContractError(RuntimeError):
     """The feed exists at the trader's key and must not be served.
@@ -93,6 +112,12 @@ class PredictionsFeedContractError(RuntimeError):
     "the harness has not published today's feed yet" and "today's feed is
     malformed" have different fixes, and a trader that collapsed them would
     treat a corrupt document as a quiet day.
+    """
+
+
+class OneSidedCrossSectionError(PredictionsFeedContractError):
+    """A cross-section of at least :data:`MIN_NAMES_FOR_SIGN_CHECK` names
+    with no name below zero, or none above zero (`alpha-engine-config-I12121`).
     """
 
 
@@ -155,6 +180,7 @@ def publish_predictions_feed(
     trading_day: str,
     slot: str = PREDICTIONS_FEED_SLOT,
     ctx: Any = None,
+    strategy_dir: Path | str | None = None,
 ) -> str | None:
     """Republish the champion's cross-section at the trader's key; return it.
 
@@ -169,9 +195,16 @@ def publish_predictions_feed(
     operator republication is.
 
     Raises :class:`~crucible.champion.ChampionUnusableError` when a pointer
-    exists and the reader refuses it, and
+    exists and the reader refuses it,
     :class:`~crucible.slots.cycle.MissingArtifactError` when the pointer names
-    an arm with no `arm_predictions.v1` document for ``trading_day``.
+    an arm with no `arm_predictions.v1` document for ``trading_day``,
+    :class:`~crucible.slots.model.UnsignedChampionTargetError` when the
+    champion's recipe is not fitted to a signed forward return (or no recipe
+    declares it), and :class:`OneSidedCrossSectionError` when the
+    cross-section fails the two-sided sign check — in every case before
+    anything is written (`alpha-engine-config-I12121`). ``strategy_dir`` is
+    the checkout the champion's recipe is read from; ``None`` reads the tree
+    synced into ``store``.
 
     **Validated on the way out as well as on the way in.** The source document
     is checked against its own schema by
@@ -188,7 +221,14 @@ def publish_predictions_feed(
         # would fail every promote run taken before the slot's first
         # promotion, which is every promote run the M slot has ever had.
         return None
-    return _publish(store, arm_id=pointer.arm_id, trading_day=trading_day, slot=slot, ctx=ctx)
+    return _publish(
+        store,
+        arm_id=pointer.arm_id,
+        trading_day=trading_day,
+        slot=slot,
+        ctx=ctx,
+        strategy_dir=strategy_dir,
+    )
 
 
 def publish_promoted_feed(
@@ -196,6 +236,7 @@ def publish_promoted_feed(
     *,
     pointer: ChampionPointer,
     ctx: Any = None,
+    strategy_dir: Path | str | None = None,
 ) -> str:
     """Republish the feed for a pointer `promote` has JUST written; return the key.
 
@@ -229,6 +270,7 @@ def publish_promoted_feed(
         trading_day=pointer.as_of,
         slot=pointer.slot,
         ctx=ctx,
+        strategy_dir=strategy_dir,
     )
 
 
@@ -282,12 +324,32 @@ def _load_source(
     return source_key, document
 
 
-def _publish(store: Store, *, arm_id: str, trading_day: str, slot: str, ctx: Any) -> str:
+def _publish(
+    store: Store,
+    *,
+    arm_id: str,
+    trading_day: str,
+    slot: str,
+    ctx: Any,
+    strategy_dir: Path | str | None,
+) -> str:
     source_key, document = _load_source(
         store,
         arm_id=arm_id,
         trading_day=trading_day,
         named_by=f"the champion pointer for slot {slot!r}",
+    )
+    # The champion's TARGET, before anything is built or written
+    # (`alpha-engine-config-I12121`): a feed is `predicted_alpha`, which the
+    # trader sizes on, and only a signed forward return may be published
+    # under that name. Local import for the reason `_load_source` gives.
+    from crucible.slots.model import require_signed_champion  # noqa: PLC0415
+
+    require_signed_champion(
+        arm_id,
+        action=f"publish {predictions_key(trading_day)} for slot {slot!r}'s champion",
+        store=store,
+        strategy_dir=strategy_dir,
     )
 
     feed = PredictionsFeed(
@@ -300,12 +362,40 @@ def _publish(store: Store, *, arm_id: str, trading_day: str, slot: str, ctx: Any
         uncertainty=_uncertainty_fields(document),
     )
     _validate(feed.to_dict())
+    _assert_two_sided(feed.predicted_alpha, source_key=source_key, arm_id=arm_id)
     key = predictions_key(trading_day)
     if ctx is not None:
         ctx.record_output(key, feed.to_bytes(), schema_version=PREDICTIONS_FEED_SCHEMA_VERSION)
     else:
         store.put_bytes(key, feed.to_bytes())
     return key
+
+
+def _assert_two_sided(predicted_alpha: dict[str, float], *, source_key: str, arm_id: str) -> None:
+    """Refuse a one-sided cross-section of :data:`MIN_NAMES_FOR_SIGN_CHECK`+ names.
+
+    `alpha-engine-config-I12121`; see that constant for why. Raises
+    :class:`OneSidedCrossSectionError` naming which side is empty, so the
+    page says what was wrong with the numbers rather than only that the run
+    failed.
+    """
+    n = len(predicted_alpha)
+    if n < MIN_NAMES_FOR_SIGN_CHECK:
+        return
+    below = sum(1 for v in predicted_alpha.values() if v < 0)
+    above = sum(1 for v in predicted_alpha.values() if v > 0)
+    if below and above:
+        return
+    empty = "below zero" if not below else "above zero"
+    if not below and not above:
+        empty = "away from zero"
+    raise OneSidedCrossSectionError(
+        f"one_sided_cross_section: {source_key!r} (arm {arm_id!r}) scores {n} names with "
+        f"{below} below zero and {above} above zero — no name {empty}. Across at least "
+        f"{MIN_NAMES_FOR_SIGN_CHECK} names a directional model does not call every name "
+        "the same way; this is an unsigned or sign-broken producer, and publishing it as "
+        "`predicted_alpha` would size the whole book one way. No feed is written."
+    )
 
 
 #: The source-document keys the feed republishes beside `predicted_alpha`.

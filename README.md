@@ -136,6 +136,13 @@ Recorded as `promotion_source=operator_bootstrap`, never as evidence;
 `--reason` is mandatory — an unexplained override is the one pointer
 movement nobody can reconstruct later.
 
+For the S slot the pointer also carries the `pit_parity` attestation that
+`experiment.grade --slot s` measured for that arm on the same `--date`, read
+off that run's manifest. With no successful grade for the day, or a verdict
+other than `PASS`, the revert writes nothing: the trader refuses an S
+pointer without an attestation `PASS` (plan §9.1), so writing one would only
+move the refusal to the session.
+
 ### heal
 
 `crucible data.heal --gap <name> --from YYYY-MM-DD --to YYYY-MM-DD` repairs

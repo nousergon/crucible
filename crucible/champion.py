@@ -50,6 +50,7 @@ from crucible.models import ChampionPointerDocument
 from crucible.store import Store
 
 __all__ = [
+    "ATTESTATION_METRIC",
     "ATTESTED_SLOTS",
     "CHAMPION_SCHEMA_VERSION",
     "PROMOTION_SOURCES",
@@ -81,6 +82,14 @@ ATTESTED_SLOTS: tuple[str, ...] = ("s",)
 
 #: The one attestation status that lets a card render as a grade.
 ATTESTATION_PASS = "PASS"
+
+#: The `experiment.grade` manifest row carrying one arm's measured
+#: `pit_parity` verdict (`crucible.slots.strategy.grade`), and the row both
+#: pointer writers in `crucible.promote` read it back from. One row per
+#: graded arm, with the verdict under `attestation` and the arm under
+#: `arm_id`; never inferred from the cycle, which records only the arms a
+#: precondition REFUSED.
+ATTESTATION_METRIC = "pit_parity_attestation"
 
 
 class ChampionUnusableError(RuntimeError):

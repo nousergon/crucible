@@ -119,7 +119,6 @@ __all__ = [
     "produce_history",
     "registration_specs",
     "render_verdict",
-    "resolve_recorded_session",
     "resolve_session",
     "serve_daily",
 ]
@@ -1137,6 +1136,14 @@ def _attribute_book(
     fit = fit.tail(COVARIANCE_LOOKBACK_TRADING_DAYS)
     fit_days = [str(day) for day in fit.index]
 
+    # Every name the book carried a non-zero weight in on ANY session — not
+    # just the last, because an earlier session's realized return was earned
+    # on that session's weights.
+    ever_held = {
+        ticker
+        for i, ticker in enumerate(universe.tickers)
+        if any(float(w[i]) != 0.0 for w in constructed.weights)
+    }
     holding_returns: dict[str, list[float]] = {}
     for ticker in universe.tickers:
         if ticker == CASH_TICKER:
@@ -1146,6 +1153,16 @@ def _attribute_book(
             holding_returns[ticker] = [0.0] * len(fit_days)
             continue
         if ticker not in returns.columns:
+            if ticker not in ever_held:
+                # `alpha-engine-config-I12020`: a name the universe carries
+                # because a recorded session PRICED it, at weight zero on every
+                # session, is not a position — there is nothing to attribute,
+                # and leaving it out of the fit changes no number (each name's
+                # loadings are its own regression, and `portfolio_risk` weights
+                # it zero). The 2026-10-09 panel dropped OLN, PSKY and WBD's
+                # entire history once they left the price universe; all three
+                # were ineligible, never held, and failed the whole S grade.
+                continue
             raise MissingArtifactError(
                 f"attribution over the book graded {as_of}: holding {ticker!r} has no row "
                 "in the price panel this book was constructed over. A book position with "
@@ -1192,7 +1209,11 @@ def _attribute_book(
         factor_returns[name] = factor_return_series(fdef, fit_proxy)
         attributed_factor_returns[name] = factor_return_series(fdef, earned_proxy)
 
-    weights = dict(zip(universe.tickers, constructed.weights[-1], strict=True))
+    weights = {
+        ticker: weight
+        for ticker, weight in zip(universe.tickers, constructed.weights[-1], strict=True)
+        if ticker in holding_returns
+    }
     return compute_factor_attribution(
         trading_day=settle_days[-1],
         window_sessions=len(fit_days),
@@ -2102,7 +2123,10 @@ def resolve_session(store: Any, *, trading_day: str, ctx: Any = None) -> Resolve
         load_store_document(store, u_pointer).get("arm_id") if store.exists(u_pointer) else None
     )
     cut: set[str] | None = None
-    eligibility_source = _no_u_champion_source()
+    eligibility_source = (
+        f"{_ABSENT_SOURCE_PREFIX}{u_pointer} names no arm, so every name the M champion priced is "
+        "eligible. A recorded absence, not a cut that happened to include everything."
+    )
     if u_champion:
         u_shadow = shadow_key(u_champion, trading_day)
         u_feed = universe_members_key(trading_day)
@@ -2110,7 +2134,20 @@ def resolve_session(store: Any, *, trading_day: str, ctx: Any = None) -> Resolve
             cut = {str(t) for t in load_store_document(store, u_shadow)["selection"]}
             eligibility_source = u_shadow
         elif store.exists(u_feed):
-            cut = _u_feed_cut(store, trading_day=trading_day, u_champion=u_champion)
+            feed = load_store_document(store, u_feed)
+            if (
+                feed.get("slot") != "u"
+                or feed.get("trading_day") != trading_day
+                or feed.get("champion") != u_champion
+            ):
+                raise MissingArtifactError(
+                    f"{u_feed} serves slot {feed.get('slot')!r}, session "
+                    f"{feed.get('trading_day')!r} and champion {feed.get('champion')!r}; the "
+                    f"S slot needs the cut of U champion {u_champion!r} for {trading_day}. "
+                    "A cut from another arm or another session is not this session's "
+                    "eligibility mask."
+                )
+            cut = {str(t) for t in feed["members"]}
             eligibility_source = u_feed
         else:
             raise MissingArtifactError(
@@ -2130,50 +2167,6 @@ def resolve_session(store: Any, *, trading_day: str, ctx: Any = None) -> Resolve
     )
 
 
-def _no_u_champion_source() -> str:
-    """The `eligibility_source` a session records when no U champion was seated.
-
-    One sentence, built in one place, because :func:`resolve_recorded_session`
-    reads it BACK: a session recorded with no U champion is re-resolved with no
-    cut, whoever holds the U pointer today.
-    """
-    from crucible.keys import champion_key  # noqa: PLC0415 - avoids a cycle
-
-    return (
-        f"absent — {champion_key('u')} names no arm, so every name the M champion priced "
-        "is eligible. A recorded absence, not a cut that happened to include everything."
-    )
-
-
-def _u_feed_cut(store: Any, *, trading_day: str, u_champion: str | None) -> set[str]:
-    """The cut the U champion feed `universe/{day}/members.json` serves.
-
-    Accepted only for slot `u` and this session; with ``u_champion`` given,
-    only when the feed names that champion. A cut from another arm or another
-    session is not this session's eligibility mask.
-    """
-    from crucible.documents import load_store_document  # noqa: PLC0415 - avoids a cycle
-    from crucible.keys import universe_members_key  # noqa: PLC0415 - avoids a cycle
-    from crucible.slots.cycle import MissingArtifactError  # noqa: PLC0415 - avoids a cycle
-
-    u_feed = universe_members_key(trading_day)
-    feed = load_store_document(store, u_feed)
-    if (
-        feed.get("slot") != "u"
-        or feed.get("trading_day") != trading_day
-        or not feed.get("champion")
-        or (u_champion is not None and feed.get("champion") != u_champion)
-    ):
-        raise MissingArtifactError(
-            f"{u_feed} serves slot {feed.get('slot')!r}, session "
-            f"{feed.get('trading_day')!r} and champion {feed.get('champion')!r}; the "
-            f"S slot needs the cut of U champion {u_champion!r} for {trading_day}. "
-            "A cut from another arm or another session is not this session's "
-            "eligibility mask."
-        )
-    return {str(t) for t in feed["members"]}
-
-
 def _resolved_session(
     *,
     trading_day: str,
@@ -2182,9 +2175,13 @@ def _resolved_session(
     alpha_source: str,
     eligibility_source: str,
 ) -> ResolvedSession:
-    """One session's inputs from its alpha vector and cut — the shape
-    :func:`resolve_session` and :func:`resolve_recorded_session` share, so the
-    two passes of the §9.1 attestation can differ only in what they READ."""
+    """A :class:`ResolvedSession` from an alpha cross-section and an eligibility cut.
+
+    The one place the document is assembled, shared by :func:`resolve_session`
+    (the decision-date resolution) and :func:`re_resolve_session` (the
+    attestation's re-read of the same sources), so the two passes
+    :func:`pit_parity` compares can differ only in the bytes they read.
+    """
     tickers = tuple(sorted(predicted))
     eligibility = tuple(True if cut is None else t in cut for t in tickers)
     return ResolvedSession(
@@ -2212,88 +2209,96 @@ def _resolved_session(
     )
 
 
-def _arm_named_by(key: str, *, prefix: str, suffix: str) -> str | None:
-    """The arm id a per-arm key names between ``prefix`` and ``suffix``, or ``None``."""
-    from crucible.keys import arm_id_from_segment  # noqa: PLC0415 - avoids a cycle
-
-    if not (key.startswith(prefix) and key.endswith(suffix)):
-        return None
-    segment = key[len(prefix) : len(key) - len(suffix)]
-    if not segment or "/" in segment:
-        return None
-    return arm_id_from_segment(segment)
+#: How :func:`resolve_session` spells "no U champion, no cut" in
+#: ``eligibility_source``. Read back by :func:`re_resolve_session`.
+_ABSENT_SOURCE_PREFIX = "absent — "
 
 
-def resolve_recorded_session(store: Any, recorded: ResolvedSession) -> ResolvedSession:
-    """``recorded`` re-resolved from the upstream documents IT named, as they
-    stand today — the second pass of the §9.1 attestation.
+def re_resolve_session(store: Any, *, recorded: ResolvedSession) -> ResolvedSession:
+    """Re-read the SAME sources ``recorded`` was resolved from, as they stand today.
 
-    `alpha-engine-config-I12055`. The attestation used to re-resolve each
-    session through :func:`resolve_session`, which reads TODAY's M and U
-    champion pointers. With daily S sessions only the champion of the day
-    writes a session's documents (`serve.daily --slot m` its predictions,
-    `--slot u` its cut), so after the next promotion the new champion had none
-    for any earlier session: every one failed to re-resolve, coverage
-    dropped, and every S arm failed its serving precondition until the window
-    aged out — a contamination check reading a pointer move as contamination.
+    The contamination half of the §9.1 attestation (:func:`_attest`). Its
+    question is "has anything this session was constructed from been REVISED
+    since the decision date?", so the second pass must read the artifacts the
+    session recorded — ``alpha_source`` and ``eligibility_source`` — and
+    nothing else.
 
-    **Under the champions in force on the session**, read off the keys it
-    recorded, so `session_inputs.v1` is unchanged:
+    It used to call :func:`resolve_session`, which re-reads the CURRENT M and
+    U champion pointers. Once either pointer moved, the second pass built the
+    book on a different model's predictions and a different selection's cut,
+    and the delta measured the champion change rather than any revision:
+    measured on the 2026-10-09 S grade, after M moved from
+    `v3meta_volatility_head` to `residual_momentum` and U from
+    `attractiveness_momzero` to `attractiveness`, every S arm rendered FAIL
+    ("MATERIAL contamination", mean delta +0.0296/session) while not one
+    recorded input had been revised. A check that fails every arm whenever an
+    upstream champion moves is not measuring contamination, and an operator
+    taught to read its FAIL as noise is an operator who will read a real one
+    the same way.
 
-    * `alpha_source` is `arm_predictions_key(m_champion, day)`; the arm it
-      names is the M champion of that session, read back through
-      `crucible.slots.inputs.read_arm_predictions` and its own checks;
-    * `eligibility_source` is that U champion's `shadow.json` (an arc
-      session), the U champion feed `universe/{day}/members.json` (a daily
-      session, whose own `champion` field names the arm that served it), or
-      the recorded absence of a U champion, which stays an absence.
-
-    **Their CURRENT bytes**, so an upstream revision since the session is
-    still the non-zero delta the attestation exists to measure. A source this
-    function cannot read back raises ``ValueError`` rather than being guessed
-    at; :func:`_attest` counts it against coverage.
+    Every guard the decision-date read applies is applied again here
+    (`read_arm_predictions`' point-in-time and identity checks, the U feed's
+    slot/session check). A source this reader does not recognise raises, and
+    :func:`_attest` records that as reduced COVERAGE — `PARTIAL`, a refusal —
+    never as a clean pass.
     """
     from crucible.documents import load_store_document  # noqa: PLC0415 - avoids a cycle
     from crucible.keys import (  # noqa: PLC0415 - avoids a cycle
         ARM_PREDICTIONS_PREFIX,
+        arm_id_from_segment,
         shadow_key,
         universe_members_key,
     )
+    from crucible.slots.cycle import MissingArtifactError  # noqa: PLC0415 - avoids a cycle
     from crucible.slots.inputs import read_arm_predictions  # noqa: PLC0415 - avoids a cycle
 
     day = recorded.trading_day
-    m_champion = _arm_named_by(
-        recorded.alpha_source, prefix=ARM_PREDICTIONS_PREFIX, suffix=f"/{day}.json"
-    )
-    if m_champion is None or arm_predictions_key(m_champion, day) != recorded.alpha_source:
-        raise ValueError(
-            f"the session inputs for {day} record alpha_source {recorded.alpha_source!r}, "
-            "which names no arm's predictions for that session; the M champion in force "
-            "on it cannot be read back, and today's pointer is not that champion."
+    alpha_source = recorded.alpha_source
+    segment = alpha_source.removeprefix(ARM_PREDICTIONS_PREFIX).removesuffix(f"/{day}.json")
+    m_arm = arm_id_from_segment(segment) if segment and "/" not in segment else None
+    if m_arm is None or arm_predictions_key(m_arm, day) != alpha_source:
+        raise MissingArtifactError(
+            f"session {day} recorded alpha_source {alpha_source!r}, which is not an "
+            "arm-predictions key for that session; the attestation cannot re-read a "
+            "source it cannot name."
         )
-    predicted = read_arm_predictions(store, arm_id=m_champion, trading_day=day)
+    predicted = read_arm_predictions(store, arm_id=m_arm, trading_day=day)
 
-    source = recorded.eligibility_source
+    eligibility_source = recorded.eligibility_source
     cut: set[str] | None
-    u_champion = _arm_named_by(source, prefix="experiments/", suffix=f"/{day}/shadow.json")
-    if source == _no_u_champion_source():
+    if eligibility_source.startswith(_ABSENT_SOURCE_PREFIX):
         cut = None
-    elif u_champion is not None and shadow_key(u_champion, day) == source:
-        cut = {str(t) for t in load_store_document(store, source)["selection"]}
-    elif source == universe_members_key(day):
-        cut = _u_feed_cut(store, trading_day=day, u_champion=None)
+    elif eligibility_source == universe_members_key(day):
+        feed = load_store_document(store, eligibility_source)
+        if feed.get("slot") != "u" or feed.get("trading_day") != day:
+            raise MissingArtifactError(
+                f"{eligibility_source} now serves slot {feed.get('slot')!r}, session "
+                f"{feed.get('trading_day')!r}; session {day} recorded it as its U cut."
+            )
+        cut = {str(t) for t in feed["members"]}
+    elif eligibility_source.startswith("experiments/") and eligibility_source.endswith(
+        f"/{day}/shadow.json"
+    ):
+        u_segment = eligibility_source.removeprefix("experiments/").removesuffix(
+            f"/{day}/shadow.json"
+        )
+        if shadow_key(arm_id_from_segment(u_segment), day) != eligibility_source:
+            raise MissingArtifactError(
+                f"session {day} recorded eligibility_source {eligibility_source!r}, which "
+                "is not a shadow key for that session."
+            )
+        cut = {str(t) for t in load_store_document(store, eligibility_source)["selection"]}
     else:
-        raise ValueError(
-            f"the session inputs for {day} record eligibility_source {source!r}, which "
-            "names no U cut this resolver writes — not a U champion's shadow, not the U "
-            "champion feed, and not the recorded absence of a U champion."
+        raise MissingArtifactError(
+            f"session {day} recorded eligibility_source {eligibility_source!r}, which this "
+            "reader does not recognise; the attestation cannot re-read it."
         )
     return _resolved_session(
         trading_day=day,
         predicted=predicted,
         cut=cut,
-        alpha_source=recorded.alpha_source,
-        eligibility_source=source,
+        alpha_source=alpha_source,
+        eligibility_source=eligibility_source,
     )
 
 
@@ -2922,6 +2927,40 @@ def _attestation_precondition(verdict: PitParityVerdict) -> ServingPrecondition:
     )
 
 
+def _attestation_metric(arm_id: str, verdict: PitParityVerdict) -> dict[str, Any]:
+    """One arm's measured §9.1 verdict, as a row on THIS grade run's manifest.
+
+    The precondition above decides whether the arm may be promoted this
+    cycle; this row is what a pointer for the arm CARRIES. The arena cycle
+    records only the arms a precondition refused, so without this row a PASS
+    existed nowhere a pointer writer could read it, and no S pointer ever
+    carried one — `crucible.promote.read_graded_attestation` reads it back,
+    on both the evidence path and the operator revert.
+
+    ``status`` is the manifest's coverage vocabulary — ``OK`` only for
+    ``PASS``, ``FAIL`` for every refusal including ``PARTIAL`` and
+    ``UNKNOWN`` — and the verdict itself, in its own closed vocabulary,
+    travels unchanged under ``attestation``.
+    """
+    from crucible.champion import ATTESTATION_METRIC  # noqa: PLC0415 - avoids a cycle
+    from crucible.keys import experiments_prefix  # noqa: PLC0415 - avoids a cycle
+
+    return {
+        "name": ATTESTATION_METRIC,
+        "module": f"crucible.slots.{SLOT}",
+        "metric_type": "gauge",
+        "value": float(verdict.coverage_fraction or 0.0),
+        "unit": "ratio",
+        "n_floor": 1,
+        "status": "OK" if verdict.status == "PASS" else "FAIL",
+        "status_reason": f"{arm_id}: pit_parity {verdict.status}: {verdict.reason}"[:500],
+        "source_path": experiments_prefix(arm_id),
+        "last_updated_utc": _utc_now(),
+        "arm_id": arm_id,
+        "attestation": verdict.to_dict(),
+    }
+
+
 def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
     """Construct every registered S arm's book and run the slot's arena cycle.
 
@@ -3096,6 +3135,7 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
             adv_cache=adv_cache,
         )
         preconditions[spec.arm_id] = [_attestation_precondition(attestation)]
+        ctx.record_metric(_attestation_metric(spec.arm_id, attestation))
         graded[spec.arm_id] = {
             "sessions": int(constructed.evidence["sessions"]),
             "cost_model": constructed.evidence["cost_model"]["name"],
@@ -3201,17 +3241,14 @@ def _attest(
     """The §9.1 contamination attestation, measured rather than asserted.
 
     The point-in-time pass is the book built from what each session RECORDED.
-    The second pass re-resolves each session's inputs from the upstream
-    artifacts AS THEY STAND TODAY and builds the same book from those — so the
-    per-date delta between the two is exactly the effect of any upstream
-    revision since the session, which is the contamination
-    `crucible.keys.session_inputs_key` exists to make measurable.
-
-    Re-resolved under the champions IN FORCE ON EACH SESSION
-    (:func:`resolve_recorded_session`, `alpha-engine-config-I12055`), never
-    today's pointers: a promotion since the session is not an upstream
-    revision of it, and reading one as unresolvable failed every S arm's
-    serving precondition after each M or U promotion.
+    The second pass re-reads the SAME upstream artifacts each session recorded
+    (:func:`re_resolve_session`) AS THEY STAND TODAY and builds the same book
+    from those — so the per-date delta between the two is exactly the effect
+    of any upstream revision since the session, which is the contamination
+    `crucible.keys.session_inputs_key` exists to make measurable. Never the
+    CURRENT champion pointers: a champion change is not a revision of what the
+    session saw, and measuring it renders every arm FAIL the cycle after an
+    upstream promotion.
 
     A session that cannot be re-resolved today reduces COVERAGE rather than
     being dropped from the pairing: :func:`pit_parity` refuses a pairing whose
@@ -3222,7 +3259,7 @@ def _attest(
     current: list[ResolvedSession] = []
     for session in resolved:
         try:
-            current.append(resolve_recorded_session(ctx.store, session))
+            current.append(re_resolve_session(ctx.store, recorded=session))
         except Exception:  # noqa: BLE001 - see below
             # The ONLY swallow on this path, and it is not a degrade. What is
             # absorbed: "one session's upstream artifacts are no longer

@@ -676,6 +676,30 @@ def run_migrate_history(
         # (`served_model_recipe`), which is the M slot's own registration
         # refusal already applied; the catalogue partition is a U/R ranker's.
         refused_by_recipe = catalog_refusal(recipe) if ranked else None
+        if not ranked:
+            # `alpha-engine-config-I12121`: an M seat is a pointer the trader
+            # sizes on, so the arm must be fitted to a SIGNED forward return.
+            # v1's zoo champion has been a volatility magnitude head before;
+            # importing one would publish |return| as `predicted_alpha`. Same
+            # shape as the producibility refusal above: raised when the slot
+            # was named, deferred with the reason otherwise, nothing written.
+            # Local import: the M module carries the whole fitting stack.
+            from crucible.slots.model import (  # noqa: PLC0415
+                UnsignedChampionTargetError,
+                require_signed_target,
+            )
+
+            try:
+                require_signed_target(
+                    recipe.recipe, action=f"seat slot {slot!r} from v1 by migrate.history"
+                )
+            except UnsignedChampionTargetError as exc:
+                if asserted:
+                    raise
+                imported[slot] = []
+                pointers[slot] = "deferred"
+                deferred[slot] = str(exc)
+                continue
         if refused_by_recipe is not None:
             why = (
                 f"v1 slot {slot!r} names champion {champion_name!r}, which resolves to "
