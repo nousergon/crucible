@@ -382,6 +382,9 @@ STILL_ORPHANED_M_CALLABLES: list[str] = [
     # 2026-10-05: the `servable_as_of` serving precondition, reached from
     # `grade` only. Pinned for the reason `grade` is.
     "evaluate_servable_as_of",
+    # 2026-10-14: the `signed_target` serving precondition, reached from
+    # `grade` only. Pinned for the reason `grade` is.
+    "evaluate_signed_target",
     # `alpha-engine-config-I11791`: the std calibration check, reached from
     # `grade_arm` (itself pinned above), and the served std, reached from
     # `produce_arm_predictions`. Pinned for the reason `grade` is.

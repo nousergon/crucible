@@ -16,6 +16,12 @@ Asserted here, each against the shape that broke:
 2. **The promote write** — a cycle that names a magnitude head as a moved
    champion is refused loudly, naming the arm and its target, and the
    incumbent pointer is left as it was.
+2a. **The decision** — the `signed_target` serving precondition
+   (:func:`crucible.slots.model.evaluate_signed_target`) bars the head in the
+   engine itself, so the decision falls to the best signed arm or the
+   incumbent, the head is named in `decision.ineligible`, and `promote` over
+   that decision succeeds rather than refusing (2026-10-14: the 2026-10-09
+   weekly arc failed at `promote --slot m` because only the write refused).
 3. **The operator revert** — the same refusal on `promote --revert-to`, the
    path that actually seated the head.
 4. **The feed** — publishing under such a champion raises and writes no
@@ -58,8 +64,10 @@ from crucible.slots.model import (
     DEFAULT_TARGET,
     FACTOR_RESIDUAL_TARGET,
     SIGNED_FORWARD_RETURN_TARGETS,
+    SIGNED_TARGET_PRECONDITION,
     TARGETS,
     UnsignedChampionTargetError,
+    evaluate_signed_target,
     require_signed_target,
 )
 from crucible.store import LocalStore
@@ -201,6 +209,113 @@ class TestPromoteRefusesAnUnsignedChampion:
         assert isinstance(refused.value.__cause__, UnsignedChampionTargetError)
         assert store.get_bytes(champion_key("m")) == pointer_bytes
         assert store.get_bytes(predictions_key(as_of)) == feed_bytes
+
+
+class TestTheDecisionBarsAnUnsignedArm:
+    """2026-10-14: the exclusion belongs at the decision, not only the write.
+
+    `vol_head` leads every paired date, as the magnitude head did on the
+    2026-10-09 arc. With the `signed_target` precondition supplied, the
+    engine never chooses it, and `promote` has nothing to refuse.
+    """
+
+    def _with_signed_challenger(self, arena, dates):
+        """``arena`` plus `mid`: signed, servable, ahead of `champ` and
+        behind `vol_head`."""
+        store, _, register, ids, as_of, _ = arena
+        register, record = register.register(
+            slot="m",
+            name="mid",
+            spec=m_recipe("mid").spec,
+            created_date=dates[0],
+            filed_on=dates[0],
+        )
+        ids = {**ids, "mid": record.arm_id}
+        seed_m_recipe(store, "mid")
+        seed_arm_predictions(store, ids["mid"], as_of)
+        return register, ids
+
+    def _cycle(self, register, ids, dates, as_of, *, store, scores):
+        from nousergon_lib.arena.engine import run_cycle
+
+        challengers = [arm for name, arm in ids.items() if name != "champ"]
+        checks = evaluate_signed_target(challengers, store=store)
+        return run_cycle(
+            config=get_slot("m").arena,
+            as_of=as_of,
+            register=register,
+            series_by_arm={
+                ids[name]: ArmSeries(arm_id=ids[name], scores=dict.fromkeys(dates, score))
+                for name, score in scores.items()
+            },
+            incumbent=ids["champ"],
+            preconditions={arm: [check] for arm, check in checks.items()},
+        )
+
+    def test_the_precondition_fails_the_head_and_passes_a_signed_arm(self, arena) -> None:
+        store, _, _, ids, _, _ = arena
+        checks = evaluate_signed_target([ids["vol_head"], ids["champ"]], store=store)
+        head = checks[ids["vol_head"]]
+        assert head.name == SIGNED_TARGET_PRECONDITION
+        assert not head.passed
+        assert ids["vol_head"] in head.reason and UNSIGNED in head.reason
+        assert checks[ids["champ"]].passed, checks[ids["champ"]].reason
+
+    def test_an_arm_no_recipe_declares_fails_the_precondition(self, arena, tmp_path) -> None:
+        store, _, _, ids, _, _ = arena
+        (tmp_path / strategy_arm_key("m", "vol_head")).unlink()
+        check = evaluate_signed_target([ids["vol_head"]], store=store)[ids["vol_head"]]
+        assert not check.passed
+        assert "declared by no M recipe" in check.reason
+
+    def test_loaded_recipes_are_read_before_the_tree(self, arena, tmp_path) -> None:
+        """The grade hands in the cycle's own recipes; a recipe it carries is
+        not re-read off the store."""
+        store, _, _, ids, _, _ = arena
+        (tmp_path / strategy_arm_key("m", "vol_head")).unlink()
+        recipe = m_recipe("vol_head", target=UNSIGNED)
+        check = evaluate_signed_target([ids["vol_head"]], recipes=[recipe], store=store)
+        assert not check[ids["vol_head"]].passed
+        assert UNSIGNED in check[ids["vol_head"]].reason
+
+    def test_the_decision_falls_to_the_best_signed_arm_and_promote_seats_it(self, arena) -> None:
+        store, dates, _, _, as_of, _ = arena
+        register, ids = self._with_signed_challenger(arena, dates)
+        cycle = self._cycle(
+            register,
+            ids,
+            dates,
+            as_of,
+            store=store,
+            scores={"champ": 0.0, "mid": 0.03, "vol_head": 0.045},
+        )
+        assert cycle.decision.moved
+        assert cycle.decision.champion == ids["mid"]
+        barred = cycle.decision.ineligible[ids["vol_head"]]
+        assert [p.name for p in barred] == [SIGNED_TARGET_PRECONDITION]
+        assert UNSIGNED in barred[0].reason
+
+        result = run_promotion(
+            spec=get_slot("m"), register=register, cycle=cycle, store=store, code_sha=CODE_SHA
+        )
+        assert result.pointer is not None and result.pointer.arm_id == ids["mid"]
+        assert read_predictions_feed(store, as_of).champion == ids["mid"]
+
+    def test_with_no_signed_challenger_the_incumbent_holds_without_a_refusal(self, arena) -> None:
+        store, dates, register, ids, as_of, pointer_bytes = arena
+        cycle = self._cycle(
+            register, ids, dates, as_of, store=store, scores={"champ": 0.0, "vol_head": 0.045}
+        )
+        assert not cycle.decision.moved
+        assert cycle.decision.champion == ids["champ"]
+        assert ids["vol_head"] in cycle.decision.ineligible
+
+        result = run_promotion(
+            spec=get_slot("m"), register=register, cycle=cycle, store=store, code_sha=CODE_SHA
+        )
+        assert result.pointer is None
+        assert store.get_bytes(champion_key("m")) == pointer_bytes
+        assert read_predictions_feed(store, as_of).champion == ids["champ"]
 
 
 class TestTheOperatorRevertRefusesAnUnsignedChampion:

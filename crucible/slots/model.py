@@ -127,12 +127,14 @@ __all__ = [
     "HIGH_CONFIDENCE_P_UP",
     "MIN_DISPERSION_RATIO",
     "SERVABLE_AS_OF_PRECONDITION",
+    "SIGNED_TARGET_PRECONDITION",
     "SERVING_VETO_WINDOW_METRIC",
     "SETTLED_WINDOW_DECISION_DATES",
     "UNPRODUCED_VETO_METRICS",
     "GAUSSIAN_ONE_SIGMA_COVERAGE",
     "UNCERTAINTY_CALIBRATION_METRIC",
     "UNSERVABLE_AS_OF_METRIC",
+    "UNSIGNED_TARGET_METRIC",
     "Z_VAR_BAND",
     "M_SELECTION_TOP_N",
     "OOS_METHOD",
@@ -185,6 +187,7 @@ __all__ = [
     "evaluate_uncertainty_calibration",
     "evaluate_input_completeness",
     "evaluate_servable_as_of",
+    "evaluate_signed_target",
     "factor_residual_panel",
     "neutralize_cross_section",
     "point_in_time_factor_betas",
@@ -275,6 +278,16 @@ SERVABLE_AS_OF_PRECONDITION = "servable_as_of"
 #: barred this cycle — filed on every grade, as a zero when none was, so
 #: "no arm was barred" is a reading rather than an absence.
 UNSERVABLE_AS_OF_METRIC = "arms_unservable_as_of"
+
+#: The serving precondition that bars an arm from the M pointer when its
+#: declared fit target is not in :data:`SIGNED_FORWARD_RETURN_TARGETS`
+#: (2026-10-14). See :func:`evaluate_signed_target`.
+SIGNED_TARGET_PRECONDITION = "signed_target"
+
+#: The grade-manifest row naming every arm :data:`SIGNED_TARGET_PRECONDITION`
+#: barred this cycle — filed on every grade, zero included, for the reason
+#: :data:`UNSERVABLE_AS_OF_METRIC` is.
+UNSIGNED_TARGET_METRIC = "arms_unsigned_target"
 
 #: Settled out-of-sample DECISION DATES an arm needs before its realized
 #: veto inputs exist. The metric's own name declares the window —
@@ -2886,9 +2899,11 @@ DEFAULT_TARGET: str = TARGETS[0]
 #: 2026-10-07 the M pointer named exactly such an arm
 #: (`m:v3meta_volatility_head:97645d421bea`, seated by an operator revert),
 #: and `serve.daily` published its |return| forecasts as `predicted_alpha` —
-#: a book that reads every name as a long. Grading cannot catch this (it
+#: a book that reads every name as a long. Scoring cannot catch this (it
 #: scores every arm against the signed return, and a magnitude head merely
-#: scores badly); only a refusal on the pointer write and on the feed can.
+#: scores badly), so the rule is held three times: as the grade's
+#: :data:`SIGNED_TARGET_PRECONDITION`, which bars such an arm from the
+#: DECISION (2026-10-14), and as refusals on the pointer write and the feed.
 #:
 #: An ALLOWLIST, deliberately: a target added to :data:`TARGETS` later is
 #: refused as a champion until someone states here that it is signed.
@@ -5455,17 +5470,39 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
     # into the decision: the engine picks among arms that can serve, the
     # incumbent holds if none of them beats it, and the barred arm is named
     # with its reason in `decision.ineligible` and on this manifest.
-    servable = evaluate_servable_as_of(
-        ctx.store, _servable_candidates(ctx, specs, champion=champion, as_of=as_of), as_of=as_of
-    )
+    challengers = _servable_candidates(ctx, specs, champion=champion, as_of=as_of)
+    servable = evaluate_servable_as_of(ctx.store, challengers, as_of=as_of)
     for arm_id, check in servable.items():
         preconditions.setdefault(arm_id, []).append(check)
         if arm_id in grades:
             grades[arm_id]["servable_as_of"] = check.passed
 
+    # The FOURTH serving precondition, and the only one about what the arm
+    # IS rather than how it scored or what it wrote (2026-10-14). Replaying
+    # the 2026-10-09 weekly arc, the engine chose
+    # `m:v3meta_volatility_head:97645d421bea` — a magnitude head fitted to
+    # `abs_forward_return` — as the evidence winner, and only `promote`'s
+    # write-side witness (`_refuse_unsigned_champion`) refused it, failing
+    # the stage and every stage after it. The arm is still graded and scored
+    # above (an unsigned head is a legitimate research arm); it is barred
+    # from the POINTER here, so the engine chooses among signed arms and
+    # names this one in `decision.ineligible`. Same candidate set as
+    # `servable_as_of`, for the same reasons.
+    signed = evaluate_signed_target(
+        challengers,
+        recipes=loaded.registered,
+        store=ctx.store,
+        strategy_dir=getattr(settings, "strategy_dir", None),
+    )
+    for arm_id, check in signed.items():
+        preconditions.setdefault(arm_id, []).append(check)
+        if arm_id in grades:
+            grades[arm_id][SIGNED_TARGET_PRECONDITION] = check.passed
+
     _record_dead_slot_finding(ctx, grades, as_of=as_of)
     _record_serving_veto_window(ctx, grades, windows, as_of=as_of)
     _record_unservable_as_of(ctx, servable, as_of=as_of)
+    _record_unsigned_target(ctx, signed, as_of=as_of)
 
     result = run_grade(
         ctx,
@@ -5479,10 +5516,96 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
     result["unservable_as_of"] = {
         arm_id: check.reason for arm_id, check in sorted(servable.items()) if not check.passed
     }
+    result["unsigned_target"] = {
+        arm_id: check.reason for arm_id, check in sorted(signed.items()) if not check.passed
+    }
     result["refused"] = [
         {"arm": r.arm, "unresolvable": list(r.unresolvable)} for r in loaded.refused
     ]
     return result
+
+
+def evaluate_signed_target(
+    arm_ids: Sequence[str],
+    *,
+    recipes: Sequence[ModelRecipe] = (),
+    store: Any = None,
+    strategy_dir: Path | str | None = None,
+) -> dict[str, ServingPrecondition]:
+    """One :data:`SIGNED_TARGET_PRECONDITION` per arm: is its output signed?
+
+    The rule is :func:`require_signed_target`'s and the resolution is
+    :func:`resolve_arm_recipe`'s — the same two functions
+    `crucible.promote._refuse_unsigned_champion` runs on the pointer write —
+    so "the decision may seat this arm" and "the write may seat it" are one
+    answer. ``recipes`` (the cycle's loaded recipes) are matched on the full
+    arm id first; an arm none of them declares is resolved from the strategy
+    tree (``strategy_dir``, else ``store``), and one the tree does not
+    declare either FAILS, because its target cannot be read.
+
+    **A declared swallow** (`crucible/AGENTS.md`, fail-loud). (a) Swallowed:
+    :class:`UnsignedChampionTargetError`. (b) The deliverable survives
+    because an unsigned arm is not a broken grade: it is still scored and
+    ladder-aged, only the POINTER is closed to it. (c) Recording surface: a
+    FAILED precondition carrying the refusal's own message, filed by the
+    engine under `decision.ineligible` in the `arena_cycle` artifact, and the
+    :data:`UNSIGNED_TARGET_METRIC` row on the grade manifest.
+    """
+    known = {recipe.arm_id: recipe for recipe in recipes}
+    checks: dict[str, ServingPrecondition] = {}
+    for arm_id in sorted(arm_ids):
+        action = f"let the decision seat {arm_id!r} as slot {SLOT} champion"
+        try:
+            recipe = known.get(arm_id) or resolve_arm_recipe(
+                arm_id, store=store, strategy_dir=strategy_dir
+            )
+            require_signed_target(recipe, action=action)
+        except UnsignedChampionTargetError as exc:
+            checks[arm_id] = ServingPrecondition(
+                name=SIGNED_TARGET_PRECONDITION, passed=False, reason=str(exc)
+            )
+        else:
+            checks[arm_id] = ServingPrecondition(
+                name=SIGNED_TARGET_PRECONDITION,
+                passed=True,
+                reason=(
+                    f"arm {arm_id} is fitted to {effective_target(recipe)!r}, a signed "
+                    "forward return"
+                ),
+            )
+    return checks
+
+
+def _record_unsigned_target(
+    ctx: Any, signed: dict[str, ServingPrecondition], *, as_of: str
+) -> None:
+    """File :data:`UNSIGNED_TARGET_METRIC` — on every grade, zero included.
+
+    Status ``OK`` in both directions, as :func:`_record_unservable_as_of`: a
+    barred challenger is a fact about the pointer, not a fault in the grade.
+    """
+    barred = [arm for arm, check in sorted(signed.items()) if not check.passed]
+    ctx.record_metric(
+        {
+            "name": UNSIGNED_TARGET_METRIC,
+            "module": f"crucible.slots.{SLOT}",
+            "metric_type": "count",
+            "value": float(len(barred)),
+            "unit": "arms",
+            "n_floor": 0,
+            "status": "OK",
+            "status_reason": (
+                f"{len(barred)} of {len(signed)} challenger arm(s) are not fitted to a "
+                f"signed forward return and are barred from the pointer this cycle "
+                f"({SIGNED_TARGET_PRECONDITION}): {', '.join(barred)}"
+                if barred
+                else f"every one of {len(signed)} challenger arm(s) is fitted to a signed "
+                "forward return"
+            ),
+            "source_path": arena_cycle_key(SLOT, as_of),
+            "last_updated_utc": _utc_now(),
+        }
+    )
 
 
 def evaluate_servable_as_of(
