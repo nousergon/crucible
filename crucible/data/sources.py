@@ -38,15 +38,28 @@ lies outside the window is a fact about the market, not the source — it is
 returned alongside the panel, in ``panel.attrs["unlisted_in_window"]``,
 rather than failing the run. This is never guessed from an empty frame
 alone: both implementations resolve real bounds before choosing either
-branch. Survivorship (a delisted symbol dropped from *today's* universe
-list before ever reaching this module) is unaffected and stays phase-5 work
-— see the binding plan §10.4 and `alpha-engine-config-I9761`.
+branch.
+
+**A departed symbol keeps its history** (`alpha-engine-config-I12287`).
+The data layer prunes a delisted name from the live price library by
+MOVING its whole stored history into a separate retention library
+(``delisted_history``, written by the data repository's
+``prune_delisted_tickers``), so a reader of the live library alone sees a
+delisted name vanish from every session it ever traded, not just the ones
+after it stopped. :meth:`PriceSource.retained_symbols` names the retained
+symbols whose history reaches into a window, and
+:meth:`PriceSource.load_departed` reads departed names from whichever
+library holds them. A departed symbol held in neither is NAMED
+(``DepartedHistory.without_history``), never invented and never silently
+dropped. Point-in-time constituents from a provider stay phase-5 work —
+see the binding plan §10.4 and `alpha-engine-config-I9761`.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -54,7 +67,9 @@ if TYPE_CHECKING:
 
 __all__ = [
     "PANEL_COLUMNS",
+    "RETENTION_LIBRARY",
     "ArcticPriceSource",
+    "DepartedHistory",
     "FramePriceSource",
     "MissingSourceError",
     "PriceSource",
@@ -72,6 +87,12 @@ PANEL_COLUMNS: tuple[str, ...] = (
     "close_raw",
     "volume_raw",
 )
+
+#: The ArcticDB library a delisted symbol's full stored history is MOVED to
+#: when the data layer prunes it from the live `universe` library — the data
+#: repository's ``store.arctic_store.get_delisted_history_lib`` contract
+#: (`alpha-engine-config-I1943`, leg 3). Read here, never written.
+RETENTION_LIBRARY = "delisted_history"
 
 _OHLCV_RENAME = {
     "Open": "open_raw",
@@ -149,6 +170,42 @@ def _frame_date_bounds(frame: Any) -> tuple[dt.date, dt.date] | None:
     return (min(dates), max(dates))
 
 
+def _overlaps_window(
+    bounds: tuple[dt.date, dt.date] | None, *, window_start: dt.date, window_end: dt.date
+) -> bool:
+    """Whether stored-history ``bounds`` reach into ``(window_start, window_end]``."""
+    if bounds is None:
+        return False
+    first, last = bounds
+    return last > window_start and first <= window_end
+
+
+def _empty_panel() -> pd.DataFrame:
+    import pandas as pd
+
+    return pd.DataFrame({column: [] for column in PANEL_COLUMNS})
+
+
+@dataclass(frozen=True)
+class DepartedHistory:
+    """What a source holds for symbols that have LEFT the declared universe.
+
+    ``panel`` is the canonical long panel (:data:`PANEL_COLUMNS`) of every
+    departed symbol with a stored row inside the window — each up to its own
+    last stored session and no further, because nothing here fills forward.
+    It may be empty: a window no departure reached is not an outage.
+
+    ``without_history`` names the departed symbols the source holds NO stored
+    history for in any library — the "never written" case. Named rather than
+    raised: a departed name is outside the coverage denominator, so its
+    absence cannot fail the day, and naming it is what lets a consumer tell
+    a name with genuinely no data from a panel that dropped one.
+    """
+
+    panel: pd.DataFrame
+    without_history: tuple[str, ...]
+
+
 class MissingSourceError(RuntimeError):
     """A required input could not be read. The run fails; it does not degrade.
 
@@ -184,6 +241,32 @@ class PriceSource(ABC):
         reason to shrink the panel's expected-universe denominator. Always
         present (``[]`` when empty), so its absence is never mistaken for
         "not measured".
+        """
+
+    @abstractmethod
+    def retained_symbols(self, *, end: dt.date, lookback_days: int) -> list[str]:
+        """Every symbol the source RETAINS after it left the live listing whose
+        stored history reaches into ``(end - lookback_days, end]``, sorted.
+
+        Abstract rather than defaulted to ``[]``: a source that could not say
+        what it retains would silently produce a survivors-only panel, which
+        is the defect `alpha-engine-config-I12287` exists to close.
+        """
+
+    @abstractmethod
+    def load_departed(
+        self, *, end: dt.date, lookback_days: int, symbols: list[str]
+    ) -> DepartedHistory:
+        """The window's history for ``symbols`` — names that LEFT the declared
+        universe — read from the live listing first and the retention store
+        second.
+
+        Never raises for a symbol held nowhere (that is
+        :attr:`DepartedHistory.without_history`), nor for one whose history
+        lies wholly outside the window (it simply contributes no rows). Still
+        raises :class:`MissingSourceError` for a symbol whose stored history
+        overlaps the window yet came back empty: that is a partial outage,
+        exactly as it is for a universe name.
         """
 
     @abstractmethod
@@ -280,9 +363,62 @@ class FramePriceSource(PriceSource):
 
     name = "frames"
 
-    def __init__(self, frames: dict[str, Any], *, snapshot: str = "frames:in-memory") -> None:
+    def __init__(
+        self,
+        frames: dict[str, Any],
+        *,
+        retained: dict[str, Any] | None = None,
+        snapshot: str = "frames:in-memory",
+    ) -> None:
         self._frames = frames
+        # The retention store's stand-in: frames for names that LEFT the live
+        # listing. Kept apart from `frames` exactly as the production source
+        # keeps the two libraries apart, so `load_panel` never sees them.
+        self._retained = dict(retained or {})
         self._snapshot = snapshot
+
+    def retained_symbols(self, *, end: dt.date, lookback_days: int) -> list[str]:
+        window_start = end - dt.timedelta(days=lookback_days)
+        return sorted(
+            ticker
+            for ticker, frame in self._retained.items()
+            if _overlaps_window(
+                _frame_date_bounds(frame), window_start=window_start, window_end=end
+            )
+        )
+
+    def load_departed(
+        self, *, end: dt.date, lookback_days: int, symbols: list[str]
+    ) -> DepartedHistory:
+        window_start = end - dt.timedelta(days=lookback_days)
+        present: dict[str, Any] = {}
+        without: list[str] = []
+        overlapping_but_empty: list[str] = []
+        for ticker in sorted(set(symbols)):
+            frame = self._frames.get(ticker)
+            if frame is None:
+                frame = self._retained.get(ticker)
+            bounds = _frame_date_bounds(frame)
+            if bounds is None:
+                without.append(ticker)
+                continue
+            dates = _frame_dates(frame)
+            if ((dates > window_start) & (dates <= end)).any():
+                present[ticker] = frame
+            elif _overlaps_window(bounds, window_start=window_start, window_end=end):
+                overlapping_but_empty.append(ticker)
+        if overlapping_but_empty:
+            raise MissingSourceError(
+                f"departed symbol(s) {overlapping_but_empty} have stored history overlapping "
+                f"the window ending {end} but no row inside it — a partial outage, not a "
+                "departure."
+            )
+        panel = (
+            normalize_panel(present, end=end, lookback_days=lookback_days)
+            if present
+            else _empty_panel()
+        )
+        return DepartedHistory(panel=panel, without_history=tuple(without))
 
     def load_panel(
         self,
@@ -501,6 +637,141 @@ class ArcticPriceSource(PriceSource):
         panel = normalize_panel(frames, end=end, lookback_days=lookback_days)
         panel.attrs["unlisted_in_window"] = unlisted
         return panel
+
+    def _retention_lib(self) -> Any:
+        """The retention library, opened read-only (never created).
+
+        ``None`` under a dedicated-``library`` override: that override names
+        ONE library for an isolated read (`alpha-engine-config-I10457`), and
+        reaching from it into the production retention store would mix two
+        stores in one panel — the cross-over the override's docstring
+        forbids. An absent retention library on the production path is an
+        outage, not an empty store: the data layer creates it on its first
+        prune, so a production bucket without it is the wrong bucket.
+        """
+        if self.library:
+            return None
+        from nousergon_lib.arcticdb import open_arctic
+
+        try:
+            return open_arctic(self.bucket, region=self.region).get_library(RETENTION_LIBRARY)
+        except Exception as exc:
+            raise MissingSourceError(
+                f"ArcticDB retention library {RETENTION_LIBRARY!r} on bucket {self.bucket!r} "
+                f"could not be opened: {type(exc).__name__}: {exc}. Without it every "
+                "delisted name's history is invisible and the panel is survivors-only."
+            ) from exc
+
+    def _live_lib(self) -> Any:
+        from nousergon_lib.arcticdb import open_arctic, open_universe_lib
+
+        if self.library:
+            return open_arctic(self.bucket, region=self.region).get_library(
+                self.library, create_if_missing=True
+            )
+        return open_universe_lib(self.bucket, region=self.region)
+
+    def retained_symbols(self, *, end: dt.date, lookback_days: int) -> list[str]:
+        import pandas as pd
+
+        retention = self._retention_lib()
+        if retention is None:
+            return []
+        window_start = end - dt.timedelta(days=lookback_days)
+        try:
+            symbols = sorted(retention.list_symbols())
+            descriptions = retention.get_description_batch(symbols) if symbols else []
+        except Exception as exc:
+            raise MissingSourceError(
+                f"ArcticDB retention library {RETENTION_LIBRARY!r} on bucket {self.bucket!r} "
+                f"could not be listed: {type(exc).__name__}: {exc}"
+            ) from exc
+        out: list[str] = []
+        for sym, description in zip(symbols, descriptions, strict=True):
+            start_ts, end_ts = description.date_range
+            if pd.isna(start_ts) or pd.isna(end_ts):
+                raise MissingSourceError(
+                    f"retained symbol {sym!r} carries no date range in {RETENTION_LIBRARY!r}; "
+                    "whether its history reaches this window cannot be decided, and "
+                    "guessing either way would add or drop a name silently."
+                )
+            bounds = (pd.Timestamp(start_ts).date(), pd.Timestamp(end_ts).date())
+            if _overlaps_window(bounds, window_start=window_start, window_end=end):
+                out.append(sym)
+        return out
+
+    def load_departed(
+        self, *, end: dt.date, lookback_days: int, symbols: list[str]
+    ) -> DepartedHistory:
+        import pandas as pd
+        from nousergon_lib.arcticdb import _load_arctic_frames
+
+        wanted = sorted(set(symbols))
+        if not wanted:
+            return DepartedHistory(panel=_empty_panel(), without_history=())
+        try:
+            live = self._live_lib()
+            retention = self._retention_lib()
+            by_lib: dict[str, list[str]] = {"live": [], "retained": []}
+            without: list[str] = []
+            for sym in wanted:
+                if live.has_symbol(sym):
+                    by_lib["live"].append(sym)
+                elif retention is not None and retention.has_symbol(sym):
+                    by_lib["retained"].append(sym)
+                else:
+                    without.append(sym)
+            frames: dict[str, Any] = {}
+            bounds: dict[str, tuple[dt.date, dt.date] | None] = {}
+            for key, lib in (("live", live), ("retained", retention)):
+                if not by_lib[key]:
+                    continue
+                frames.update(
+                    _load_arctic_frames(
+                        lib,
+                        by_lib[key],
+                        lookback_days=lookback_days,
+                        end=str(end),
+                        columns=None,
+                        label=f"ArcticPriceSource.load_departed({key})",
+                    )
+                )
+                for sym in by_lib[key]:
+                    if sym in frames:
+                        continue
+                    start_ts, end_ts = lib.get_description(sym).date_range
+                    bounds[sym] = (
+                        None
+                        if pd.isna(start_ts) or pd.isna(end_ts)
+                        else (pd.Timestamp(start_ts).date(), pd.Timestamp(end_ts).date())
+                    )
+        except MissingSourceError:
+            raise
+        except Exception as exc:
+            raise MissingSourceError(
+                f"ArcticDB departed-symbol read on bucket {self.bucket!r} failed for the window "
+                f"ending {end}: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        window_start = end - dt.timedelta(days=lookback_days)
+        # A held symbol whose windowed read came back empty is either history
+        # wholly outside the window (contributes nothing) or an outage — the
+        # same two facts `load_panel` separates, decided the same way.
+        missing, _outside = _classify_absent_symbols(
+            sorted(bounds), bounds, window_start=window_start, window_end=end
+        )
+        if missing:
+            raise MissingSourceError(
+                f"departed symbol(s) {missing} are held on bucket {self.bucket!r} with history "
+                f"overlapping the window ending {end}, yet the read returned nothing for them "
+                "— a partial outage, which must fail the run rather than thin the panel."
+            )
+        panel = (
+            normalize_panel(frames, end=end, lookback_days=lookback_days)
+            if frames
+            else _empty_panel()
+        )
+        return DepartedHistory(panel=panel, without_history=tuple(without))
 
     def _symbol_bounds(self, symbols: list[str]) -> dict[str, tuple[dt.date, dt.date] | None]:
         """Each symbol's FULL stored-history ``(first, last)`` date, or ``None``.

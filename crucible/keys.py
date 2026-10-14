@@ -90,6 +90,7 @@ __all__ = [
     "cross_section_settled_key",
     "data_panel_key",
     "declared_universe_key",
+    "declared_universe_prefix",
     "dispatch_exit_key",
     "dispatch_key",
     "dispatch_prefix",
@@ -1277,7 +1278,18 @@ def declared_universe_key(trading_day: str) -> str:
     """
     if not trading_day:
         raise ValueError("trading_day must be non-empty")
-    return f"universe/declared/{trading_day}/members.json"
+    return f"{declared_universe_prefix()}{trading_day}/members.json"
+
+
+def declared_universe_prefix() -> str:
+    """The prefix under which every :func:`declared_universe_key` lives.
+
+    `crucible.data.daily` lists it to find every universe declared over a
+    panel's window: a name that LEFT the universe keeps its history in the
+    panel only because some earlier session's declaration named it
+    (`alpha-engine-config-I12287`).
+    """
+    return "universe/declared/"
 
 
 def signals_key(trading_day: str) -> str:
