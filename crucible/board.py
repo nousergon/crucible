@@ -66,7 +66,7 @@ from crucible.features.depth import (
     check_feature_layer_provenance,
 )
 from crucible.gate import LADDER_STATES, STANDING_SLOS, Ladder, PhaseRow
-from crucible.keys import ALERTS_ROOT
+from crucible.keys import ALERTS_ROOT, reopen_record_key
 from crucible.models import BoardCurrentDocument, BoardDeclarationRow
 from crucible.store import Store
 
@@ -1200,7 +1200,67 @@ def _phase_rows(
                 clauses=_clause_views(supplied.get(phase.gate) if phase.gate else None),
             )
         )
+        if ladder_row.latched_by is not None:
+            rows.append(_regression_row(phase, ladder_row))
     return rows
+
+
+def _regression_row(phase: Any, ladder_row: PhaseRow) -> BoardRow:
+    """A LATCHED phase's live clauses, as their own row.
+
+    A phase latched by its closing record reads `MET` on the ladder for good
+    (`crucible.gate.read_phase_latch`) — the answer to phases decaying after
+    they exited. The cost of that answer would be a regression nobody sees,
+    so the latched phase's clauses are still read every render and this row
+    carries them: `MET` while every one still holds, red the moment one does
+    not. Declared for every latched phase, so "no regression" is a green row
+    rather than an absent one. It clears only when the clause reads met again
+    or the phase is explicitly reopened (`crucible.keys.reopen_record_key`).
+    """
+    latch = ladder_row.latched_by or {}
+    key = str(latch.get("key"))
+    exit_line = (
+        f"phase {phase.number} exited {latch.get('clauses_met')}/"
+        f"{latch.get('clauses_total')} on {latch.get('trading_day')} ({key})"
+    )
+    if ladder_row.regressions:
+        state = "UNMET"
+        detail = (
+            f"REGRESSED: {', '.join(ladder_row.regressions)} — {exit_line}, and today's "
+            f"reading has {ladder_row.clauses_met}/{ladder_row.clauses_total} clauses met. "
+            "The phase stays latched MET; this row stays red until the clause holds again "
+            "or the phase is reopened."
+        )
+        if ladder_row.regressions_unmeasurable:
+            also = ", ".join(ladder_row.regressions_unmeasurable)
+            detail = f"{detail} Also unmeasurable: {also}."
+    elif ladder_row.regressions_unmeasurable:
+        state = "UNMEASURABLE"
+        detail = (
+            f"could not read {', '.join(ladder_row.regressions_unmeasurable)} — {exit_line}; "
+            "whether it has regressed is unknown, which is a fault in our access."
+        )
+    else:
+        state = "MET"
+        detail = f"no regression — {exit_line}, and every clause still reads met today."
+    return BoardRow(
+        id=f"phase:{phase.id}:regression",
+        source="phase",
+        section=f"§6 phase {phase.number}",
+        title=f"{phase.title} — still holds after exit",
+        state=state,
+        detail=detail,
+        surface="crucible/board",
+        artifact=key,
+        means_when_red=(
+            f"phase {phase.number} exited and stays latched, but a clause its exit "
+            "depended on no longer reads met. Fix the regression, or — if the exit itself "
+            f"was wrong — file a reopen record at {reopen_record_key(phase.id)} "
+            f"(phase, reason, ruled_by, filed_utc). Tracker: {phase.tracker} "
+            f"({phase.tracker_url})."
+        ),
+        last_read=ladder_row.read_on,
+    )
 
 
 def _earliest_satisfiable_rows(
@@ -1683,7 +1743,9 @@ def _schedule_rows(ladder: Ladder | None, trading_day: str) -> list[BoardRow]:
                 if phase_row.clauses_total
                 else f"{phase.id} {phase_row.gate_state}"
             )
-            state = "MET" if phase_row.gate_state == "MET" else None
+            # `exited`, not `gate_state == "MET"`: a phase latched by its
+            # closing record met its milestone, whatever today's live reading.
+            state = "MET" if phase_row.exited else None
 
         if state is None:
             # Strictly PAST the anchor: the anchor day itself is the session

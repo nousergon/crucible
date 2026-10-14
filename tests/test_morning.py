@@ -961,6 +961,32 @@ class TestTheHeadline:
         board_uri = (tmp_path / "board" / "index.html").resolve().as_uri()
         assert f'<a href="{board_uri}">Board</a>' in message
 
+    def test_a_latched_phase_says_so_and_names_a_regression(self, tmp_path):
+        """A phase latched by its closing record reads MET with a live
+        fraction that may be below total; the headline says it is latched,
+        and says when the latch's regression row is red, rather than
+        printing a bare "MET 1/2" for a reader to decode."""
+        board = _board(
+            rows=[
+                _row(
+                    "phase:phase0",
+                    "phase",
+                    "MET",
+                    "latched by gates/phase0/closing.json",
+                    [_clause("a_met", True), _clause("b_unmet", False)],
+                ),
+                _row("phase:phase0:regression", "phase", "UNMET", "REGRESSED: b_unmet"),
+                _row("phase:phase1", "phase", "UNMET", "0 of 1", [_clause("c", False)]),
+            ]
+        )
+        inputs = self._inputs(tmp_path, board=board, previous=_board())
+        message = render_message(
+            inputs, now=FIRED_AT, update_url=UPDATE_URL, history_url=HISTORY_URL
+        )
+        assert "1/2 latched — UNMET regression" in message
+        assert "Phase 1  UNMET" in message
+        assert message.count("Phase ") == 6
+
     def test_exactly_one_line_per_plan_phase_never_the_closing_rows(self, tmp_path):
         """`alpha-engine-config-I10123` follow-up, measured live 2026-09-06:
         the board carries a SEPARATE `phase:phaseN:closing` row per phase

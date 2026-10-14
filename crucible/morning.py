@@ -1213,7 +1213,16 @@ def render_message(
             else "—"
         )
         state = report.escape(str(row.get("state")))
-        lines.append(f"Phase {phase.number}  {state:<{_STATE_COLUMN_WIDTH}} {fraction}")
+        line = f"Phase {phase.number}  {state:<{_STATE_COLUMN_WIDTH}} {fraction}"
+        # A phase latched by its closing record reads MET for good; its live
+        # fraction can then be below total, and the line says why rather
+        # than leaving "MET 3/6" to be decoded (`crucible.board._regression_row`).
+        latch = rows_by_id.get(f"{_PHASE_ROW_ID[phase.id]}:regression")
+        if latch is not None:
+            line = f"{line} latched"
+            if latch.get("state") != "MET":
+                line = f"{line} — {report.escape(str(latch.get('state')))} regression"
+        lines.append(line)
 
     lines.append(
         report.escape(

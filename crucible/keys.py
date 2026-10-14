@@ -134,6 +134,7 @@ __all__ = [
     "parse_manifest_key",
     "parse_migration_key",
     "predictions_key",
+    "reopen_record_key",
     "retirement_log_key",
     "review_key",
     "review_prefix",
@@ -1241,6 +1242,29 @@ def closing_record_key(phase: str) -> str:
             "shape exists to guarantee."
         )
     return f"gates/{phase}/closing.json"
+
+
+def reopen_record_key(phase: str) -> str:
+    """The explicit ruling that a LATCHED phase is reopened.
+
+    A phase whose :func:`closing_record_key` record is present and valid is
+    latched by `crucible.gate.build_ladder`: it reads `MET` on the ladder for
+    good, and a clause that later fails is rendered as a REGRESSION rather than
+    as the phase quietly un-exiting. The only way back to live grading is a
+    record filed HERE — a human's ruling with a reason and a name on it
+    (`phase`, `reason`, `ruled_by`, `filed_utc`), newer than the closing
+    record it overrides. Never a side effect of a rolling window.
+
+    A sibling of the closing record, three segments deep and not named
+    `gate.json`, so `crucible.gate.last_read` does not mistake it for a dated
+    reading either.
+    """
+    if not phase:
+        raise ValueError(
+            "phase must be non-empty — a blank phase would put every phase's reopen "
+            "ruling at one key."
+        )
+    return f"gates/{phase}/reopen.json"
 
 
 def gate_prefix(gate: str) -> str:
