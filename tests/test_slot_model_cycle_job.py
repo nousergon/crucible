@@ -44,8 +44,10 @@ from crucible.slots.model import (
     CPCV_OOS_IC_METRIC,
     FEATURE_COMPLETENESS_METRIC,
     SERVABLE_AS_OF_PRECONDITION,
+    SIGNED_TARGET_PRECONDITION,
     SLOT,
     UNSERVABLE_AS_OF_METRIC,
+    UNSIGNED_TARGET_METRIC,
     FeatureLayerSource,
     ModelRecipe,
     RegisteredModelArm,
@@ -171,7 +173,9 @@ def _build_store(tmp_path, *, stationary: bool = False):
     return backing
 
 
-def _write_recipe(directory, name, *, features, inputs=(), supersedes=None, min_days=10):
+def _write_recipe(
+    directory, name, *, features, inputs=(), supersedes=None, min_days=10, target=None
+):
     directory.mkdir(parents=True, exist_ok=True)
     lines = ["slot: m", f"name: {name}"]
     if supersedes:
@@ -186,6 +190,10 @@ def _write_recipe(directory, name, *, features, inputs=(), supersedes=None, min_
         "  refit_cadence_trading_days: 5",
         f"  training_window: {{kind: expanding, min_trading_days: {min_days}}}",
         "  cpcv: {n_groups: 4, k_test: 1, embargo_trading_days: 1}",
+    ]
+    if target is not None:
+        lines.append(f"  target: {target}")
+    lines += [
         f"registered_at: '{SESSIONS[0]}'",
     ]
     (directory / f"{name}.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -580,6 +588,78 @@ class TestAnArmWithNoCrossSectionForTheDayCannotTakeThePointer:
         assert [r["value"] for r in rows] == [0.0]
         assert not [a for a in result["model_grades"] if "control" in a]
         assert result["model_grades"][stacked]["servable_as_of"] is True
+
+
+class TestAnUnsignedArmIsGradedButCannotTakeThePointer:
+    """2026-10-14: the 2026-10-09 weekly arc's shape, on the real grade job.
+
+    Replaying that arc, the engine chose `m:v3meta_volatility_head:...` — a
+    magnitude head fitted to `abs_forward_return` — as the evidence winner,
+    and only `promote`'s write-side witness refused it, failing the whole
+    stage. The `signed_target` serving precondition puts that refusal into
+    the DECISION: the head is still graded and scored, and it is named in
+    `decision.ineligible` and on the manifest.
+    """
+
+    def _graded(self, store, tmp_path):
+        arms = tmp_path / "strategy" / "arms" / SLOT
+        _write_recipe(arms, "base", features=[BASE_COLUMN])
+        _write_recipe(arms, "vol_head", features=[SECOND_COLUMN], target="abs_forward_return")
+        settings = _Settings(tmp_path / "strategy")
+        runner = TestGradeRunsTheSharedEngine()
+        for day in (*WARMUP, *SESSIONS[46:52]):
+            _run_produce(store, settings, day=day)
+        _, result = runner._grade(store, settings, GRADE_DAY)
+        cycle = json.loads(store.get_bytes(result["arena_cycle_key"]).decode("utf-8"))
+        rows = [
+            m
+            for m in _manifest(store, "experiment.grade", GRADE_DAY)["metrics"]
+            if m["name"] == UNSIGNED_TARGET_METRIC
+        ]
+        head = next(arm for arm in result["model_grades"] if ":vol_head:" in arm)
+        base = next(arm for arm in result["model_grades"] if ":base:" in arm)
+        return head, base, result, cycle, rows
+
+    def test_the_head_still_has_a_grade_row(self, store, tmp_path) -> None:
+        head, _, result, _, _ = self._graded(store, tmp_path)
+        graded = result["model_grades"][head]
+        assert graded["oos_n"] > 0, "an unsigned head is a research arm and is still scored"
+        assert graded[SIGNED_TARGET_PRECONDITION] is False
+
+    def test_the_head_is_barred_by_name_in_the_decision_and_on_the_manifest(
+        self, store, tmp_path
+    ) -> None:
+        head, base, result, cycle, rows = self._graded(store, tmp_path)
+
+        checks = cycle["decision"]["ineligible"][head]
+        signed = [c for c in checks if c["name"] == SIGNED_TARGET_PRECONDITION]
+        assert len(signed) == 1 and not signed[0]["passed"]
+        assert "abs_forward_return" in signed[0]["reason"]
+        assert cycle["decision"]["champion"] != head
+
+        assert list(result["unsigned_target"]) == [head]
+        assert result["model_grades"][base][SIGNED_TARGET_PRECONDITION] is True
+        for arm, others in cycle["decision"]["ineligible"].items():
+            if arm != head:
+                assert not [
+                    c for c in others if c["name"] == SIGNED_TARGET_PRECONDITION and not c["passed"]
+                ]
+        assert len(rows) == 1
+        assert rows[0]["value"] == 1.0
+        assert rows[0]["status"] == "OK", "a barred challenger is a pointer fact, not a fault"
+        assert head in rows[0]["status_reason"]
+
+    def test_a_signed_slot_files_the_zero(self, store, strategy) -> None:
+        runner = TestGradeRunsTheSharedEngine()
+        runner._produce_a_series(store, strategy)
+        _, result = runner._grade(store, strategy, GRADE_DAY)
+        rows = [
+            m
+            for m in _manifest(store, "experiment.grade", GRADE_DAY)["metrics"]
+            if m["name"] == UNSIGNED_TARGET_METRIC
+        ]
+        assert result["unsigned_target"] == {}
+        assert [r["value"] for r in rows] == [0.0]
 
 
 class TestAMiscalibratedStdIsIneligibleToServe:
