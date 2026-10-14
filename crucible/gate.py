@@ -111,6 +111,7 @@ from crucible.keys import (
     arena_cycle_key,
     arm_register_key,
     champion_key,
+    closing_record_key,
     gate_key,
     gate_prefix,
     holdout_unseal_prefix,
@@ -123,6 +124,7 @@ from crucible.keys import (
     parse_bus_key,
     parse_fault_injection_key,
     parse_manifest_key,
+    reopen_record_key,
     review_key,
     review_prefix,
     runs_prefix,
@@ -10827,6 +10829,22 @@ class PhaseRow:
     met_ratio: float | None
     read_on: str | None
     blocked_by: str | None
+    #: The closing record holding this phase MET, when it is latched
+    #: (:func:`read_phase_latch`); `None` when the phase is graded live.
+    latched_by: dict[str, Any] | None = None
+    #: The clauses of a LATCHED phase that are not met on today's reading —
+    #: a regression, rendered loudly and never allowed to un-latch the phase.
+    #: Always empty for a phase graded live (its unmet clauses are already
+    #: what its state says).
+    regressions: tuple[str, ...] = ()
+    #: The clauses of a latched phase that could not be read today.
+    regressions_unmeasurable: tuple[str, ...] = ()
+
+    @property
+    def exited(self) -> bool:
+        """Whether this phase counts as met for ORDERING: its gate reads MET
+        today, or a valid closing record latches it."""
+        return self.latched_by is not None or self.gate_state == "MET"
 
     def to_dict(self, generated_utc: str) -> dict[str, Any]:
         return {
@@ -10852,6 +10870,8 @@ class PhaseRow:
             "met_ratio": self.met_ratio,
             "read_on": self.read_on,
             "blocked_by": self.blocked_by,
+            "latched_by": self.latched_by,
+            "regressions": list(self.regressions),
             "generated_utc": generated_utc,
         }
 
@@ -10872,7 +10892,7 @@ class Ladder:
         been read is not behind us, and this is the field that says so.
         """
         for row in self.rows:
-            if row.gate_state != "MET":
+            if not row.exited:
                 return row.phase.id
         return "complete"
 
@@ -10891,7 +10911,7 @@ class Ladder:
             "generated_utc": self.generated_utc,
             "current_phase": self.current_phase,
             "phases_total": len(self.rows),
-            "phases_met": sum(1 for r in self.rows if r.gate_state == "MET"),
+            "phases_met": sum(1 for r in self.rows if r.exited),
             "unmeasured": self.unmeasured,
             "out_of_order": self.out_of_order,
             "phases": [r.to_dict(self.generated_utc) for r in self.rows],
@@ -10900,7 +10920,7 @@ class Ladder:
     def render(self) -> str:
         lines = [
             f"phase ladder @ {self.trading_day.isoformat()}: at {self.current_phase}, "
-            f"{sum(1 for r in self.rows if r.gate_state == 'MET')}/{len(self.rows)} met, "
+            f"{sum(1 for r in self.rows if r.exited)}/{len(self.rows)} met, "
             f"{self.unmeasured} unmeasured"
         ]
         for row in self.rows:
@@ -10910,6 +10930,165 @@ class Ladder:
                 f"(tracker {row.phase.tracker}, last read {read})"
             )
         return "\n".join(lines)
+
+
+#: The fields a reopen record must carry (`crucible.keys.reopen_record_key`).
+#: Every one a non-empty string: a reopen is a human's ruling, and a ruling
+#: with no reason or no name on it is not one anybody can be held to.
+REOPEN_RECORD_FIELDS: tuple[str, ...] = ("phase", "reason", "ruled_by", "filed_utc")
+
+_UTC_STAMP_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+
+
+def reopen_record_refusals(document: dict[str, Any] | None, *, phase_id: str) -> list[str]:
+    """Why ``document`` is NOT a usable reopen ruling for ``phase_id``. Empty means it is."""
+    if not isinstance(document, dict):
+        return ["the reopen record is not a JSON object"]
+    problems = [
+        f"field {name!r} is missing or empty"
+        for name in REOPEN_RECORD_FIELDS
+        if not isinstance(document.get(name), str) or not document.get(name, "").strip()
+    ]
+    named = document.get("phase")
+    if isinstance(named, str) and named and named != phase_id:
+        problems.append(f"it names phase {named!r}, not {phase_id!r}")
+    stamp = document.get("filed_utc")
+    if isinstance(stamp, str) and stamp and not _UTC_STAMP_RE.match(stamp):
+        problems.append(f"filed_utc {stamp!r} is not a YYYY-MM-DDTHH:MM:SSZ timestamp")
+    return problems
+
+
+@dataclass(frozen=True)
+class PhaseLatch:
+    """Whether a phase's exit is LATCHED by its closing record.
+
+    Brian's question of 2026-10-13: "Is there a way to keep a phase once
+    complete fully complete going forward rather than allowing it to decay?"
+    Phase 1 exited 6/6 on 2026-09-08 and then flipped MET/UNMET some eight
+    times, because its exit evidence aged out of a rolling window and one
+    failed weekly arc un-met it — and every later phase rendered OUT_OF_ORDER
+    each time. A phase exits ONCE (:func:`crucible.keys.closing_record_key`
+    is written once, compare-and-swap against an absent key), so the ladder
+    now reads that record rather than re-deciding the exit every render.
+
+    ``held`` is the verdict. ``note`` says why a phase that has a record (or a
+    reopen ruling) is NOT held, and is `None` when there is nothing to say.
+    """
+
+    held: bool
+    key: str
+    document: dict[str, Any] | None = None
+    note: str | None = None
+
+    @property
+    def latched_by(self) -> dict[str, Any] | None:
+        if not self.held or self.document is None:
+            return None
+        return {
+            "key": self.key,
+            "trading_day": self.document.get("trading_day"),
+            "commit": self.document.get("commit"),
+            "clauses_met": self.document.get("clauses_met"),
+            "clauses_total": self.document.get("clauses_total"),
+        }
+
+    @property
+    def line(self) -> str:
+        """`latched by gates/phase1/closing.json (6/6 on 2026-09-08 at abc1234)`."""
+        doc = self.document or {}
+        commit = str(doc.get("commit") or "")[:7]
+        return (
+            f"latched by {self.key} ({doc.get('clauses_met')}/{doc.get('clauses_total')} on "
+            f"{doc.get('trading_day')} at {commit})"
+        )
+
+
+def read_phase_latch(store: Store, phase: Phase) -> PhaseLatch:
+    """Read ``phase``'s closing record and any reopen ruling: is it latched?
+
+    Latched only when the closing record is present, readable, and passes
+    :func:`closing_reading_refusals` — the same predicate the tracker sweep and
+    `crucible.board._closing_rows` enforce, so the ladder cannot latch on a
+    record the board calls unjustified.
+
+    Un-latched only EXPLICITLY: a valid reopen record
+    (:func:`crucible.keys.reopen_record_key`) filed after the closing record.
+    A reopen record that is present but unreadable or malformed also falls
+    back to live grading, with its problem in the note — somebody tried to
+    reopen the phase, and claiming it exited over their attempt would be the
+    worse error. Every non-latched outcome is today's live grading.
+    """
+    key = closing_record_key(phase.id)
+    record = _read_store_document(store, key)
+    if record.absent:
+        return PhaseLatch(held=False, key=key)
+    if record.problem is not None or record.document is None:
+        return PhaseLatch(
+            held=False,
+            key=key,
+            note=f"not latched: the closing record could not be read: {record.problem}",
+        )
+    document = record.document
+    refusals = closing_reading_refusals(document, phase_id=phase.id)
+    if refusals:
+        return PhaseLatch(
+            held=False,
+            key=key,
+            document=document,
+            note=f"not latched: {key} does not justify an exit: {'; '.join(refusals)}",
+        )
+    reopen_key = reopen_record_key(phase.id)
+    reopen = _read_store_document(store, reopen_key)
+    if not reopen.absent:
+        if reopen.problem is not None or reopen.document is None:
+            return PhaseLatch(
+                held=False,
+                key=key,
+                document=document,
+                note=f"not latched: the reopen record at {reopen_key} could not be read: "
+                f"{reopen.problem}; graded live until it is fixed or removed",
+            )
+        problems = reopen_record_refusals(reopen.document, phase_id=phase.id)
+        if problems:
+            return PhaseLatch(
+                held=False,
+                key=key,
+                document=document,
+                note=f"not latched: the reopen record at {reopen_key} is malformed "
+                f"({'; '.join(problems)}); graded live until it is fixed or removed",
+            )
+        filed = reopen.document["filed_utc"]
+        closed = str(document.get("generated_utc") or "")
+        if filed > closed:
+            return PhaseLatch(
+                held=False,
+                key=key,
+                document=document,
+                note=(
+                    f"reopened by {reopen.document['ruled_by']} at {filed} ({reopen_key}): "
+                    f"{reopen.document['reason']}; graded live"
+                ),
+            )
+    return PhaseLatch(held=True, key=key, document=document)
+
+
+@dataclass(frozen=True)
+class _GradedPhase:
+    phase: Phase
+    #: The ladder state before ordering: `MET` for a latched phase, otherwise
+    #: the live gate state.
+    state: str
+    #: The live gate state, whatever the latch says.
+    gate_state: str
+    detail: str
+    met: int | None
+    total: int | None
+    unmeasurable: int | None
+    ratio: float | None
+    read_on: str | None
+    latched_by: dict[str, Any] | None = None
+    regressions: tuple[str, ...] = ()
+    regressions_unmeasurable: tuple[str, ...] = ()
 
 
 def build_ladder(
@@ -10931,19 +11110,25 @@ def build_ladder(
     here — `gate_handler` used to read the same gate twice in one job, doubling
     every store read the clause set makes (`alpha-engine-config-I9826`). Any
     gate not present in ``readings`` is still evaluated normally.
+
+    A phase LATCHED by its closing record (:func:`read_phase_latch`) reads
+    `MET` and counts as met for ordering, so later phases are not
+    OUT_OF_ORDER behind it. Its clauses are still read every render; any that
+    is not met today is a regression, named in the row's `detail` and
+    `regressions` and rendered as its own red board row — never silently, and
+    never by un-latching the phase.
     """
     moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
     reg = registry if registry is not None else load_registry()
     supplied = readings or {}
 
-    gate_states: list[
-        tuple[Phase, str, str, int | None, int | None, int | None, float | None, str | None]
-    ] = []
+    graded: list[_GradedPhase] = []
     for phase in PHASES:
         if phase.gate is None or phase.gate not in GATES:
-            gate_states.append(
-                (
+            graded.append(
+                _GradedPhase(
                     phase,
+                    "UNMEASURED",
                     "UNMEASURED",
                     f"no clause list is registered for {phase.id}; nothing has ever "
                     "measured whether it may exit",
@@ -10971,9 +11156,10 @@ def build_ladder(
             # than constructing a second `None` here, is what makes the
             # ladder row and the dated gate artifact agree by construction:
             # there is exactly one place this ratio is computed.
-            gate_states.append(
-                (
+            graded.append(
+                _GradedPhase(
                     phase,
+                    "UNMEASURED",
                     "UNMEASURED",
                     f"gate {phase.gate} has no clauses",
                     0,
@@ -10986,11 +11172,17 @@ def build_ladder(
             continue
         unmet = [c.name for c in reading.clauses if not c.met and not c.unmeasurable]
         unmeasurable_names = [c.name for c in reading.clauses if c.unmeasurable]
+        latch = read_phase_latch(store, phase)
         detail = f"{met}/{total} clauses met"
+        if latch.held:
+            detail = f"{latch.line}; today's reading: {detail}"
         if unmeasurable_names:
             detail = f"{detail}; unmeasurable: {', '.join(unmeasurable_names)}"
         if unmet:
-            detail = f"{detail}; holding: {', '.join(unmet)}"
+            # On a latched phase an unmet clause is not what holds the phase
+            # — nothing does, it exited — it is a REGRESSION from the exit.
+            label = "regressed" if latch.held else "holding"
+            detail = f"{detail}; {label}: {', '.join(unmet)}"
         # The coverage line travels with the row. Without it a phase whose
         # gate grades a SUBSET of its deliverables renders MET on the ladder
         # and on the board with nothing saying so — partial coverage reported
@@ -11003,6 +11195,8 @@ def build_ladder(
                 f"{detail}; could not determine when gate {phase.gate} was last read "
                 "(store access failure)"
             )
+        if latch.note:
+            detail = f"{detail}; {latch.note}"
         # `UNMEASURABLE` outranks `MET`/`UNMET`: a phase with one unreadable
         # clause, or whose own read-history listing failed, was rendering as
         # plain `UNMET` with a specific `met_ratio` — indistinguishable from
@@ -11014,58 +11208,59 @@ def build_ladder(
         # `gate_state` from the same function, so a ladder row and the block on
         # the tracker beside it cannot disagree about one reading
         # (`alpha-engine-config-I9967`).
-        state = "UNMEASURABLE" if read_on_access_problem else gate_state_for(reading)
-        gate_states.append(
-            (
+        gate_state = "UNMEASURABLE" if read_on_access_problem else gate_state_for(reading)
+        graded.append(
+            _GradedPhase(
                 phase,
-                state,
+                "MET" if latch.held else gate_state,
+                gate_state,
                 detail,
                 met,
                 total,
                 unmeasurable_count,
                 reading.met_ratio,
                 read_on,
+                latched_by=latch.latched_by,
+                regressions=tuple(unmet) if latch.held else (),
+                regressions_unmeasurable=tuple(unmeasurable_names) if latch.held else (),
             )
         )
 
     # Out-of-order: a phase later than the lowest not-met phase that has
-    # nevertheless been graded. Derived from readings alone, so nothing here
-    # depends on a hand-maintained claim about which phase is "open".
-    first_unmet = next((i for i, s in enumerate(gate_states) if s[1] != "MET"), len(gate_states))
+    # nevertheless been graded. Derived from readings alone — plus the
+    # closing records, which are themselves readings filed at the exit — so
+    # nothing here depends on a hand-maintained claim about which phase is
+    # "open".
+    first_unmet = next((i for i, g in enumerate(graded) if g.state != "MET"), len(graded))
     rows: list[PhaseRow] = []
-    for index, (
-        phase,
-        gate_state,
-        detail,
-        met,
-        total,
-        unmeasurable_count,
-        ratio,
-        read_on,
-    ) in enumerate(gate_states):
-        state = gate_state
+    for index, g in enumerate(graded):
+        state = g.state
+        detail = g.detail
         blocked_by = None
-        if index > first_unmet and read_on is not None:
-            blocker = gate_states[first_unmet][0]
+        if index > first_unmet and g.read_on is not None:
+            blocker = graded[first_unmet]
             state = "OUT_OF_ORDER"
-            blocked_by = blocker.id
+            blocked_by = blocker.phase.id
             detail = (
-                f"{detail}; graded while {blocker.id} ({blocker.tracker}) is "
-                f"{gate_states[first_unmet][1]} — a later phase may not be exited "
+                f"{detail}; graded while {blocker.phase.id} ({blocker.phase.tracker}) is "
+                f"{blocker.state} — a later phase may not be exited "
                 "ahead of an earlier one"
             )
         rows.append(
             PhaseRow(
-                phase=phase,
+                phase=g.phase,
                 state=state,
-                gate_state=gate_state,
+                gate_state=g.gate_state,
                 detail=detail,
-                clauses_met=met,
-                clauses_total=total,
-                clauses_unmeasurable=unmeasurable_count,
-                met_ratio=ratio,
-                read_on=read_on,
+                clauses_met=g.met,
+                clauses_total=g.total,
+                clauses_unmeasurable=g.unmeasurable,
+                met_ratio=g.ratio,
+                read_on=g.read_on,
                 blocked_by=blocked_by,
+                latched_by=g.latched_by,
+                regressions=g.regressions,
+                regressions_unmeasurable=g.regressions_unmeasurable,
             )
         )
 

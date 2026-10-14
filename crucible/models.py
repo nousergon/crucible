@@ -2888,6 +2888,19 @@ _TRACKER_ISSUE_PATTERN = r"^alpha-engine-config-I[0-9]+$"
 _PHASE_ID_PATTERN = r"^phase[0-5]$"
 
 
+class PhaseLatchRef(_Strict):
+    """The closing record that latches a phase MET (`crucible.gate.read_phase_latch`)."""
+
+    key: str = Field(
+        pattern=r"^gates/phase[0-5]/closing\.json$",
+        description="crucible.keys.closing_record_key for the phase.",
+    )
+    trading_day: str = Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+    commit: str = Field(pattern=r"^[0-9a-f]{12,40}$")
+    clauses_met: Annotated[int, Field(ge=1)]
+    clauses_total: Annotated[int, Field(ge=1)]
+
+
 class PhaseLadderRow(_Strict):
     """One phase row of `gates/ladder.json`'s `phases` array, plan §6."""
 
@@ -2936,6 +2949,18 @@ class PhaseLadderRow(_Strict):
     blocked_by: str | None = Field(
         description="The earlier unmet phase id blocking this one, when state is "
         "OUT_OF_ORDER; null otherwise.",
+    )
+    latched_by: PhaseLatchRef | None = Field(
+        default=None,
+        description="The valid closing record holding this phase MET, or null when the "
+        "phase is graded live (no record, a refused record, or an explicit reopen "
+        "record newer than it). A latched phase counts as met for ordering.",
+    )
+    regressions: list[str] = Field(
+        default_factory=list,
+        description="Clauses of a LATCHED phase that are not met on today's reading. "
+        "A regression is rendered red on the board and never un-latches the phase; "
+        "always empty for a phase graded live.",
     )
     generated_utc: str = Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 

@@ -102,6 +102,18 @@
           "title": "Generated Utc",
           "type": "string"
         },
+        "latched_by": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PhaseLatchRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The valid closing record holding this phase MET, or null when the phase is graded live (no record, a refused record, or an explicit reopen record newer than it). A latched phase counts as met for ordering."
+        },
         "met_ratio": {
           "anyOf": [
             {
@@ -139,6 +151,14 @@
           ],
           "description": "The last trading day this gate was read, or null when never.",
           "title": "Read On"
+        },
+        "regressions": {
+          "description": "Clauses of a LATCHED phase that are not met on today's reading. A regression is rendered red on the board and never un-latches the phase; always empty for a phase graded live.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Regressions",
+          "type": "array"
         },
         "state": {
           "description": "crucible.gate.LADDER_STATES: MET | UNMET | UNMEASURED | UNMEASURABLE | OUT_OF_ORDER. Closed set.",
@@ -188,6 +208,47 @@
         "generated_utc"
       ],
       "title": "PhaseLadderRow",
+      "type": "object"
+    },
+    "PhaseLatchRef": {
+      "additionalProperties": false,
+      "description": "The closing record that latches a phase MET (`crucible.gate.read_phase_latch`).",
+      "properties": {
+        "clauses_met": {
+          "minimum": 1,
+          "title": "Clauses Met",
+          "type": "integer"
+        },
+        "clauses_total": {
+          "minimum": 1,
+          "title": "Clauses Total",
+          "type": "integer"
+        },
+        "commit": {
+          "pattern": "^[0-9a-f]{12,40}$",
+          "title": "Commit",
+          "type": "string"
+        },
+        "key": {
+          "description": "crucible.keys.closing_record_key for the phase.",
+          "pattern": "^gates/phase[0-5]/closing\\.json$",
+          "title": "Key",
+          "type": "string"
+        },
+        "trading_day": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+          "title": "Trading Day",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "trading_day",
+        "commit",
+        "clauses_met",
+        "clauses_total"
+      ],
+      "title": "PhaseLatchRef",
       "type": "object"
     }
   },

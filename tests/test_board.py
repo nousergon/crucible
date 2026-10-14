@@ -1767,19 +1767,34 @@ class TestScheduleRows:
     """
 
     @staticmethod
-    def _row(phase_id: str, gate_state: str, *, met: int | None = None, total: int | None = None):
+    def _row(
+        phase_id: str,
+        gate_state: str,
+        *,
+        met: int | None = None,
+        total: int | None = None,
+        latched_by: dict | None = None,
+    ):
+        # A real `PhaseRow`, not a duck-typed stub: `_schedule_rows` reads
+        # `PhaseRow.exited` since the closing-record latch, and a stub that
+        # only carried the fields read at the time it was written would stop
+        # tracking the contract the moment the reader grew.
+        from crucible.gate import PhaseRow
+
         (phase,) = [p for p in PHASES if p.id == phase_id]
-
-        class _Row:
-            pass
-
-        row = _Row()
-        row.phase = phase
-        row.gate_state = gate_state
-        row.clauses_met = met
-        row.clauses_total = total
-        row.read_on = None
-        return row
+        return PhaseRow(
+            phase=phase,
+            state=gate_state,
+            gate_state=gate_state,
+            detail="stub",
+            clauses_met=met,
+            clauses_total=total,
+            clauses_unmeasurable=0 if total is not None else None,
+            met_ratio=None,
+            read_on=None,
+            blocked_by=None,
+            latched_by=latched_by,
+        )
 
     @staticmethod
     def _ladder(*rows):
@@ -1870,6 +1885,21 @@ class TestScheduleRows:
     def test_a_met_phase_renders_met_regardless_of_date(self) -> None:
         ladder = self._ladder(self._row("phase1", "MET", met=6, total=6))
         row = self._schedule_row(ladder, "2026-09-01", "day5_replays")
+        assert row.state == "MET"
+
+    def test_a_latched_phase_renders_met_even_when_its_live_gate_regressed(self) -> None:
+        """The closing-record latch: phase 1 exited, so its milestone was met,
+        whatever today's rolling-window reading says. The regression is the
+        `phase:phase1:regression` row's job, not a re-opened milestone."""
+        latch = {
+            "key": "gates/phase1/closing.json",
+            "trading_day": "2026-09-08",
+            "commit": "c06e4efb90c31b6b84e5e4d4925688ee2ea99054",
+            "clauses_met": 6,
+            "clauses_total": 6,
+        }
+        ladder = self._ladder(self._row("phase1", "UNMET", met=3, total=6, latched_by=latch))
+        row = self._schedule_row(ladder, "2026-10-13", "day5_replays")
         assert row.state == "MET"
 
     def test_no_ladder_supplied_renders_unmeasured(self) -> None:
