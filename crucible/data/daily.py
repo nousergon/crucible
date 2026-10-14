@@ -5,7 +5,9 @@ Normative source: plan §4.3, §9.7, §4.12.
 One job, three writes and one refusal:
 
 * ``data/{trading_day}/panel.parquet`` — the day's compiled price panel,
-  covering the trailing window the feature layer needs, not just the day;
+  covering the trailing window the feature layer needs, not just the day —
+  and every DEPARTED name's history over that window, up to its own last
+  session (`alpha-engine-config-I12287`, below);
 * ``data/{trading_day}/coverage.json`` — what was read, from which source,
   under which snapshot, with the per-gate coverage figures;
 * ``features/{version}/{trading_day}.parquet`` plus its registry — the
@@ -46,6 +48,7 @@ from typing import TYPE_CHECKING, Any
 from crucible.calendar import assert_trading_day
 from crucible.data.point_in_time import GROUP_COVERAGE_FLOOR_RATIO, PointInTimeSource
 from crucible.data.sources import MissingSourceError, PriceSource
+from crucible.documents import load_store_document
 from crucible.features import (
     build_features,
     catalog_column_depths,
@@ -55,6 +58,7 @@ from crucible.features import (
 from crucible.keys import (
     coverage_key,
     data_panel_key,
+    declared_universe_prefix,
     feature_registry_key,
     features_key,
 )
@@ -389,6 +393,19 @@ def run_daily(
         panel = pd.concat([panel, extra_panel], ignore_index=True)
         panel = panel.sort_values(["trading_day", "ticker"]).reset_index(drop=True)
 
+    # The feature layer is built over the declared universe and its declared
+    # extras ONLY, never over the departed names added below: the
+    # cross-section is what M scores and U selects from, and a name that left
+    # the universe is not a candidate. Its history changes no feature byte.
+    feature_panel = panel
+    panel, departed = _with_departed_history(
+        ctx,
+        panel,
+        source=source,
+        lookback_days=lookback_days,
+        already=set(expected) | set(extra_panel_symbols),
+    )
+
     panel_key = data_panel_key(trading_day.isoformat())
     write_panel(ctx, panel, panel_key)
 
@@ -420,7 +437,7 @@ def run_daily(
             }
         )
 
-    features, catalog = build_features(panel, point_in_time=point_in_time_inputs)
+    features, catalog = build_features(feature_panel, point_in_time=point_in_time_inputs)
     registry = registry_payload(catalog)
     feature_version = registry["feature_version"]
 
@@ -447,6 +464,8 @@ def run_daily(
         "coverage_ratio": coverage_ratio,
         "coverage_floor": coverage_floor,
         "panel_key": panel_key,
+        "departed_tickers": departed["tickers"],
+        "departed_without_history": departed["without_history"],
         "features_key": feature_key,
         "feature_version": feature_version,
         "point_in_time": point_in_time_inputs.to_dict(),
@@ -457,6 +476,118 @@ def run_daily(
         schema_version="coverage.v1",
     )
     return coverage
+
+
+def _declared_in_window(store: Any, *, window_start: dt.date, end: dt.date) -> set[str]:
+    """Every symbol a declared universe RECORDED for a session inside
+    ``(window_start, end)`` named — ``end`` itself excluded, since that day's
+    declaration is the run's own ``expected_symbols``.
+
+    Read from the store copies `crucible.data.universe.DeclaredUniverse.record`
+    writes beside every data run, never from a live document: the membership
+    the panel recovers must be what was declared ON those sessions, and a
+    record for a later session is never read, so a recompile cannot depend on
+    when it ran.
+    """
+    prefix = declared_universe_prefix()
+    members: set[str] = set()
+    for key in sorted(store.list_keys(prefix)):
+        day_text = key[len(prefix) :].split("/", 1)[0]
+        try:
+            day = dt.date.fromisoformat(day_text)
+        except ValueError as exc:
+            raise ValueError(
+                f"declared-universe key {key!r} does not carry an ISO trading day under "
+                f"{prefix!r}; every key there is written by `declared_universe_key`"
+            ) from exc
+        if not window_start < day < end:
+            continue
+        document = load_store_document(store, key)
+        members.update(str(symbol) for symbol in document["symbols"])
+    return members
+
+
+def _with_departed_history(
+    ctx: RunContext,
+    panel: pd.DataFrame,
+    *,
+    source: PriceSource,
+    lookback_days: int,
+    already: set[str],
+) -> tuple[pd.DataFrame, dict[str, list[str]]]:
+    """``panel`` plus the window's history for every name that LEFT the universe.
+
+    `alpha-engine-config-I12287`: the 2026-10-09 panel carried no row at all
+    for OLN, PSKY and WBD — not just none after they stopped trading — so
+    every grade over a window they were part of read a survivors-only
+    universe. Two things dropped them, and both are closed here:
+
+    * this job asked the source for today's declared universe and nothing
+      else, so a name absent from it was never requested. The departed set
+      is now every name an earlier session's RECORDED declaration named
+      (:func:`_declared_in_window`), plus
+    * every name the source RETAINS after pruning it from the live listing
+      whose history reaches the window (`PriceSource.retained_symbols`) — the
+      data layer moves a delisted name's whole history into a retention
+      library, so a live-library read finds nothing for it at all.
+
+    Departed names never enter the coverage denominator (they are not
+    expected to close today) or the feature cross-section (see the caller).
+    A departed name the source holds no history for anywhere is NAMED in the
+    coverage record and in a metric, never invented — the S grade reads that
+    list to tell a name with genuinely no data from a panel that dropped one.
+    """
+    trading_day = ctx.trading_day
+    window_start = trading_day - dt.timedelta(days=lookback_days)
+    candidates = _declared_in_window(ctx.store, window_start=window_start, end=trading_day)
+    candidates |= set(source.retained_symbols(end=trading_day, lookback_days=lookback_days))
+    departed = source.load_departed(
+        end=trading_day,
+        lookback_days=lookback_days,
+        symbols=sorted(candidates - already),
+    )
+    tickers = sorted(str(t) for t in departed.panel["ticker"].unique())
+    without = sorted(departed.without_history)
+    for name, names, reason in (
+        (
+            "departed_symbols_in_panel",
+            tickers,
+            "name(s) that left the declared universe carry history in the panel ending",
+        ),
+        (
+            "departed_symbols_without_history",
+            without,
+            "name(s) that left the declared universe have NO stored history in any "
+            "library for the window ending",
+        ),
+    ):
+        # Recorded unconditionally (0 is a value, never a missing metric), the
+        # same discipline `symbols_unlisted_in_window` follows. OK, not FAIL:
+        # a departed name is outside the coverage denominator, and the S
+        # grade refuses any HELD name without a return series on its own.
+        ctx.record_metric(
+            {
+                "name": name,
+                "module": "crucible.data.daily",
+                "metric_type": "coverage",
+                "value": float(len(names)),
+                "unit": "symbols",
+                "n_floor": 0,
+                "status": "OK",
+                "status_reason": (
+                    f"{len(names)} {reason} {trading_day}"
+                    + (f": {names[:20]}{'…' if len(names) > 20 else ''}" if names else "")
+                ),
+                "source_path": coverage_key(trading_day.isoformat()),
+                "last_updated_utc": _utc_now(),
+            }
+        )
+    if tickers:
+        import pandas as pd  # noqa: PLC0415 - only needed on the departed merge path
+
+        panel = pd.concat([panel, departed.panel], ignore_index=True)
+        panel = panel.sort_values(["trading_day", "ticker"]).reset_index(drop=True)
+    return panel, {"tickers": tickers, "without_history": without}
 
 
 def _utc_now() -> str:

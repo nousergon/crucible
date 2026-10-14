@@ -36,6 +36,7 @@ from crucible.keys import (
     arm_predictions_key,
     arm_register_key,
     champion_key,
+    coverage_key,
     data_panel_key,
     features_key,
     manifest_key,
@@ -1474,16 +1475,34 @@ class TestANameThePanelDroppedIsAttributedOnlyIfHeld:
     09-18 and 10-02 sessions had recorded all three as PRICED names. The S
     universe is the union of every recorded session's priced names, so all
     three entered the attribution loop; every one of them was ineligible and
-    carried weight 0.0 on every session. A name the book never held is not a
-    position, and there is nothing to attribute. A name it DID hold still has
-    no return series, and that still fails the slot.
+    carried weight 0.0 on every session.
+
+    `alpha-engine-config-I12287` narrowed the skip once the panel stopped
+    dropping departed names' history: a panel-absent name is now skipped only
+    when it was never held AND the day's compile names it as a departed name
+    with no stored history anywhere. Any other absence is a panel that should
+    carry the name and does not, and fails the slot.
     """
 
     @staticmethod
-    def _drop_from_panel(store, tickers) -> None:
+    def _drop_from_panel(store, tickers, *, without_history: list[str] | None = None) -> None:
+        """Drop ``tickers`` from the panel; with ``without_history``, also
+        write the day's coverage record naming those as departed names with
+        no stored history — the statement `data.daily` makes."""
         key = data_panel_key(AS_OF.isoformat())
         panel = pd.read_parquet(__import__("io").BytesIO(store.get_bytes(key)))
         store.put_bytes(key, panel[~panel["ticker"].isin(tickers)].to_parquet(index=False))
+        if without_history is not None:
+            store.put_bytes(
+                coverage_key(AS_OF.isoformat()),
+                json.dumps(
+                    {
+                        "schema_version": "coverage.v1",
+                        "trading_day": AS_OF.isoformat(),
+                        "departed_without_history": sorted(without_history),
+                    }
+                ).encode("utf-8"),
+            )
 
     @staticmethod
     def _held_names(monkeypatch, store, settings) -> set[str]:
@@ -1504,12 +1523,10 @@ class TestANameThePanelDroppedIsAttributedOnlyIfHeld:
         assert manifest["status"] == "ok", manifest.get("reason")
         return held - {"SPY", strategy_module.CASH_TICKER}
 
-    def test_a_never_held_name_missing_from_the_panel_does_not_fail_the_grade(
-        self, world, monkeypatch
-    ) -> None:
+    @staticmethod
+    def _never_held(monkeypatch, store, settings, days) -> list[str]:
         """OLN's shape exactly: priced by M, outside U's cut, so ineligible on
         every session and pinned to weight zero by the solver."""
-        store, settings, _root, days = world
         _run_produce(store, settings, days)
         priced = set(
             load_store_document(store, arm_predictions_key(M_CHAMPION, days[0].isoformat()))[
@@ -1521,12 +1538,37 @@ class TestANameThePanelDroppedIsAttributedOnlyIfHeld:
         )
         ineligible = sorted(priced - cut)
         assert ineligible, "the fixture must price a name outside the U cut"
-        assert not set(ineligible) & self._held_names(monkeypatch, store, settings)
-        self._drop_from_panel(store, ineligible)
+        assert not set(ineligible) & TestANameThePanelDroppedIsAttributedOnlyIfHeld._held_names(
+            monkeypatch, store, settings
+        )
+        return ineligible
+
+    def test_a_never_held_name_with_no_stored_history_does_not_fail_the_grade(
+        self, world, monkeypatch
+    ) -> None:
+        store, settings, _root, days = world
+        ineligible = self._never_held(monkeypatch, store, settings, days)
+        self._drop_from_panel(store, ineligible, without_history=ineligible)
 
         _result, manifest, _ctx = _run_grade(store, settings)
 
         assert manifest["status"] == "ok", manifest.get("reason")
+
+    @pytest.mark.parametrize("statement", ["no coverage record", "not named in it"])
+    def test_a_never_held_name_the_compile_did_not_declare_missing_fails_the_grade(
+        self, world, monkeypatch, statement
+    ) -> None:
+        """The panel dropped a name the data layer holds history for — the
+        I12287 defect itself. That is no longer absorbed by the skip: it is a
+        panel to recompile, and the refusal names the heal."""
+        store, settings, _root, days = world
+        ineligible = self._never_held(monkeypatch, store, settings, days)
+        self._drop_from_panel(
+            store, ineligible, without_history=None if statement == "no coverage record" else []
+        )
+
+        with pytest.raises(MissingArtifactError, match="crucible data.heal"):
+            _run_grade(store, settings)
 
     def test_a_held_name_missing_from_the_panel_still_fails_the_grade(
         self, world, monkeypatch
@@ -1535,7 +1577,9 @@ class TestANameThePanelDroppedIsAttributedOnlyIfHeld:
         _run_produce(store, settings, days)
         held = sorted(self._held_names(monkeypatch, store, settings))
         assert held, "the fixture's book must hold at least one name"
-        self._drop_from_panel(store, held)
+        # Even a compile that declared it history-less does not excuse a
+        # position: a held name with no return series cannot be attributed.
+        self._drop_from_panel(store, held, without_history=held)
 
         with pytest.raises(MissingArtifactError, match="has no row in the price panel"):
             _run_grade(store, settings)

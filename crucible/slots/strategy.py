@@ -60,7 +60,7 @@ from crucible.attribution import (
     load_attribution_params_from_store,
 )
 from crucible.features import DEFAULT_FEATURE_VERSION, feature_names, read_features
-from crucible.keys import arm_predictions_key, features_key
+from crucible.keys import arm_predictions_key, coverage_key, features_key
 from crucible.portfolio import (
     PORTFOLIO_PARAM_FIELDS,
     CostModel,
@@ -1084,8 +1084,13 @@ def _attribute_book(
     returns: Any,
     params: AttributionFactorParams,
     as_of: str,
+    without_history: frozenset[str] | None,
 ) -> dict[str, Any]:
     """The `factor_attribution.v1` evidence for ``constructed``'s book.
+
+    ``without_history`` is the panel compile's own statement of which departed
+    names it holds no stored history for (:func:`_departed_without_history`),
+    or ``None`` when the day's compile recorded no such statement.
 
     Two windows, deliberately distinct (`alpha-engine-config-I11964`):
 
@@ -1153,20 +1158,37 @@ def _attribute_book(
             holding_returns[ticker] = [0.0] * len(fit_days)
             continue
         if ticker not in returns.columns:
-            if ticker not in ever_held:
-                # `alpha-engine-config-I12020`: a name the universe carries
-                # because a recorded session PRICED it, at weight zero on every
-                # session, is not a position — there is nothing to attribute,
-                # and leaving it out of the fit changes no number (each name's
-                # loadings are its own regression, and `portfolio_risk` weights
-                # it zero). The 2026-10-09 panel dropped OLN, PSKY and WBD's
-                # entire history once they left the price universe; all three
-                # were ineligible, never held, and failed the whole S grade.
+            if ticker in ever_held:
+                raise MissingArtifactError(
+                    f"attribution over the book graded {as_of}: holding {ticker!r} has no "
+                    "row in the price panel this book was constructed over. A book position "
+                    "with no return series cannot be attributed and none is invented for it."
+                )
+            if without_history is not None and ticker in without_history:
+                # `alpha-engine-config-I12020`, narrowed by `-I12287`: a name
+                # the universe carries because a recorded session PRICED it,
+                # at weight zero on every session, and which the day's compile
+                # states it holds NO stored history for in any library. There
+                # is nothing to attribute, and leaving it out of the fit
+                # changes no number (each name's loadings are its own
+                # regression, and `portfolio_risk` weights it zero).
                 continue
+            # Any other absence is the I12287 defect itself: the compile keeps
+            # a departed name's history, so a priced name it does not carry
+            # and did not declare history-less is a panel to recompile — not
+            # a name to skip.
             raise MissingArtifactError(
-                f"attribution over the book graded {as_of}: holding {ticker!r} has no row "
-                "in the price panel this book was constructed over. A book position with "
-                "no return series cannot be attributed and none is invented for it."
+                f"attribution over the book graded {as_of}: {ticker!r} was priced on a "
+                "recorded session but has no row in the price panel, and the day's "
+                f"coverage record ({coverage_key(as_of)}) "
+                + (
+                    "states no `departed_without_history` at all — it was compiled before "
+                    "the panel kept departed names' history"
+                    if without_history is None
+                    else "does not name it as a departed name with no stored history"
+                )
+                + ". The panel dropped history it should carry; recompile it:\n"
+                f"    crucible data.heal --from {as_of} --to {as_of} --gap departed-history"
             )
         # `nan_to_num`, exactly as `_build_sessions` builds the covariance
         # panel the optimiser solved against: the loadings are fit over the
@@ -2699,6 +2721,26 @@ def serve_daily(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
     }
 
 
+def _departed_without_history(store: Any, as_of: str) -> frozenset[str] | None:
+    """The departed names the ``as_of`` panel compile holds NO stored history
+    for, from its own coverage record — or ``None`` when that record is absent
+    or predates the statement (`alpha-engine-config-I12287`).
+
+    ``None`` is not an empty set: a compile that never made the statement has
+    not said a name is history-less, and `_attribute_book` refuses rather
+    than skip on silence.
+    """
+    from crucible.documents import load_store_document  # noqa: PLC0415 - avoids a cycle
+
+    key = coverage_key(as_of)
+    if not store.exists(key):
+        return None
+    names = load_store_document(store, key).get("departed_without_history")
+    if names is None:
+        return None
+    return frozenset(str(name) for name in names)
+
+
 def _close_returns(panel: Any) -> Any:
     """Simple session-over-session returns, `trading_day x ticker`.
 
@@ -3024,6 +3066,7 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
     feature_version = kwargs.get("feature_version") or DEFAULT_FEATURE_VERSION
     panel = _read_panel(ctx.store, ctx.trading_day)
     returns = _close_returns(panel)
+    without_history = _departed_without_history(ctx.store, as_of)
     sessions_index = [str(d) for d in returns.index]
     # Decision date -> the session it is held through. The last session in the
     # panel has no successor and is therefore UNSETTLED, which is a state, not
@@ -3112,6 +3155,7 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
                     returns=returns,
                     params=attribution_params,
                     as_of=as_of,
+                    without_history=without_history,
                 ),
                 now_utc=_utc_now(),
             )
