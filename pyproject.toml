@@ -93,7 +93,7 @@ dependencies = [
     # fresh resolve.
     "numpy>=2.5.4",
     "pandas>=2.0",
-    "pyarrow>=25.0.1",
+    "pyarrow>=26.0.0",
     # The convex layer for `crucible.portfolio`'s mean-variance program
     # (`alpha-engine-config-I10500`). The engine composes the objective and the
     # constraint geometry; cvxpy owns the DCP analysis and dispatch to a conic
