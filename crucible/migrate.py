@@ -37,7 +37,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from crucible.calendar import resolve_trading_day
+from crucible.calendar import is_trading_day, resolve_trading_day
 from crucible.carryover import V1_ZOO_CHAMPION_NAME, V1_ZOO_LEADERBOARD_KEY, read_production
 from crucible.champion import PROMOTION_SOURCES, ChampionPointer
 from crucible.documents import load_document_bytes, load_store_document, read_manifests_under
@@ -917,7 +917,23 @@ def _date_of(pointer: dict[str, Any], *, source: V1Source, recipe: Any) -> tuple
             "so there is no date to start its OOS clock from. Defaulting to today would "
             "reset a clock that has been running since the arm was installed."
         )
-    return str(raw)[:10], f"{source.key}:{source.date_field}"
+    stamped = dt.date.fromisoformat(str(raw)[:10])
+    # v1 promoted on its Saturday weekly, so `promoted_at` can be a calendar
+    # day with no session (2026-10-10). Every v2 key binds to a session
+    # (plan §4.12), and a decision filed on a non-trading day is about the
+    # last session before it, the same rule `resolve_trading_day` applies to
+    # a run launched then. Walking back keeps the OOS clock no later than v1's
+    # own date, never resetting it (alpha-engine-config-I12020).
+    session = stamped
+    while not is_trading_day(session):
+        session -= dt.timedelta(days=1)
+    provenance = f"{source.key}:{source.date_field}"
+    if session != stamped:
+        provenance = (
+            f"{provenance} ({stamped.isoformat()} has no NYSE session; bound to the "
+            f"last session before it, {session.isoformat()})"
+        )
+    return session.isoformat(), provenance
 
 
 def _map_promotion_source(v1_promotion_source: str) -> str:
