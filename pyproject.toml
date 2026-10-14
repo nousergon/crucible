@@ -76,7 +76,7 @@ dependencies = [
     # plan §4.2): those are consumed by other repos and must not require a
     # Python import to read. Pydantic is the in-process reader, not a
     # replacement for them.
-    "pydantic>=2.14.0",
+    "pydantic>=2.14.1",
     "PyYAML>=6.0.3",
     # The M slot's linear estimators and the CPCV grader operate on a
     # (trading_day x name) panel. Pure-Python normal equations over ~450k
@@ -91,7 +91,7 @@ dependencies = [
     # install surface. The floor is track B's (>=2.1), not the looser one —
     # two floors for one package is a lockfile waiting to disagree with a
     # fresh resolve.
-    "numpy>=2.5.3",
+    "numpy>=2.5.4",
     "pandas>=2.0",
     "pyarrow>=25.0.1",
     # The convex layer for `crucible.portfolio`'s mean-variance program
@@ -118,7 +118,7 @@ dependencies = [
     # flips on. Floored, not pinned: boto3 ships daily and the API surface
     # used here (put_object/head_object/get_paginator, IfMatch/IfNoneMatch)
     # is stable, so a pin would be a weekly Dependabot PR buying nothing.
-    "boto3>=1.43.110",
+    "boto3>=1.43.111",
     "lightgbm>=4.7.0",
 ]
 
@@ -142,7 +142,7 @@ Homepage = "https://github.com/nousergon/crucible"
 dev = [
     "pytest>=8.3",
     "pytest-cov>=6.0",
-    "ruff>=0.16.10",
+    "ruff>=0.17.0",
 ]
 
 [build-system]
