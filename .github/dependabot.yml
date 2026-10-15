@@ -50,10 +50,23 @@ updates:
     # here are deliberate and land with the feature that needs the new release
     # and the regenerated `uv.lock` (see #336, #365, #378), never as a bot
     # PR. Remove this entry if the two pins are ever collapsed into one.
+    #
+    # pyarrow 26 is held by ruling, not by resolution. pyarrow 26.0.0
+    # (published 2026-10-09) refuses to import under NumPy 1.x, and the
+    # collection boxes still pin `numpy<2`; it broke D17 morning_enrich that
+    # morning and `nousergon-data` capped it below 26 (data#2128). This repo
+    # resolves numpy>=2 and would install 26 cleanly, but crucible is the
+    # harness the trader reads, so the bump waits until the fleet can run 26
+    # everywhere (Brian's ruling #25, 2026-10-14; crucible#402 and #409
+    # closed under it). pyarrow 25.x minor/patch releases still arrive. Remove
+    # this entry in the same change that lifts data#2128's cap; the
+    # collection-box root cause is alpha-engine-config-I12318.
     ignore:
       - dependency-name: pandas
         versions: [">=3"]
       - dependency-name: nousergon-lib
+      - dependency-name: pyarrow
+        versions: [">=26"]
     groups:
       minor-and-patch:
         update-types:
