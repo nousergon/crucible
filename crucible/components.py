@@ -15,8 +15,12 @@ The YAML carries an anchor and an offset; :meth:`Deadline.describe` produces
 projection of the data rather than a second copy of it, and the two cannot
 disagree.
 
-**Two anchors, exhaustively.** Adding a third is a design change visible in a
-diff, for the same reason the two page conditions are a closed set.
+**Three anchors, exhaustively.** Adding one is a design change visible in a
+diff, for the same reason the two page conditions are a closed set. The third,
+`next_open_plus`, was that change (alpha-engine-config-I12353): `trader.session`
+binds its manifest to trading day d but RUNS on the next session's morning, so
+neither "after d's close" nor "the calendar day after d" can say when it is
+late on a Friday or before a holiday.
 """
 
 from __future__ import annotations
@@ -30,7 +34,7 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
-from crucible.calendar import assert_trading_day, is_week_final_trading_day
+from crucible.calendar import assert_trading_day, is_week_final_trading_day, next_trading_day
 from crucible.models import ComponentsDocument
 
 __all__ = [
@@ -58,11 +62,27 @@ NYSE_TZ = ZoneInfo("America/New_York")
 #: their head at 3am.
 REGULAR_CLOSE = dt.time(16, 0)
 
+#: The regular NYSE open, the base of a `next_open_plus` deadline. Every
+#: session opens at 09:30 ET, half days included, so this one has no
+#: half-day caveat.
+REGULAR_OPEN = dt.time(9, 30)
+
 #: Exhaustive. `close_plus` is "T hours after the close of trading day d";
 #: `next_calendar_day_at` is "HH:MM ET on the calendar day after trading day
-#: d" — which for a Friday d is the Saturday the weekly work runs on.
-Anchor = Literal["close_plus", "next_calendar_day_at"]
-ANCHORS: tuple[str, ...] = ("close_plus", "next_calendar_day_at")
+#: d" — which for a Friday d is the Saturday the weekly work runs on;
+#: `next_open_plus` is "T hours after the open of the first SESSION after
+#: trading day d" — which for a Friday d is Monday's open, or Tuesday's when
+#: Monday is a holiday. It is read from the trading calendar
+#: (:func:`crucible.calendar.next_trading_day`), never from a weekday number,
+#: and it exists for the one shape the other two cannot state: a job that
+#: binds to d and runs the next session's morning (`trader.session`,
+#: alpha-engine-config-I12353). Under `close_plus` its Friday deadline would
+#: fall on a weekend it was never going to run in.
+Anchor = Literal["close_plus", "next_calendar_day_at", "next_open_plus"]
+ANCHORS: tuple[str, ...] = ("close_plus", "next_calendar_day_at", "next_open_plus")
+
+#: The anchors whose `offset_hours` is the required field.
+OFFSET_ANCHORS: tuple[str, ...] = ("close_plus", "next_open_plus")
 
 #: §8.3 of observability-policy: DISABLED and RETIRED are DECLARED, never
 #: inferred. A job inferred to be retired because it stopped producing is
@@ -87,7 +107,15 @@ LIFECYCLES: tuple[str, ...] = ("ACTIVE", "DISABLED", "RETIRED")
 #: `nous-ergon-ops/tests/crossrepo/test_crucible_dispatch_lockstep.py`. A
 #: value verified in only one direction would be a suppression wearing a
 #: field name.
-DISPATCHES: tuple[str, ...] = ("arc", "scheduler", "github-actions")
+#:
+#: `box-timer` was added 2026-10-17 (alpha-engine-config-I12353): the
+#: trader's jobs are started by systemd timers on the executor box
+#: (`nousergon/crucible-executor` `infrastructure/systemd/`), which is none of
+#: the other three. While `trader.session` had no value to declare it sat at
+#: `dispatch: null`, so no deadline was allowed and a unit that died before
+#: writing its manifest paged nobody. A `box-timer` row names its timer in
+#: `dispatch_unit`, so the cross-repo pairing has a declared name to check.
+DISPATCHES: tuple[str, ...] = ("arc", "scheduler", "github-actions", "box-timer")
 
 #: WHICH trading days a deadline is due on. Exhaustive, and a machine field
 #: rather than a reading of the prose `schedule` string. `daily` is every
@@ -134,8 +162,8 @@ class Deadline:
                 f"{self.anchor!r} is not a deadline anchor. There are exactly "
                 f"{ANCHORS}; a third is a design change, not a config value."
             )
-        if self.anchor == "close_plus" and self.offset_hours is None:
-            raise ValueError("a close_plus deadline needs offset_hours")
+        if self.anchor in OFFSET_ANCHORS and self.offset_hours is None:
+            raise ValueError(f"a {self.anchor} deadline needs offset_hours")
         if self.anchor == "next_calendar_day_at" and self.at is None:
             raise ValueError("a next_calendar_day_at deadline needs `at`")
 
@@ -170,6 +198,13 @@ class Deadline:
         if self.anchor == "close_plus":
             base = dt.datetime.combine(trading_day, REGULAR_CLOSE, tzinfo=NYSE_TZ)
             return (base + dt.timedelta(hours=float(self.offset_hours))).astimezone(dt.UTC)
+        if self.anchor == "next_open_plus":
+            # The next SESSION, from the calendar: a Friday d resolves to
+            # Monday's open, and a Monday holiday moves it to Tuesday's, so a
+            # weekend or a holiday raises no page without anyone muting it.
+            session = next_trading_day(trading_day)
+            base = dt.datetime.combine(session, REGULAR_OPEN, tzinfo=NYSE_TZ)
+            return (base + dt.timedelta(hours=float(self.offset_hours))).astimezone(dt.UTC)
         # next_calendar_day_at. Calendar, deliberately: this is a wall-clock
         # scheduling quantity, which is one of §4.12's exhaustive exceptions.
         assert self.at is not None  # narrowed by __post_init__
@@ -192,6 +227,11 @@ class Deadline:
             hours = self.offset_hours
             rendered = f"{hours:g}h"
             return f"{rendered} after the close of trading day {day} ({every})"
+        if self.anchor == "next_open_plus":
+            rendered = f"{self.offset_hours:g}h"
+            return (
+                f"{rendered} after the open of the first session after trading day {day} ({every})"
+            )
         assert self.at is not None
         return f"{self.at.strftime('%H:%M')} ET the calendar day after trading day {day} ({every})"
 
@@ -275,6 +315,13 @@ class Component:
     #: question, and it is answered by the missing artifact rather than by
     #: reading a schedule or a workflow.
     dispatch_workflow: str | None = None
+    #: WHICH systemd timer starts a `box-timer` row, e.g.
+    #: `alpha-engine-trader-session.timer`, the basename of a unit in
+    #: `nousergon/crucible-executor` `infrastructure/systemd/`. Required on
+    #: exactly those rows and forbidden on every other, the same rule as
+    #: `dispatch_workflow` and for the same reason: a starter has to be a
+    #: name something can check (alpha-engine-config-I12353).
+    dispatch_unit: str | None = None
     #: WHO would notice this row's absence. Almost always `alerts.sweep`.
     #: The two exceptions are the sweep itself (a sweep that never ran
     #: cannot report itself missing) and the heartbeat, whose watcher is
@@ -307,6 +354,19 @@ class Component:
                 "A `github-actions` row naming no workflow could not be verified "
                 "against anything, and a name on a row nothing reads it for is a "
                 "second declaration that can drift."
+            )
+        if (self.dispatch == "box-timer") != (self.dispatch_unit is not None):
+            raise ValueError(
+                f"{self.name}: dispatch_unit is required on a `box-timer` row and "
+                f"forbidden on any other, and this row has dispatch {self.dispatch!r} "
+                f"with dispatch_unit {self.dispatch_unit!r}. A `box-timer` row naming "
+                "no timer could not be checked against the box's units."
+            )
+        if self.dispatch_unit is not None and not self.dispatch_unit.endswith(".timer"):
+            raise ValueError(
+                f"{self.name}: dispatch_unit {self.dispatch_unit!r} is not a systemd "
+                "timer basename (`<name>.timer`). The row names the thing that STARTS "
+                "the job, and on the box that is the timer, not its service."
             )
         if self.lifecycle not in LIFECYCLES:
             raise ValueError(f"{self.name}: lifecycle {self.lifecycle!r} not in {LIFECYCLES}")
@@ -374,6 +434,7 @@ def load_registry(path: str | None = None) -> dict[str, Component]:
             schedule=row.schedule,
             dispatch=row.dispatch,
             dispatch_workflow=row.dispatch_workflow,
+            dispatch_unit=row.dispatch_unit,
             absence_watched_by=row.absence_watched_by,
             # `mode="json"` so `at` arrives as the ISO string `from_yaml`
             # parses — the model has already turned it into a `dt.time`, and
