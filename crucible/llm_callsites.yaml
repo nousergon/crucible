@@ -20,6 +20,16 @@
 #                      that looks like a vendor model id.
 #   max_usd_per_call   this site's own ceiling, under the per-run cap.
 #   owner              the module that holds the call.
+#   trace_capture      what this site's `llm_trace.v1` row may retain once the
+#                      trace sink is deployed: `hash_only` (ids, hashes,
+#                      usage, citations; no prompt or output text) or `off`.
+#                      REQUIRED. `full` is not admitted: v2 prompts carry
+#                      vendor market data, and krepis defaults to `full` the
+#                      moment a sink environment appears unless the site says
+#                      otherwise (alpha-engine-config-I12312). Write `off`
+#                      QUOTED ('off'): bare, YAML reads it as boolean false
+#                      and the row is refused at load.
+#   trace_capture_reason  why, in one sentence.
 schema_version: llm_callsite_registry.v1
 
 # The ALLOWLIST of capability classes `crucible.llm.call` will ask for, and
@@ -125,3 +135,8 @@ callsites:
     capability_class: chaos_probe
     max_usd_per_call: 0.01
     owner: crucible.fault_probe
+    trace_capture: hash_only
+    trace_capture_reason: >-
+      A fixed synthetic probe prompt that always fails at the provider; the
+      failed-call row (error type, latency, route) is the useful part, and no
+      content needs keeping.

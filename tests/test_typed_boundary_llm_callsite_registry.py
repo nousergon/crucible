@@ -41,6 +41,8 @@ def _document(**overrides: object) -> dict[str, object]:
                 "capability_class": "high",
                 "max_usd_per_call": 0.25,
                 "owner": "crucible.slots.research",
+                "trace_capture": "hash_only",
+                "trace_capture_reason": "vendor market data in the prompt",
             }
         },
     }
@@ -158,6 +160,8 @@ class TestAWronglyTypedFieldSurfacesAtTheLiveReader:
                             "capability_class": "high",
                             "max_usd_per_call": "not a number",
                             "owner": "crucible.slots.research",
+                            "trace_capture": "hash_only",
+                            "trace_capture_reason": "x",
                         }
                     },
                 }

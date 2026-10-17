@@ -254,7 +254,7 @@ requires-dist = [
     { name = "boto3", specifier = ">=1.43.111" },
     { name = "cvxpy", specifier = ">=1.9.3,<1.10" },
     { name = "jsonschema", specifier = ">=4.26.0" },
-    { name = "krepis", extras = ["openai"], specifier = "==0.59.72" },
+    { name = "krepis", extras = ["openai"], specifier = "==0.59.77" },
     { name = "lightgbm", specifier = ">=4.7.0" },
     { name = "nousergon-lib", extras = ["arcticdb"], marker = "extra == 'arcticdb'", specifier = "==0.124.165" },
     { name = "nousergon-lib", extras = ["github-app", "gates"], specifier = "==0.124.165" },
@@ -368,8 +368,8 @@ name = "httpcore2"
 version = "2.12.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "h11" },
-    { name = "truststore" },
+    { name = "h11", marker = "sys_platform != 'emscripten'" },
+    { name = "truststore", marker = "sys_platform != 'emscripten'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/be/ad/f4f0e57345f1870f3e8cb624e058d7eca6e5a27d33bcc3311d9b618734cd/httpcore2-2.12.0.tar.gz", hash = "sha256:9293522bba0aa7c4c8e9e3f040c16575bd8868e155a77fa30c7a9085a5eae648", size = 67548, upload-time = "2026-08-18T13:22:08.211Z" }
 wheels = [
@@ -508,7 +508,7 @@ wheels = [
 
 [[package]]
 name = "krepis"
-version = "0.59.72"
+version = "0.59.77"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "boto3" },
@@ -516,9 +516,9 @@ dependencies = [
     { name = "pyyaml" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/7c/00/fb73690e7c71a272e6e25a26cf6d5d09883633b52d53785edb72304814e0/krepis-0.59.72.tar.gz", hash = "sha256:c5da84cf6ece9e017a1cd970feb83ac411ab734209fddc09cee2eb5191d4810b", size = 756866, upload-time = "2026-10-04T14:03:24.645Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/97/8f/a6e08ce57636e59b8e9084e9327dce8badecd901abf9b7c6d56db91bc2c8/krepis-0.59.77.tar.gz", hash = "sha256:0504bc3a8ecb35ce0367d4b4cb417a4d2fc23d8d39f0fd973d9d311ed744baba", size = 797073, upload-time = "2026-10-17T05:07:06.077Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e7/e7/a51d7ae43f976ae0dd631472150a822c997a7dcaaf5144d88d4989920cfa/krepis-0.59.72-py3-none-any.whl", hash = "sha256:6a726c345d19d24cbb58994579db267288d5908bac5a324f8554b54389fc4b71", size = 473421, upload-time = "2026-10-04T14:03:22.673Z" },
+    { url = "https://files.pythonhosted.org/packages/1e/5a/f06dd9bbd40c8ae053d4c5735064d8cf41df46e8c1313657af170bc9b835/krepis-0.59.77-py3-none-any.whl", hash = "sha256:cc2ca30670e09a81a7e21d3933f8ff5c3abf929cbda4280499cdaed2c07b22b0", size = 498026, upload-time = "2026-10-17T05:07:04.566Z" },
 ]
 
 [package.optional-dependencies]

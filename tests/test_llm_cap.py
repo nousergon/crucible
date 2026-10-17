@@ -339,7 +339,9 @@ class TestEnforcement:
             "    purpose: p\n"
             "    capability_class: gpt-5\n"
             "    max_usd_per_call: 0.01\n"
-            "    owner: t\n",
+            "    owner: t\n"
+            "    trace_capture: 'off'\n"
+            "    trace_capture_reason: t\n",
             encoding="utf-8",
         )
         with pytest.MonkeyPatch.context() as patch:
