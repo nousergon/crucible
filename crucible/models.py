@@ -213,7 +213,7 @@ class DeadlineRow(_Strict):
     for the same reason the two page conditions are a closed set.
     """
 
-    anchor: Literal["close_plus", "next_calendar_day_at"]
+    anchor: Literal["close_plus", "next_calendar_day_at", "next_open_plus"]
     #: WHICH trading days this row is due on. Required and closed, for the
     #: same reason `anchor` is: without it the deadline answers "by when"
     #: while nothing answers "on what days", and `evaluate_absence` graded
@@ -228,8 +228,8 @@ class DeadlineRow(_Strict):
 
     @model_validator(mode="after")
     def _the_anchor_carries_the_field_it_needs(self) -> DeadlineRow:
-        if self.anchor == "close_plus" and self.offset_hours is None:
-            raise ValueError("a close_plus deadline needs offset_hours")
+        if self.anchor in ("close_plus", "next_open_plus") and self.offset_hours is None:
+            raise ValueError(f"a {self.anchor} deadline needs offset_hours")
         if self.anchor == "next_calendar_day_at" and self.at is None:
             raise ValueError("a next_calendar_day_at deadline needs `at`")
         return self
@@ -269,8 +269,11 @@ class ComponentRow(_Strict):
     #: WHO starts a scheduled row. Required and nullable: `null` is
     #: "on-demand", an assertion, and it must not be spellable by leaving the
     #: key out.
-    dispatch: Literal["arc", "scheduler", "github-actions"] | None
+    dispatch: Literal["arc", "scheduler", "github-actions", "box-timer"] | None
     dispatch_workflow: str | None = None
+    #: The systemd timer basename a `box-timer` row is started by; see
+    #: `crucible.components.Component.dispatch_unit`.
+    dispatch_unit: str | None = None
     #: WHAT would notice this component is missing. Required and NOT
     #: defaulted, for exactly the reason stated three fields above for
     #: `dispatch`: a coverage claim must not be spellable by leaving the key
@@ -377,6 +380,11 @@ def derived_log_location(
                 "its log location cannot be derived and must not be guessed."
             )
         return f"github-actions:{dispatch_workflow}"
+    # `box-timer` (alpha-engine-config-I12353) derives nothing, like an
+    # on-demand row: the trader's units write to the box journal, and no
+    # shipping path to `/crucible/<job>` exists yet (I12353 item 4). The row
+    # is held to the on-demand rule, the group the job WOULD log to, rather
+    # than given a location derived from a path that does not exist.
     return None
 
 

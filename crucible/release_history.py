@@ -119,7 +119,7 @@ def row_has_a_starter(row: dict[str, Any] | None) -> bool:
         return False
     return (
         row.get("lifecycle") == "ACTIVE"
-        and row.get("dispatch") in ("arc", "scheduler", "github-actions")
+        and row.get("dispatch") in ("arc", "scheduler", "github-actions", "box-timer")
         and bool(row.get("deadline"))
     )
 
