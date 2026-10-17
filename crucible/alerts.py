@@ -831,7 +831,11 @@ def evaluate_absence(
             # the manifest is known missing, so a delivering row costs no
             # read. Anything short of a readable declaration grades the row
             # against the current registry, as before.
-            if component.dispatch in ("scheduler", "github-actions"):
+            # `box-timer` too (alpha-engine-config-I12353): the trader's
+            # session row gained its starter on 2026-10-17, and a day before
+            # the release declaring it was in force is graded as UNDECLARED
+            # rather than paged after the fact.
+            if component.dispatch in ("scheduler", "github-actions", "box-timer"):
                 if history is None:
                     history = release_history or ReleaseInForce.for_store(store)
                 declaration = history.declaration(name, due)

@@ -45,7 +45,8 @@
               "enum": [
                 "arc",
                 "scheduler",
-                "github-actions"
+                "github-actions",
+                "box-timer"
               ],
               "type": "string"
             },
@@ -54,6 +55,18 @@
             }
           ],
           "title": "Dispatch"
+        },
+        "dispatch_unit": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Dispatch Unit"
         },
         "dispatch_workflow": {
           "anyOf": [
@@ -133,7 +146,8 @@
         "anchor": {
           "enum": [
             "close_plus",
-            "next_calendar_day_at"
+            "next_calendar_day_at",
+            "next_open_plus"
           ],
           "title": "Anchor",
           "type": "string"

@@ -14,8 +14,10 @@
 # omitted class is indistinguishable from a forgotten one.
 #
 # `dispatch` says WHO starts a scheduled row: `arc` (a stage of the weekly
-# driver, `crucible weekly`), `scheduler` (its own EventBridge schedule) or
-# `github-actions` (a cron in this repository's own .github/workflows/).
+# driver, `crucible weekly`), `scheduler` (its own EventBridge schedule),
+# `github-actions` (a cron in this repository's own .github/workflows/) or
+# `box-timer` (a systemd timer on the executor box, named by the row's
+# `dispatch_unit`; the trader's jobs, alpha-engine-config-I12353).
 # On-demand rows declare `null`. It is a separate field from `schedule`
 # because `schedule` is prose and this is wiring: six rows read
 # "weekly, Saturday" while exactly one of them was dispatched by anything.
@@ -65,8 +67,10 @@
 # refuses any other value, so this cannot drift back.
 #
 # `deadline` is expressed relative to the TRADING calendar (§4.12): "present
-# by T after the close of trading day d". A Monday holiday therefore raises no
-# page, without anyone muting anything.
+# by T after the close of trading day d" (`close_plus`), or "present by T
+# after the open of the first session after d" (`next_open_plus`, for a job
+# that binds to d and runs the next morning). A Monday holiday therefore
+# raises no page, without anyone muting anything.
 #
 # `log_retention_days` is CALENDAR days — one of §4.12's exhaustive
 # exceptions, because retention is an AWS property billed by calendar time.
@@ -1439,12 +1443,33 @@ components:
     # `execution_shortfall.v1` (`no_orders` for a shadow session) as run outputs. Admitted by
     # `crucible.models.TRADER_JOB_VALUES` for the reason `trader.reconcile` is.
     #
-    # `schedule`/`dispatch`/`deadline` are null for the reason they are on
-    # `trader.reconcile`: the box timer exists, but nothing it runs can reach
-    # this store until the executor role's v2 grants are applied and a trader
-    # release is pinned, and a `close_plus` deadline declared before then
-    # would page ABSENCE every trading day for a job that cannot yet start.
-    # The change that proves the first unattended run sets all three.
+    # SCHEDULED since alpha-engine-config-I12353 (2026-10-17). These fields
+    # were null until "the change that proves the first unattended run". That
+    # proof is in the store: unattended sessions filed `ok` manifests for
+    # 2026-10-02 through 10-13, and for 10-15. Nothing set the fields, so a
+    # unit that died before writing its manifest paged nobody. The 10-14 and
+    # 10-08 sessions are missing with no page; 10-14 died in the venv build,
+    # crucible-trader#39.
+    #
+    # `dispatch: box-timer`: crucible-executor
+    # `infrastructure/systemd/alpha-engine-trader-session.timer`, which fires
+    # `Mon..Fri 10:45 America/New_York`. The entry point skips NYSE holidays
+    # itself. The run binds to the LAST CLOSED session, so the manifest for
+    # trading day d is written on the next session's morning: Monday for a
+    # Friday d. Measured 2026-10-02..15: every `ok` manifest landed at
+    # 14:45-14:47Z on the next session.
+    #
+    # `next_open_plus 2h` = 11:30 ET on the next session. That is 45 minutes
+    # past the timer, which covers the service's `TimeoutStartSec=30min`,
+    # including `ExecStartPre`, with 15 minutes to spare. `close_plus` cannot
+    # express this deadline: for a Friday d it would fall on the weekend.
+    # The 21:00 ET `alerts.sweep` grades it the same evening. A run that
+    # STARTS and fails still pages FAILURE from its own manifest.
+    #
+    # `trader.reconcile` stays null in this edit. Its timer fires 16:45 ET,
+    # but its manifests landed 19:05-20:45 ET (2026-10-07..16), and the SF
+    # drain step also starts it (#12292). Its deadline needs that timing
+    # settled first.
     description: >-
       Serve one trading session on the M champion (shadow until an order
       router exists) and record the served day, with its session mode, in the
@@ -1462,9 +1487,13 @@ components:
     console_surface: crucible/runs
     artifact_retention: forever
     absence_watched_by: alerts.sweep
-    schedule: null
-    dispatch: null
-    deadline: null
+    schedule: weekdays, next session 10:45 ET
+    dispatch: box-timer
+    dispatch_unit: alpha-engine-trader-session.timer
+    deadline:
+      anchor: next_open_plus
+      cadence: daily
+      offset_hours: 2
 
   deploy:
     # alpha-engine-config-I10969. The component that moves `releases/current`
