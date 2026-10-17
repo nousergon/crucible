@@ -304,6 +304,50 @@ class TestCPCV:
             assert not (set(fold.train_dates) & set(fold.purged_dates))
             assert fold.purged_dates, "a purge that removes nothing is not a purge"
 
+    def test_no_training_label_overlaps_a_test_label_on_either_side(self, panel) -> None:
+        """A training day's label window may not intersect any test day's.
+
+        The 21-session label of a day just AFTER a test block starts inside
+        that block's label windows, so purging only BEFORE the block (and a
+        2-session embargo after it) left 14 of 15 folds training on labels
+        that overlap the ones they are scored on. Measured 2026-10-17 on the
+        live recipes' horizon 21 / embargo 2. López de Prado's purge is
+        two-sided; the embargo is applied on top of it.
+        """
+        horizon = 21
+        result = cpcv_oos_ic(
+            panel,
+            recipe=_recipe(),
+            cpcv=CPCVSpec(n_groups=6, k_test=2, embargo_trading_days=2),
+            label_horizon_trading_days=horizon,
+        )
+        position = {d: i for i, d in enumerate(panel.dates)}
+        assert result.folds
+        for fold in result.folds:
+            test = sorted(position[d] for d in fold.test_dates)
+            for d in fold.train_dates:
+                i = position[d]
+                overlaps = [t for t in test if i <= t + horizon and i + horizon >= t]
+                assert not overlaps, (
+                    f"fold {fold.test_groups}: training day {d} (label {i}..{i + horizon}) "
+                    f"overlaps test labels starting at {overlaps[:3]}"
+                )
+
+    def test_the_embargo_extends_past_the_after_side_purge(self, panel) -> None:
+        horizon, embargo = 21, 5
+        result = cpcv_oos_ic(
+            panel,
+            recipe=_recipe(),
+            cpcv=CPCVSpec(n_groups=6, k_test=1, embargo_trading_days=embargo),
+            label_horizon_trading_days=horizon,
+        )
+        position = {d: i for i, d in enumerate(panel.dates)}
+        for fold in result.folds:
+            last_test = max(position[d] for d in fold.test_dates)
+            after = [position[d] for d in fold.train_dates if position[d] > last_test]
+            if after:
+                assert min(after) > last_test + horizon + embargo
+
     def test_the_backtest_path_count_is_reported(self, panel) -> None:
         result = cpcv_oos_ic(
             panel,

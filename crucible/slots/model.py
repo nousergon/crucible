@@ -2603,8 +2603,9 @@ def _purged_kfold_uncertainty(
     training days are split into the recipe's ``cpcv.n_groups`` contiguous
     blocks; each block is predicted by a fit on the OTHER blocks, purged and
     embargoed exactly as :func:`cpcv_oos_ic` purges — every day whose
-    ``label_horizon`` window reaches into the test block is dropped before
-    it, and ``embargo_trading_days`` after it. That is the slot's own CPCV
+    ``label_horizon`` window overlaps the test block's labels is dropped on
+    BOTH sides, plus ``embargo_trading_days`` beyond the after-side purge.
+    That is the slot's own CPCV
     construction at ``k_test = 1``: each training day is predicted exactly
     once, by a fit that never saw its label, so the pooled mean squared
     residual is an honest estimate of the serving fit's error rather than of
@@ -2638,7 +2639,7 @@ def _purged_kfold_uncertainty(
     for start, end in _contiguous_groups(len(days), k):
         test = days[start : end + 1]
         first, last = test[0], test[-1]
-        train = [d for d in days if d < first - horizon or d > last + embargo]
+        train = [d for d in days if d < first - horizon or d > last + horizon + embargo]
         try:
             fold, _, _ = _fit_rows(recipe, panel, train)
         except (TrainingIntegrityError, np.linalg.LinAlgError) as exc:
@@ -3358,12 +3359,14 @@ def cpcv_oos_ic(
 ) -> CPCVResult:
     """Out-of-sample rank IC over every ``C(n_groups, k_test)`` combination.
 
-    Purge and embargo, verbatim in behaviour from the lifted implementation:
-    every date within ``label_horizon_trading_days`` BEFORE a test block, and
-    ``embargo_trading_days`` AFTER it, is removed from training. The first
-    window is the overlapping-label purge; the second is the serial-correlation
-    embargo. Removing only one of them is the leak this whole construction
-    exists to close.
+    Purge and embargo (López de Prado): every date within
+    ``label_horizon_trading_days`` BEFORE a test block, and within
+    ``label_horizon_trading_days + embargo_trading_days`` AFTER it, is removed
+    from training. The purge is two-sided because a label window overlaps the
+    test labels from either side; the embargo is the serial-correlation buffer
+    applied beyond the after-side purge. Until alpha-engine-config-I12395 the
+    after side carried the embargo alone (2 sessions against a 21-session
+    label), and 14 of 15 folds trained on labels overlapping their test labels.
 
     An empty or unfittable fold makes the whole result ``unmeasurable`` with a
     reason. It is never a zero IC: `n_dates == 0` is a defect, not a result.
@@ -3389,7 +3392,10 @@ def cpcv_oos_ic(
             a, b = groups[gi]
             is_test[a : b + 1] = True
             lo = max(0, a - label_horizon_trading_days)
-            hi = min(n - 1, b + cpcv.embargo_trading_days)
+            # Two-sided purge: a day within the horizon AFTER the block has a
+            # label that starts inside the block's label windows. The embargo
+            # is applied on top of that purge, never instead of it.
+            hi = min(n - 1, b + label_horizon_trading_days + cpcv.embargo_trading_days)
             excluded[lo : hi + 1] = True
         keep = (~is_test) & (~excluded)
         purged = excluded & (~is_test)

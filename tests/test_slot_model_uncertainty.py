@@ -377,3 +377,38 @@ class TestTheGraderCalibratesTheServedStd:
         reading = grade_arm(_recipe("bayesian_ridge"), panel, as_of=panel.dates[-1]).calibration
         assert reading.status == "fail"
         assert reading.z_var > Z_VAR_BAND[1]
+
+
+class TestTheUncertaintyFoldsPurgeBothSides:
+    """The std's k-fold uses the CPCV purge, so it carries the same two-sided rule.
+
+    A training day within the label horizon AFTER a test block has a label
+    overlapping the block's labels; until 2026-10-17 only the embargo was
+    dropped there, so the residual the served std is built from was partly
+    in-sample.
+    """
+
+    def test_no_training_label_overlaps_a_test_label(self, monkeypatch) -> None:
+        from dataclasses import replace as _replace
+
+        panel = _panel(n_days=90)
+        recipe = _replace(_recipe("ols"), label_horizon_trading_days=5)
+        horizon = recipe.label_horizon_trading_days
+        embargo = recipe.cpcv.embargo_trading_days
+        seen: list[list[int]] = []
+        real_fit_rows = model_module._fit_rows
+
+        def recording_fit_rows(rec, pan, train, *a, **k):
+            seen.append(sorted(int(d) for d in train))
+            return real_fit_rows(rec, pan, train, *a, **k)
+
+        monkeypatch.setattr(model_module, "_fit_rows", recording_fit_rows)
+        days = list(range(80))
+        model_module._purged_kfold_uncertainty(recipe, panel, days)
+        blocks = model_module._contiguous_groups(len(days), recipe.cpcv.n_groups)
+        assert len(seen) == len(blocks)
+        for (start, end), train in zip(blocks, seen, strict=True):
+            for d in train:
+                assert d < start - horizon or d > end + horizon + embargo, (
+                    f"training day {d} sits inside the purge around test block {start}..{end}"
+                )
