@@ -2247,7 +2247,10 @@ class TestARuledBenchIsADeclaredDecision:
         assert row.state == "DECLARED_OFF" and not row.red
         assert row.source == "cutover"
         assert row.artifact == "slots/m/bench.json"
-        assert "M benched at zero weight — no lift (ruled 2026-10-18" in row.detail
+        assert (
+            "M temporarily benched at zero weight until a rebuilt arm passes the gate "
+            "(ruled 2026-10-18" in row.detail
+        )
         assert "re-exam 2026-11-20" in row.detail
         assert "pull/12406" in row.detail, "the failed confirmation it was ruled on"
 

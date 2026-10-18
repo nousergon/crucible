@@ -218,7 +218,7 @@ components:
   bench:
     description: >-
       File a ruled bench record (alpha-engine-config-I12024): a slot served at
-      zero weight from a named session on, recording "no lift", under a named
+      zero weight from a named session on, temporarily, under a named
       human ruling. Refuses a record missing any ruling field and writes
       nothing then; a valid filing writes slots/{slot}/bench.json.
     lifecycle: ACTIVE

@@ -514,7 +514,7 @@ class TestABenchedSlotHoldsItsPointerWithAReason:
         assert moved["source_path"] == arena_cycle_key("m", DAY)
         reason = moved["status_reason"]
         assert "benched at zero weight" in reason
-        assert "no lift" in reason
+        assert "temporarily benched" in reason
         assert slot_bench_key("m") in reason
         assert "moved=True" in reason, "the decision the bench overrode is on the record"
 

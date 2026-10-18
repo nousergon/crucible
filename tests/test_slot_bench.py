@@ -151,7 +151,8 @@ class TestTheReader:
         assert bench.reexam_date == "2026-11-20"
         assert bench.tracker == TRACKER
         assert bench.headline() == (
-            f"M benched at zero weight — no lift (ruled 2026-10-18 by brian, {TRACKER})"
+            f"M temporarily benched at zero weight until a rebuilt arm passes the gate "
+            f"(ruled 2026-10-18 by brian, {TRACKER})"
         )
         described = bench.describe()
         for fragment in (CHAMPION, EFFECTIVE, RULING_REF, bench.digest, "re-exam 2026-11-20"):

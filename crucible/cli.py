@@ -792,7 +792,7 @@ JOBS: dict[str, JobSpec] = {
     # ruling, and a clock that could file one would hold a human's authority.
     BENCH_JOB: JobSpec(
         BENCH_JOB,
-        "File a ruled bench: a slot served at zero weight, recording no lift",
+        "File a ruled bench: a slot temporarily served at zero weight",
         False,
     ),
     # SCHEDULED as of `alpha-engine-config-I10961` deliverable 4: the import
