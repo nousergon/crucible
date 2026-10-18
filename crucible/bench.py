@@ -1,4 +1,4 @@
-"""A slot benched at zero weight by ruling, recording "no lift".
+"""A slot temporarily benched at zero weight by ruling, a cutover mechanic.
 
 Normative source: Brian's ruling of 2026-10-18 14:44Z on the Crucible v2
 phase-4 cutover (`alpha-engine-config-I12024`, option (a)): *"keep the date and
@@ -172,10 +172,12 @@ class SlotBench:
         return trading_day >= self.effective_trading_day
 
     def headline(self) -> str:
-        """The one line every reader prints: "M benched at zero weight — no lift (ruled …)"."""
+        """The one line every reader prints: "M temporarily benched at zero weight until a
+        rebuilt arm passes the gate (ruled …)"."""
         ruled_on = str(self.document["ruled_at"])[:10]
         return (
-            f"{self.slot.upper()} benched at zero weight — no lift (ruled {ruled_on} by "
+            f"{self.slot.upper()} temporarily benched at zero weight until a rebuilt arm passes "
+            f"the gate (ruled {ruled_on} by "
             f"{self.document['ruled_by']}, {self.tracker})"
         )
 

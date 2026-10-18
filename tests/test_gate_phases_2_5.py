@@ -2704,7 +2704,7 @@ class TestABenchedWeekNamesItsBench:
             f"on v2 champion {TRADER_CHAMPION} benched at weight 0 "
             f"({keys_module.slot_bench_key('m')})"
         ) in clause.detail
-        assert "no lift" in clause.detail
+        assert "temporarily benched" in clause.detail
         assert keys_module.slot_bench_key("m") in clause.evidence
 
     def test_a_short_benched_week_is_unmet_and_names_the_bench(self, store: LocalStore) -> None:

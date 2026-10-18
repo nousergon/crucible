@@ -1791,7 +1791,8 @@ def _slot_bench_rows(store: Store) -> list[BoardRow]:
     """`alpha-engine-config-I12024`: one grey `DECLARED_OFF` row per ruled slot bench,
     `cutover:slot_m_bench`.
 
-    "M benched at zero weight — no lift (ruled 2026-10-18 …)". A decision, so
+    "M temporarily benched at zero weight until a rebuilt arm passes the gate
+    (ruled 2026-10-18 …)". A decision, so
     grey and never red: rendering a ruling as a defect is how a board trains
     its reader to ignore it (the `DECLARED_OFF` note above). The row exists
     only while a bench is FILED — a slot nobody benched has nothing to
@@ -1842,7 +1843,10 @@ def _slot_bench_rows(store: Store) -> list[BoardRow]:
                 id=f"cutover:slot_{slot}_bench",
                 source="cutover",
                 section="phase 4 — cutover",
-                title=f"slot {slot.upper()} benched at zero weight by ruling, recording no lift",
+                title=(
+                    f"slot {slot.upper()} temporarily benched at zero weight by ruling "
+                    "(returns when a rebuilt arm passes the gate)"
+                ),
                 state=state,
                 detail=detail,
                 surface="crucible board",
