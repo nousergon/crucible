@@ -1793,6 +1793,18 @@ class LlmCallSiteRow(_Strict):
     )
     max_usd_per_call: float = Field(gt=0, description="this site's own ceiling, under the cap")
     owner: str = Field(min_length=1, description="the module that holds the call")
+    # alpha-engine-config-I12312: the LLM traces arc.
+    trace_capture: Literal["hash_only", "off"] = Field(
+        description="what this call site's `llm_trace.v1` row may retain once the trace "
+        "sink is deployed (llm-platform-policy § Call trace record). "
+        "REQUIRED, with no default: krepis traces at `full` the moment a sink environment "
+        "appears unless the call site declares otherwise, and a v2 prompt carries vendor "
+        "market data. `full` is deliberately not admitted — adding it is a schema edit that "
+        "names the licensing basis, never a row edit."
+    )
+    trace_capture_reason: str = Field(
+        min_length=1, description="why this call site's trace_capture is what it is"
+    )
 
 
 class LlmCallsiteRegistryDocument(_Strict):

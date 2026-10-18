@@ -468,7 +468,9 @@ class TestAnUnroutedCapabilityClass:
             "    purpose: draft one arm's thesis\n"
             f"    capability_class: {self.UNROUTED}\n"
             "    max_usd_per_call: 0.25\n"
-            "    owner: crucible.slots.research\n",
+            "    owner: crucible.slots.research\n"
+            "    trace_capture: hash_only\n"
+            "    trace_capture_reason: t\n",
             encoding="utf-8",
         )
         monkeypatch.setattr("crucible.llm.CALLSITE_REGISTRY_PATH", registry_file)

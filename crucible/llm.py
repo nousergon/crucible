@@ -245,6 +245,10 @@ class CallSite:
     capability_class: str
     max_usd_per_call: float
     owner: str
+    #: The row's declared `llm_trace.v1` capture level (`hash_only` / `off`).
+    #: Defaults to `off` only for a hand-built test registry; every production
+    #: row declares it, because `LlmCallSiteRow.trace_capture` has no default.
+    trace_capture: str = "off"
 
 
 # --------------------------------------------------------------------------
@@ -824,6 +828,7 @@ def load_registry() -> dict[str, CallSite]:
             capability_class=row.capability_class,
             max_usd_per_call=row.max_usd_per_call,
             owner=row.owner,
+            trace_capture=row.trace_capture,
         )
     return registry
 
@@ -1686,6 +1691,39 @@ def provider_capture_of(ctx: Any) -> ProviderCaptureLedger | None:
     return ledger if isinstance(ledger, ProviderCaptureLedger) else None
 
 
+def trace_capture_for(site: CallSite, environ: Any = None) -> str:
+    """The ``trace_capture=`` this door passes to `krepis.llm.LLMClient`.
+
+    `alpha-engine-config-I12312`. The row's DECLARED level, whenever the
+    process has any trace-sink environment at all; ``off`` when it has none.
+
+    **Why the declaration is always passed when a sink exists.** Left unset,
+    krepis traces at `full` the moment ``KREPIS_TRACE_SINK_*`` appears, and
+    also obeys ``KREPIS_TRACE_CAPTURE=full``. A v2 prompt carries vendor
+    market data, so the call site's own `hash_only` must win over both; it
+    is never left to the environment.
+
+    **Why no sink environment means ``off`` rather than a raise.** krepis
+    raises `TraceSinkConfigError` at construction when a call site declares
+    `hash_only` and no sink is configured. Activation is an environment fact
+    for the whole fleet (the cost sink's model), and no v2 box sets the trace
+    sink today: passing the declaration unconditionally would turn every v2
+    call into a construction failure — and on a fault-injection run, into a
+    `FaultProbeFailure` misclassified as plan §10.7 fault 3. A HALF-configured
+    environment (one of the two variables set) is NOT treated as absent: the
+    declaration is passed and krepis raises naming the missing variable,
+    before any spend.
+    """
+    if site.trace_capture == "off":
+        return "off"
+    from krepis.trace_sink import BUCKET_ENV_VAR, PREFIX_ENV_VAR
+
+    env = os.environ if environ is None else environ
+    if not any((env.get(name) or "").strip() for name in (BUCKET_ENV_VAR, PREFIX_ENV_VAR)):
+        return "off"
+    return site.trace_capture
+
+
 def call(
     ctx: Any,
     *,
@@ -1892,7 +1930,12 @@ def call(
                 exec_context=_exec_context(),
                 wire="openai",
             )
-            client = LLMClient(spec, callsite_id=callsite_id, client_factory=client_factory)
+            client = LLMClient(
+                spec,
+                callsite_id=callsite_id,
+                client_factory=client_factory,
+                trace_capture=trace_capture_for(site),
+            )
         system, user_content = _system_and_user_content(messages)
         result = client.complete(system=system, user_content=user_content, **kwargs)
     except DryRunProviderCallRefused:
