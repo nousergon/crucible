@@ -144,6 +144,7 @@ __all__ = [
     "shadow_books_key",
     "shadow_key",
     "signals_key",
+    "slot_bench_key",
     "strategy_arm_key",
     "strategy_arms_prefix",
     "strategy_holdout_key",
@@ -1205,6 +1206,26 @@ def champion_key(slot: str) -> str:
     if slot not in ("u", "r", "m", "s"):
         raise KeyError(f"unknown slot {slot!r}; the four slots are ['m', 'r', 's', 'u']")
     return f"champions/{slot}/current.json"
+
+
+def slot_bench_key(slot: str) -> str:
+    """The ruled bench record for ``slot`` (`slot_bench.v1`, `crucible.bench`).
+
+    `alpha-engine-config-I12024`: Brian's ruling of 2026-10-18 benched the M
+    slot at zero weight and recorded "no lift". One document per slot,
+    dateless like :func:`champion_key` beside it, because it is a standing
+    ruling rather than a per-session record — its own
+    `effective_trading_day` says which sessions it covers.
+
+    Under its own top-level prefix, not `champions/`: the box runtime writes
+    `champions/*` (promote moves the pointer), and the identity that is
+    benched must not be the one that can write or clear its own bench. The
+    record is filed by the operator CLI identity, the way `faults/` and
+    `holdout/` are.
+    """
+    if slot not in ("u", "r", "m", "s"):
+        raise KeyError(f"unknown slot {slot!r}; the four slots are ['m', 'r', 's', 'u']")
+    return f"slots/{slot}/bench.json"
 
 
 # -- slot outputs the rest of the system consumes ---------------------------

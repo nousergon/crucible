@@ -47,6 +47,7 @@ from crucible.keys import (
     money_path_claim_key,
     predictions_key,
     shadow_books_key,
+    slot_bench_key,
     strategy_holdout_key,
     trader_broker_statement_key,
     trader_reconciliation_key,
@@ -150,6 +151,9 @@ class TestWhatIsOnTheMoneyPath:
             # result (plan §9.5 by name) and the per-session fills record.
             trader_reconciliation_key(TRADING_DAY),
             execution_shortfall_key(TRADING_DAY),
+            # `alpha-engine-config-I12024`: the ruled M bench, which decides the
+            # M champion's alpha reaches the book at weight zero.
+            slot_bench_key("m"),
         ],
     )
     def test_the_money_path_members(self, key: str) -> None:
@@ -174,6 +178,8 @@ class TestWhatIsOnTheMoneyPath:
             # manifest already; the result is what §9.5 chains.
             trader_broker_statement_key(TRADING_DAY),
             TRADER_EVIDENCE_KEY,
+            # A sibling under `slots/` is not the bench record.
+            "slots/m/bench.json.bak",
             # Not a day: the predicate rebuilds the key from the basename and
             # must refuse rather than let the key helper's date check raise.
             "trader/reconciliation/notaday.json",

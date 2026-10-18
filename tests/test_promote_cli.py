@@ -474,3 +474,64 @@ class TestPromoteCommand:
         monkeypatch.setenv("CRUCIBLE_STORE", str(store.root))
         with pytest.raises(SystemExit):
             main(["promote", "--slot", "m", "--date", DAY, "--revert-to", ids["champ"]])
+
+
+class TestABenchedSlotHoldsItsPointerWithAReason:
+    """`alpha-engine-config-I12024`: while M is benched by ruling, `promote[m]`
+    still reads the graded cycle and decides — so the verdict is on the record
+    — but writes nothing, and files `pointer_moved = 0` with a reason naming
+    the bench. That freezes the pointer the trader's served-day clock counts
+    on, and is the row the phase-3 `m_promotion_or_verdict_backed_non_promotion`
+    clause reads as a verdict-backed non-promotion."""
+
+    def test_a_cycle_that_would_promote_is_held_and_names_the_bench(
+        self, seeded, monkeypatch
+    ) -> None:
+        from crucible.gate import _clause_slot_promotion_or_non_promotion
+        from crucible.keys import slot_bench_key
+        from tests.support.bench import file_bench
+
+        store, register, ids, dates = seeded
+        seat(store, ids, dates)
+        grade(store, register, ids, dates)
+        seed_arm_predictions(store, ids["chal"], DAY)
+        file_bench(store, ids["champ"], effective=DAY, filed_on=DAY)
+        pointer_bytes = store.get_bytes(champion_key("m"))
+        graded = store.get_bytes(arena_cycle_key("m", DAY))
+        monkeypatch.setenv("CRUCIBLE_STORE", str(store.root))
+
+        assert main(["promote", "--slot", "m", "--date", DAY]) == 0
+
+        assert store.get_bytes(champion_key("m")) == pointer_bytes, "the pointer is frozen"
+        assert store.get_bytes(arena_cycle_key("m", DAY)) == graded
+        assert not store.exists(retirement_log_key("m")), "a benched slot retires nothing"
+        manifest = json.loads(store.get_bytes(f"runs/promote/{DAY}/m/run.json"))
+        assert manifest["status"] == "ok"
+        assert manifest["outputs"] == []
+        assert [i["key"] for i in manifest["inputs"]].count(slot_bench_key("m")) == 1
+        (moved,) = [m for m in manifest["metrics"] if m["name"] == "pointer_moved"]
+        assert moved["value"] == 0.0
+        assert moved["source_path"] == arena_cycle_key("m", DAY)
+        reason = moved["status_reason"]
+        assert "benched at zero weight" in reason
+        assert "no lift" in reason
+        assert slot_bench_key("m") in reason
+        assert "moved=True" in reason, "the decision the bench overrode is on the record"
+
+        clause = _clause_slot_promotion_or_non_promotion(store, "m", [dt.date.fromisoformat(DAY)])
+        assert clause.met, clause.detail
+        assert "benched at zero weight" in clause.detail
+
+    def test_a_bench_not_yet_in_effect_changes_nothing(self, seeded, monkeypatch) -> None:
+        from tests.support.bench import file_bench
+
+        store, register, ids, dates = seeded
+        seat(store, ids, dates)
+        grade(store, register, ids, dates)
+        seed_arm_predictions(store, ids["chal"], DAY)
+        file_bench(store, ids["champ"], effective="2026-09-01", filed_on=DAY)
+        monkeypatch.setenv("CRUCIBLE_STORE", str(store.root))
+
+        assert main(["promote", "--slot", "m", "--date", DAY]) == 0
+
+        assert read_champion(store, "m").arm_id == ids["chal"]

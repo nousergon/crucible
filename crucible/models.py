@@ -545,6 +545,7 @@ JOB_VALUES: tuple[str, ...] = (
     "report",
     "explain",
     "holdout",
+    "bench",
     "migrate.history",
     "release.pin",
     "release.pin_request",
@@ -4134,6 +4135,26 @@ def _trader_evidence_json_schema_extra(schema: dict[str, object]) -> None:
     )
 
 
+class TraderEvidenceBench(_Strict):
+    """The ruled bench a run of served days was served under (`alpha-engine-config-I12024`).
+
+    Part of the run's IDENTITY, beside `champion`: a day served with the M
+    champion's alpha at weight zero is not a day served on that champion's
+    forecast, so a bench filed, re-filed or lifted ends a run of days exactly
+    as a promotion does.
+    """
+
+    key: str = Field(
+        pattern=r"^slots/[a-z]/bench\.json$",
+        description="The bench record's store key, `crucible.keys.slot_bench_key`.",
+    )
+    digest: str = Field(
+        pattern=r"^sha256:[0-9a-f]{64}$",
+        description="The record's content address (`crucible.bench.SlotBench.digest`) "
+        "when the days were served. A different digest is a different bench.",
+    )
+
+
 class TraderEvidenceDocument(_Strict):
     """`trader/evidence.json` — the trader's own record, and the gate's evidence."""
 
@@ -4184,6 +4205,16 @@ class TraderEvidenceDocument(_Strict):
         pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
         description="Wall-clock date this document was last written. Provenance only, "
         "never a key (§4.12).",
+    )
+    alpha_bench: TraderEvidenceBench | None = Field(
+        default=None,
+        description="The ruled bench (`slots/{slot}/bench.json`) every day in "
+        "`days_served` was served under, with the M champion's alpha at weight zero "
+        "by ruling. OMITTED when the days were served on the "
+        "champion's own forecast. Additive and optional, so every document written "
+        "before it existed still reads as v2; a writer omits it rather than writing "
+        "null, so a reader that predates it refuses only a benched document — the one "
+        "it could not grade.",
     )
 
     def shadow_days(self) -> list[str]:

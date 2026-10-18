@@ -2115,7 +2115,22 @@ def resolve_session(store: Any, *, trading_day: str, ctx: Any = None) -> Resolve
     that arm's shadow — and the feed is accepted only when it names the same
     champion and the same session; the key actually read is the recorded
     `eligibility_source`.
+
+    **A ruled M bench serves ZERO alpha, here and nowhere else**
+    (`alpha-engine-config-I12024`, `crucible.bench`). When
+    `slots/m/bench.json` covers ``trading_day``, the session is resolved
+    exactly as above — the M pointer must exist and name the champion the
+    bench was filed against, and that champion's predictions must exist for
+    the session, because they define the priced universe — and then every
+    name's alpha is ``0.0`` and ``alpha_source`` is the bench key. One
+    chokepoint, so the S grade, the shadow books and the traded book are
+    constructed on the same zero vector. The zero is a ruled value carried by
+    a named record, not a degenerate arm: the M feed the trader's hold-book
+    safeguard reads is untouched. A bench filed against a champion the
+    pointer no longer names RAISES: a bench is a ruling about one arm, and
+    honouring it for another would be a ruling nobody made.
     """
+    from crucible.bench import SlotBenchError, active_bench  # noqa: PLC0415 - avoids a cycle
     from crucible.documents import load_store_document  # noqa: PLC0415 - avoids a cycle
     from crucible.keys import (  # noqa: PLC0415 - avoids a cycle
         champion_key,
@@ -2139,6 +2154,18 @@ def resolve_session(store: Any, *, trading_day: str, ctx: Any = None) -> Resolve
             "M arm first; the S slot's book is constructed on its predictions."
         )
     predicted = read_arm_predictions(store, arm_id=champion, trading_day=trading_day, ctx=ctx)
+    alpha_source = arm_predictions_key(champion, trading_day)
+    bench = active_bench(store, ALPHA_SLOT, trading_day)
+    if bench is not None:
+        if bench.champion_at_bench != champion:
+            raise SlotBenchError(
+                f"{bench.key} benches {bench.champion_at_bench!r}, but {m_pointer} now names "
+                f"{champion!r}. A bench is a ruling about one arm; serving another at weight "
+                "zero, or at full weight, would honour a ruling nobody made. Re-file the "
+                "bench against the current pointer or restore the pointer it was ruled on."
+            )
+        predicted = dict.fromkeys(predicted, 0.0)
+        alpha_source = bench.key
 
     u_pointer = champion_key("u")
     u_champion = (
@@ -2184,7 +2211,7 @@ def resolve_session(store: Any, *, trading_day: str, ctx: Any = None) -> Resolve
         trading_day=trading_day,
         predicted=predicted,
         cut=cut,
-        alpha_source=arm_predictions_key(champion, trading_day),
+        alpha_source=alpha_source,
         eligibility_source=eligibility_source,
     )
 
@@ -2263,12 +2290,20 @@ def re_resolve_session(store: Any, *, recorded: ResolvedSession) -> ResolvedSess
     slot/session check). A source this reader does not recognise raises, and
     :func:`_attest` records that as reduced COVERAGE — `PARTIAL`, a refusal —
     never as a clean pass.
+
+    A session resolved under a ruled M bench (`alpha_source` is the bench key,
+    `alpha-engine-config-I12024`) re-reads the bench: it must still cover the
+    session, and the alpha is zero by ruling over the priced universe of the
+    champion the bench names. A bench re-filed against another champion
+    re-reads THAT champion's universe — a different input, measured as one.
     """
+    from crucible.bench import active_bench  # noqa: PLC0415 - avoids a cycle
     from crucible.documents import load_store_document  # noqa: PLC0415 - avoids a cycle
     from crucible.keys import (  # noqa: PLC0415 - avoids a cycle
         ARM_PREDICTIONS_PREFIX,
         arm_id_from_segment,
         shadow_key,
+        slot_bench_key,
         universe_members_key,
     )
     from crucible.slots.cycle import MissingArtifactError  # noqa: PLC0415 - avoids a cycle
@@ -2276,15 +2311,27 @@ def re_resolve_session(store: Any, *, recorded: ResolvedSession) -> ResolvedSess
 
     day = recorded.trading_day
     alpha_source = recorded.alpha_source
-    segment = alpha_source.removeprefix(ARM_PREDICTIONS_PREFIX).removesuffix(f"/{day}.json")
-    m_arm = arm_id_from_segment(segment) if segment and "/" not in segment else None
-    if m_arm is None or arm_predictions_key(m_arm, day) != alpha_source:
-        raise MissingArtifactError(
-            f"session {day} recorded alpha_source {alpha_source!r}, which is not an "
-            "arm-predictions key for that session; the attestation cannot re-read a "
-            "source it cannot name."
+    if alpha_source == slot_bench_key(ALPHA_SLOT):
+        bench = active_bench(store, ALPHA_SLOT, day)
+        if bench is None:
+            raise MissingArtifactError(
+                f"session {day} recorded its alpha as benched ({alpha_source}), and no bench "
+                "at that key covers the session any more; the attestation cannot re-read a "
+                "ruling that is no longer filed."
+            )
+        predicted = dict.fromkeys(
+            read_arm_predictions(store, arm_id=bench.champion_at_bench, trading_day=day), 0.0
         )
-    predicted = read_arm_predictions(store, arm_id=m_arm, trading_day=day)
+    else:
+        segment = alpha_source.removeprefix(ARM_PREDICTIONS_PREFIX).removesuffix(f"/{day}.json")
+        m_arm = arm_id_from_segment(segment) if segment and "/" not in segment else None
+        if m_arm is None or arm_predictions_key(m_arm, day) != alpha_source:
+            raise MissingArtifactError(
+                f"session {day} recorded alpha_source {alpha_source!r}, which is not an "
+                "arm-predictions key for that session; the attestation cannot re-read a "
+                "source it cannot name."
+            )
+        predicted = read_arm_predictions(store, arm_id=m_arm, trading_day=day)
 
     eligibility_source = recorded.eligibility_source
     cut: set[str] | None

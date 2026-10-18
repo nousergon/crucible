@@ -128,6 +128,10 @@ def _minimal_argv(job: str) -> list[str]:
             "--summary",
             "no findings",
         ]
+    if job == "bench":
+        # alpha-engine-config-I12024: the slot is the one flag argparse
+        # requires; the ruling flags are refused by the handler, by name.
+        argv += ["--slot", "m"]
     if job == "acceptance.publish":
         # The reading is the whole input: this job records a measurement, it
         # does not take one, so there is nothing to default.
@@ -214,6 +218,10 @@ class TestJobSurface:
             # matter (principles.md §3.2), so a clock able to invoke it would
             # be an automation holding an authority reserved to a human.
             "holdout",
+            # alpha-engine-config-I12024 (Brian's ruling of 2026-10-18): the
+            # ruled bench record. Never scheduled, for the reason `holdout`
+            # gives — benching a slot is a human ruling.
+            "bench",
             "migrate.history",
             "release.pin",
             # alpha-engine-config-I9898: the repair for a release published
@@ -737,6 +745,14 @@ class TestDryRunNeverWrites:
             "form refuses before it reaches the store unless --ruling and --reason are "
             "given, which no shared row supplies. Both are asserted directly by "
             "tests/test_holdout.py::TestTheCli"
+        ),
+        "bench": (
+            "refuses before it reaches the store's write path unless every ruling flag "
+            "is given and an M champion pointer exists, which no shared fresh-store row "
+            "supplies; its dry-run property (the record is built and validated, printed, "
+            "and the store gains no key at all) is asserted directly by "
+            "tests/test_slot_bench.py::TestTheWriter::"
+            "test_a_dry_run_prints_the_record_and_writes_nothing"
         ),
         "smoke": "needs a published release publishing through crucible.deploy's own flow",
         "release.lock": (

@@ -602,6 +602,7 @@
         "report",
         "explain",
         "holdout",
+        "bench",
         "migrate.history",
         "release.pin",
         "release.pin_request",

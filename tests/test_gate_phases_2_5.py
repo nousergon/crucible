@@ -2678,6 +2678,78 @@ class TestTheTraderIsGradedThroughItsContractOrNotAtAll:
         assert "2 trading day(s) served" in clause.detail
 
 
+class TestABenchedWeekNamesItsBench:
+    """`alpha-engine-config-I12024`: days served with the M alpha benched at
+    zero weight are counted on the champion AND the bench, and the reading
+    says so. The bench the days were served under must still be the one filed;
+    a re-filed or lifted bench is a new identity, never a carried count."""
+
+    @staticmethod
+    def _benched(store: LocalStore, days: list[str]) -> dict:
+        from crucible.bench import read_slot_bench
+        from tests.support.bench import file_bench
+
+        file_bench(store, TRADER_CHAMPION, effective=days[0])
+        bench = read_slot_bench(store, "m")
+        assert bench is not None
+        evidence = _trader_evidence(days)
+        evidence["alpha_bench"] = {"key": bench.key, "digest": bench.digest}
+        return evidence
+
+    def test_a_benched_week_is_met_and_names_the_bench(self, store: LocalStore) -> None:
+        _put(store, keys_module.TRADER_EVIDENCE_KEY, self._benched(store, TRADER_WEEK))
+        clause = gate_module._clause_trader_week_on_v2_champion(store, _window(2))
+        assert clause.met, clause.detail
+        assert (
+            f"on v2 champion {TRADER_CHAMPION} benched at weight 0 "
+            f"({keys_module.slot_bench_key('m')})"
+        ) in clause.detail
+        assert "no lift" in clause.detail
+        assert keys_module.slot_bench_key("m") in clause.evidence
+
+    def test_a_short_benched_week_is_unmet_and_names_the_bench(self, store: LocalStore) -> None:
+        _put(store, keys_module.TRADER_EVIDENCE_KEY, self._benched(store, TRADER_WEEK[:2]))
+        clause = gate_module._clause_trader_week_on_v2_champion(store, _window(2))
+        assert not clause.met
+        assert "2 trading day(s) served" in clause.detail
+        assert "benched at weight 0" in clause.detail
+
+    def test_days_under_a_re_filed_bench_are_not_counted(self, store: LocalStore) -> None:
+        from tests.support.bench import file_bench
+
+        _put(store, keys_module.TRADER_EVIDENCE_KEY, self._benched(store, TRADER_WEEK))
+        file_bench(store, TRADER_CHAMPION, effective=TRADER_WEEK[0], reexam_date="2026-12-18")
+        clause = gate_module._clause_trader_week_on_v2_champion(store, _window(2))
+        assert not clause.met and not clause.unmeasurable
+        assert "a new identity" in clause.detail
+
+    def test_days_under_a_lifted_bench_are_not_counted(self, store: LocalStore) -> None:
+        _put(store, keys_module.TRADER_EVIDENCE_KEY, self._benched(store, TRADER_WEEK))
+        (store.root / keys_module.slot_bench_key("m")).unlink()
+        clause = gate_module._clause_trader_week_on_v2_champion(store, _window(2))
+        assert not clause.met
+        assert "is absent" in clause.detail
+
+    def test_a_bench_that_no_longer_validates_is_unmet(self, store: LocalStore) -> None:
+        _put(store, keys_module.TRADER_EVIDENCE_KEY, self._benched(store, TRADER_WEEK))
+        store.put_bytes(keys_module.slot_bench_key("m"), b"{}")
+        clause = gate_module._clause_trader_week_on_v2_champion(store, _window(2))
+        assert not clause.met and not clause.unmeasurable
+        assert "slot_bench.v1" in clause.detail
+
+    def test_a_bench_the_gate_cannot_read_is_unmeasurable(
+        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _put(store, keys_module.TRADER_EVIDENCE_KEY, self._benched(store, TRADER_WEEK))
+
+        def denied(_store, _slot):
+            raise PermissionError("AccessDenied on slots/m/bench.json")
+
+        monkeypatch.setattr(gate_module, "read_slot_bench", denied)
+        clause = gate_module._clause_trader_week_on_v2_champion(store, _window(2))
+        assert clause.unmeasurable and not clause.met
+
+
 class TestAShadowSessionIsAServedDay:
     """`alpha-engine-config-I11545`, Brian's ruling 2 of 2026-09-24: a shadow
     session (champion resolved, book built, day recorded, no order sent) counts

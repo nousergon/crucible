@@ -215,6 +215,36 @@ components:
     dispatch: null
     deadline: null
 
+  bench:
+    description: >-
+      File a ruled bench record (alpha-engine-config-I12024): a slot served at
+      zero weight from a named session on, recording "no lift", under a named
+      human ruling. Refuses a record missing any ruling field and writes
+      nothing then; a valid filing writes slots/{slot}/bench.json.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:outputs[slots/{slot}/bench.json]
+      # A bench records a ruling; it grades nothing. Declared null rather than
+      # omitted, same as holdout's outcome.
+      outcome: null
+    log_location: cloudwatch:/crucible/bench
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/runs
+    artifact_retention: forever
+    # Grades this job's FAILURES only, the same declaration holdout makes: a
+    # bench is a ruling with no cadence, so its absence is never a defect.
+    absence_watched_by: alerts.sweep
+    # NEVER scheduled. Benching a slot is a human ruling, so there is no cadence
+    # to keep and no absence of it that is a defect; a deadline would page
+    # because nobody benched a slot this week.
+    schedule: null
+    dispatch: null
+    deadline: null
+
   experiment.new:
     description: Register an immutable arm from a recipe spec.
     lifecycle: ACTIVE

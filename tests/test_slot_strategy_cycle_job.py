@@ -1717,3 +1717,96 @@ portfolio:
   conviction_gate_min_names: 3
   book_notional_usd: 1000000.0
 """
+
+
+class TestARuledMBenchServesZeroAlphaAtOneChokepoint:
+    """`alpha-engine-config-I12024` (Brian's ruling of 2026-10-18, option (a)):
+    the M slot benched at zero weight, recording "no lift".
+
+    `resolve_session` is the one place S's construction inputs are resolved,
+    so the S grade and the traded book stay the same object. The bench keeps
+    the M pointer and its feed in force — the priced universe is still the
+    champion's — and zeroes only the alpha, under a named record."""
+
+    @staticmethod
+    def _bench(store, days, *, champion: str = M_CHAMPION, effective_index: int = -3):
+        from tests.support.bench import file_bench
+
+        return file_bench(
+            store,
+            champion,
+            effective=days[effective_index].isoformat(),
+            filed_on=days[0].isoformat(),
+        )
+
+    def test_a_covered_session_serves_zero_alpha_named_by_the_bench(self, world) -> None:
+        from crucible.keys import slot_bench_key
+
+        store, _settings, _root, days = world
+        day = days[-1].isoformat()
+        unbenched = resolve_session(store, trading_day=day)
+        self._bench(store, days)
+
+        benched = resolve_session(store, trading_day=day)
+
+        assert benched.alpha_source == slot_bench_key("m")
+        assert set(benched.alpha_hat) == {0.0}
+        assert any(a != 0.0 for a in unbenched.alpha_hat), "the fixture's alpha is not zero"
+        # The priced universe and the cut are the champion's, unchanged.
+        assert benched.tickers == unbenched.tickers
+        assert benched.eligibility == unbenched.eligibility
+        assert benched.eligibility_source == unbenched.eligibility_source
+
+    def test_a_session_before_the_bench_takes_effect_is_resolved_as_it_was(self, world) -> None:
+        store, _settings, _root, days = world
+        day = days[0].isoformat()
+        before = resolve_session(store, trading_day=day)
+        self._bench(store, days)
+        assert resolve_session(store, trading_day=day) == before
+
+    def test_a_bench_ruled_on_another_arm_is_refused(self, world) -> None:
+        from crucible.bench import SlotBenchError
+
+        store, _settings, _root, days = world
+        self._bench(store, days, champion="m:other:cccccccccccc")
+        with pytest.raises(SlotBenchError, match="a ruling nobody made"):
+            resolve_session(store, trading_day=days[-1].isoformat())
+
+    def test_the_attestation_re_reads_the_bench(self, world) -> None:
+        from crucible.keys import slot_bench_key
+
+        store, _settings, _root, days = world
+        self._bench(store, days)
+        recorded = resolve_session(store, trading_day=days[-1].isoformat())
+        assert re_resolve_session(store, recorded=recorded) == recorded
+
+        (store.root / slot_bench_key("m")).unlink()
+        with pytest.raises(MissingArtifactError, match="no longer filed"):
+            re_resolve_session(store, recorded=recorded)
+
+    def test_the_s_cycle_records_and_grades_on_the_benched_vector(self, world) -> None:
+        """The whole S path, end to end: produce records the bench as each
+        covered session's alpha source, and the grade constructs on the zero
+        vector and still files `ok` with a passing attestation."""
+        from crucible.keys import slot_bench_key
+
+        store, settings, _root, days = world
+        self._bench(store, days)
+        _run_produce(store, settings, days)
+        arm_id = registration_specs(load_strategy_slot(strategy_dir=settings.strategy_dir))[
+            0
+        ].arm_id
+        sources = {
+            day: load_store_document(store, session_inputs_key(arm_id, day.isoformat()))[
+                "alpha_source"
+            ]
+            for day in days
+        }
+        assert [sources[d] == slot_bench_key("m") for d in days] == [False] * 4 + [True] * 3
+
+        result, manifest, _ctx = _run_grade(store, settings)
+
+        assert manifest["status"] == "ok", manifest.get("reason")
+        graded = result["strategy_grades"][arm_id]
+        assert graded["attestation"] == "PASS", graded
+        assert graded["attestation_mean_delta"] == 0.0, graded

@@ -40,6 +40,13 @@ from dataclasses import dataclass
 
 from crucible import __version__, morning, track_c, track_e, track_f  # track-C, track-E, track-F
 from crucible.acceptance_publish import ACCEPTANCE_PUBLISH_JOB, acceptance_publish_handler
+from crucible.bench import (
+    BENCH_JOB,
+    SLOT_BENCH_SCHEMA_VERSION,
+    active_bench,
+    add_bench_arguments,
+    bench_handler,
+)
 from crucible.calendar import resolve_trading_day
 from crucible.fault_probe import FAULT_PROBE_JOB, fault_probe_handler
 from crucible.faults import FAULT_RECORD_JOB, record_fault
@@ -301,6 +308,12 @@ def _promote(args: argparse.Namespace) -> int:
         # so acting on it would move the pointer backwards in time over a
         # promotion a later cycle already made.
         superseded_by = _newer_pointer_as_of(store, args.slot, as_of)
+        # `alpha-engine-config-I12024`: a slot benched by ruling still DECIDES
+        # — the graded cycle is read and the decision taken, so the verdict is
+        # on the record — but writes nothing. The pointer the trader's
+        # served-day clock is counted on stays where the ruling found it, and
+        # the `pointer_moved` row below names the bench as its reason.
+        bench = active_bench(store, args.slot, as_of)
         # `alpha-engine-config-I10679`: the cycle `experiment.grade` computed
         # an hour earlier, read back rather than recomputed — the pointer
         # decision, the retirement verdicts and the serving preconditions
@@ -313,7 +326,9 @@ def _promote(args: argparse.Namespace) -> int:
             register=inputs.register,
             cycle=graded_cycle,
             pointer_etag=inputs.pointer_etag,
-            store=None if args.dry_run or superseded_by is not None else store,
+            store=(
+                None if args.dry_run or superseded_by is not None or bench is not None else store
+            ),
             manifest_key=promote_manifest,
             run_id=ctx.run_id,
             code_sha=code_sha,
@@ -348,6 +363,38 @@ def _promote(args: argparse.Namespace) -> int:
                         f"(moved={result.decision.moved}) and wrote nothing"
                     ),
                     "source_path": champion_key(args.slot),
+                    "last_updated_utc": ctx.started.astimezone(dt.UTC).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"
+                    ),
+                }
+            )
+            return
+        if bench is not None:
+            # A verdict-backed NON-promotion: the cycle was graded and read,
+            # the pointer was held, and the reason names the ruling that held
+            # it. The phase-3 `m_promotion_or_verdict_backed_non_promotion`
+            # clause reads exactly this row through its existing reader.
+            ctx.record_input(
+                bench.key, store.get_bytes(bench.key), schema_version=SLOT_BENCH_SCHEMA_VERSION
+            )
+            ctx.record_metric(
+                {
+                    "name": "pointer_moved",
+                    "module": "crucible.promote",
+                    "metric_type": "gauge",
+                    "value": 0.0,
+                    "unit": "count",
+                    "n_floor": 1,
+                    "status": result.decision.status,
+                    "status_reason": (
+                        f"slot benched at zero weight by ruling ({bench.headline()}); no "
+                        f"lift. The pointer is held on {bench.champion_at_bench} by "
+                        f"{bench.key}; the graded cycle decided "
+                        f"{result.decision.status!r} (moved={result.decision.moved}"
+                        f"{': ' + result.decision.reason if result.decision.reason else ''})"
+                        " and wrote nothing"
+                    ),
+                    "source_path": arena_cycle_key(args.slot, as_of),
                     "last_updated_utc": ctx.started.astimezone(dt.UTC).strftime(
                         "%Y-%m-%dT%H:%M:%SZ"
                     ),
@@ -740,6 +787,14 @@ JOBS: dict[str, JobSpec] = {
         "Read the sealed holdout's seal state, or unseal it under a ruling",
         False,
     ),
+    # `alpha-engine-config-I12024` (Brian's ruling of 2026-10-18, option (a)).
+    # NOT scheduled, for the reason `holdout` gives: benching a slot is a
+    # ruling, and a clock that could file one would hold a human's authority.
+    BENCH_JOB: JobSpec(
+        BENCH_JOB,
+        "File a ruled bench: a slot served at zero weight, recording no lift",
+        False,
+    ),
     # SCHEDULED as of `alpha-engine-config-I10961` deliverable 4: the import
     # is a weekly arc stage (`components.yaml`, 14:30), so the deferral that
     # left M out has a trigger rather than waiting on an operator remembering.
@@ -956,6 +1011,7 @@ HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
     # track-C handlers live in crucible/track_c.py so three tracks can land
     # code in parallel without editing one another's lines.
     HOLDOUT_JOB: holdout_handler,
+    BENCH_JOB: bench_handler,
     "release.pin": track_c.release_pin_handler,
     "release.pin_request": track_c.release_pin_request_handler,
     "release.pin_apply": track_c.release_pin_apply_handler,
@@ -1257,6 +1313,8 @@ def build_parser() -> argparse.ArgumentParser:
             )
         if spec.name == HOLDOUT_JOB:
             add_holdout_arguments(sub)
+        if spec.name == BENCH_JOB:
+            add_bench_arguments(sub)
         if spec.name == FAULT_RECORD_JOB:
             sub.add_argument(
                 "--fault",
