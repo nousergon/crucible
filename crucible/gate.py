@@ -63,6 +63,7 @@ from crucible.alerts import (
     pages_in_range,
 )
 from crucible.attribution import manifest_records_factor_attribution
+from crucible.bench import SlotBenchError, read_slot_bench
 from crucible.calendar import (
     TRADING_DAYS_PER_WEEK,
     is_trading_day,
@@ -7283,10 +7284,13 @@ def _phase2(
 
 def _promote_non_promotion(
     store: Store, slot: str, window: list[dt.date]
-) -> tuple[bool, list[str], list[str], list[str], list[str]]:
+) -> tuple[bool, list[str], list[str], list[str], list[str], list[str]]:
     """Whether a verdict-backed NON-promotion was filed for ``slot``.
 
-    Returns (found, evidence, problems, access_problems, silent). Since
+    Returns (found, evidence, problems, access_problems, silent, reasons) —
+    ``reasons`` being each found non-promotion's `status_reason`, by day, so
+    the reading SAYS why the pointer was held (a ruled bench names itself
+    there, `alpha-engine-config-I12024`). Since
     `alpha-engine-config-I9759`, `promote` is a slot-scoped arc stage: four
     slots, one job name, one trading day, four writers — the
     `crucible.keys.manifest_key` discriminator case — so each slot files its
@@ -7307,6 +7311,7 @@ def _promote_non_promotion(
     problems: list[str] = []
     access: list[str] = []
     silent: list[str] = []
+    reasons: list[str] = []
     found = False
     for day in window:
         key = manifest_key("promote", day.isoformat(), discriminator=slot)
@@ -7343,6 +7348,7 @@ def _promote_non_promotion(
                 continue
             if str(metric.get("status_reason") or "").strip():
                 found = True
+                reasons.append(f"{day.isoformat()}: {str(metric['status_reason']).strip()}")
             else:
                 problems.append(
                     f"{key}: the `pointer_moved` metric for slot {slot!r} carries no "
@@ -7354,7 +7360,7 @@ def _promote_non_promotion(
                 f"{key}: read `ok` but carries no `pointer_moved` metric whose "
                 f"`source_path` is {wanted}"
             )
-    return found, evidence, problems, access, silent
+    return found, evidence, problems, access, silent, reasons
 
 
 def _clause_slot_promotion_or_non_promotion(
@@ -7426,6 +7432,7 @@ def _clause_slot_promotion_or_non_promotion(
         promote_problems,
         promote_access,
         promote_silent,
+        promote_reasons,
     ) = _promote_non_promotion(store, slot, window)
     evidence.extend(promote_evidence)
     problems.extend(promote_problems)
@@ -7436,7 +7443,8 @@ def _clause_slot_promotion_or_non_promotion(
             requirement,
             True,
             f"no promotion, and a verdict-backed non-promotion was filed for slot {slot!r} "
-            f"over {window[0].isoformat()}..{window[-1].isoformat()}",
+            f"over {window[0].isoformat()}..{window[-1].isoformat()} (latest "
+            f"{promote_reasons[-1]})",
             tuple(evidence),
         )
     if access and not problems:
@@ -8841,6 +8849,15 @@ def _clause_trader_week_on_v2_champion(store: Store, window: list[dt.date]) -> C
     2026-09-24 on `alpha-engine-config-I11545` (ruling 2). The reading names how
     many of the counted days were shadow sessions, so a MET on a week in which
     no order left the trader cannot be mistaken for a week of routed ones.
+
+    **A ruled M bench is part of the identity** (`alpha-engine-config-I12024`).
+    When the evidence records the bench its days were served under
+    (`alpha_bench`), the reading names it — "on v2 champion X benched at weight
+    0 (slots/m/bench.json)" — and the bench filed NOW must be that same record
+    (the same digest). Days counted under a bench that has since been re-filed
+    or lifted were served under a ruling that no longer stands, and read UNMET
+    until the trader restarts its count on the one that does. A ruled record,
+    never a cleared one: the bench changes what is counted on, never the count.
     """
     name = "trader_one_week_on_v2_champion"
     requirement = (
@@ -8890,22 +8907,47 @@ def _clause_trader_week_on_v2_champion(store: Store, window: list[dt.date]) -> C
     ]
     shadow = sum(1 for day in served if evidence.session_modes[day] == "shadow")
     modes = f"{shadow} shadow, {len(served) - shadow} live"
+    on = f"v2 champion {evidence.champion}"
+    keys: tuple[str, ...] = (key,)
+    if evidence.alpha_bench is not None:
+        recorded = evidence.alpha_bench
+        on = f"{on} benched at weight 0 ({recorded.key})"
+        keys = (key, recorded.key)
+        try:
+            live = read_slot_bench(store, evidence.slot)
+        except PermissionError as exc:
+            return _unmeasurable(name, requirement, str(exc), keys)
+        except SlotBenchError as exc:
+            return Clause(name, requirement, False, str(exc), keys)
+        if live is None or live.digest != recorded.digest:
+            now = "is absent" if live is None else f"is {live.digest}"
+            return Clause(
+                name,
+                requirement,
+                False,
+                f"{key}: {len(served)} trading day(s) served on {on}, but those days were "
+                f"served under bench {recorded.digest} and the bench filed now {now}. A "
+                "re-filed or lifted bench is a new identity; the trader restarts the count "
+                "on its next session",
+                keys,
+            )
+        on = f"{on}: {live.headline()}"
     if len(served) < TRADING_DAYS_PER_WEEK:
         return Clause(
             name,
             requirement,
             False,
-            f"{key}: {len(served)} trading day(s) served on v2 champion {evidence.champion} "
+            f"{key}: {len(served)} trading day(s) served on {on} "
             f"({modes}), {TRADING_DAYS_PER_WEEK} required",
-            (key,),
+            keys,
         )
     return Clause(
         name,
         requirement,
         True,
-        f"{key}: {len(served)} trading day(s) served on v2 champion {evidence.champion} "
+        f"{key}: {len(served)} trading day(s) served on {on} "
         f"({modes}; a shadow session counts as served by Brian's 2026-09-24 ruling)",
-        (key,),
+        keys,
     )
 
 

@@ -1,10 +1,48 @@
 {
   "$comment": "trading_days MUST equal the number of distinct entries in days_served, days_served MUST be strictly increasing, and session_modes MUST key exactly the days in days_served. JSON Schema cannot state any of the three, so a consumer validating against this file alone must check them itself.",
+  "$defs": {
+    "TraderEvidenceBench": {
+      "additionalProperties": false,
+      "description": "The ruled bench a run of served days was served under (`alpha-engine-config-I12024`).\n\nPart of the run's IDENTITY, beside `champion`: a day served with the M\nchampion's alpha at weight zero is not a day served on that champion's\nforecast, so a bench filed, re-filed or lifted ends a run of days exactly\nas a promotion does.",
+      "properties": {
+        "digest": {
+          "description": "The record's content address (`crucible.bench.SlotBench.digest`) when the days were served. A different digest is a different bench.",
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Digest",
+          "type": "string"
+        },
+        "key": {
+          "description": "The bench record's store key, `crucible.keys.slot_bench_key`.",
+          "pattern": "^slots/[a-z]/bench\\.json$",
+          "title": "Key",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "digest"
+      ],
+      "title": "TraderEvidenceBench",
+      "type": "object"
+    }
+  },
   "$id": "https://github.com/nousergon/crucible/schemas/trader_evidence.v2.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "The trader's rolling account of the trading days it served on the v2 champion, written at the key `crucible.keys.TRADER_EVIDENCE_KEY` and read by the phase-4 gate clause `trader_one_week_on_v2_champion`. Cumulative, not dated: the question the clause asks is cumulative, and a dated artifact would make the gate reconstruct the count by listing \u2014 a second implementation of a number the trader already knows. additionalProperties: false because a field this reader does not understand is a field the producer expected it to act on.",
   "properties": {
+    "alpha_bench": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TraderEvidenceBench"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "The ruled bench (`slots/{slot}/bench.json`) every day in `days_served` was served under, with the M champion's alpha at weight zero by ruling. OMITTED when the days were served on the champion's own forecast. Additive and optional, so every document written before it existed still reads as v2; a writer omits it rather than writing null, so a reader that predates it refuses only a benched document \u2014 the one it could not grade."
+    },
     "calendar_date": {
       "description": "Wall-clock date this document was last written. Provenance only, never a key (\u00a74.12).",
       "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",

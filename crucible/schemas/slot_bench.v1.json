@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nousergon.dev/crucible/schemas/slot_bench.v1.json",
+  "title": "slot_bench.v1",
+  "description": "A ruled bench record (alpha-engine-config-I12024), written at `slots/{slot}/bench.json` by `crucible bench` under its own run manifest. It records that a human ruling took a slot's contribution to ZERO WEIGHT and that the slot showed NO LIFT, from `effective_trading_day` on. It is a ruled record, never a cleared one: a reader that honours it still prints the failed reading it stands beside, and the record names the ruling (`ruled_by`, `ruled_at`, `ruling_ref`, `tracker`) and the evidence it was ruled on. Only the M slot can be benched in v1: M's predictions are the S slot's alpha vector, so a zero weight there has exactly one meaning (`crucible.slots.strategy.resolve_session` serves a zero alpha vector), and no other slot has a consumer for a weight.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "slot",
+    "weight",
+    "disposition",
+    "ruled_by",
+    "ruled_at",
+    "ruling_ref",
+    "tracker",
+    "reason",
+    "evidence",
+    "champion_at_bench",
+    "effective_trading_day",
+    "reexam_date",
+    "filed_by",
+    "filed_at_utc"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "slot_bench.v1"
+    },
+    "slot": {
+      "enum": ["m"],
+      "description": "The benched slot. Closed to `m` in v1: see the document description."
+    },
+    "weight": {
+      "const": 0,
+      "description": "The slot's weight while benched. Zero, by ruling, and the only value v1 can record: a partial weight would be a sizing decision, not a bench."
+    },
+    "disposition": {
+      "const": "no_lift",
+      "description": "What the ruling recorded about the slot: it showed no lift over its controls."
+    },
+    "ruled_by": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100,
+      "description": "Who ruled. A bench nobody ruled is refused by the writer before this document is built."
+    },
+    "ruled_at": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(:[0-9]{2})?Z$",
+      "description": "UTC instant of the ruling, ISO-8601 with a `Z`."
+    },
+    "ruling_ref": {
+      "type": "string",
+      "pattern": "^https://[^\\s]+$",
+      "maxLength": 500,
+      "description": "An https link to the ruling itself (the tracker comment that records it), so a reader can read the words that were ruled."
+    },
+    "tracker": {
+      "type": "string",
+      "pattern": "^alpha-engine-config-I[1-9][0-9]*$",
+      "description": "The tracked issue the ruling sits on, in the fleet reference format."
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500,
+      "description": "The no-lift finding in one sentence. Printed by every reader that honours the bench (promote, the board, the gate)."
+    },
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 20,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 500
+      },
+      "description": "What the ruling was made on: https links (the confirmation PR, the experiment record) and store keys (the promote run that held the pointer). At least one: a no-lift finding with no evidence is an opinion."
+    },
+    "champion_at_bench": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "The slot's champion pointer `arm_id` when the bench was filed, read from the store by the writer. The pointer and its feed stay in force while benched: the priced universe is still that arm's, only its alpha is zero. A pointer that has since moved is refused by every reader rather than silently re-benched."
+    },
+    "effective_trading_day": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+      "description": "First NYSE session the bench applies to (4.12). Sessions before it resolve exactly as they did, so history and backfills are point-in-time."
+    },
+    "reexam_date": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+      "description": "Calendar date the ruling is due to be re-examined. Rendered on the board; the bench does not lapse on it."
+    },
+    "filed_by": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "Who ran `crucible bench`."
+    },
+    "filed_at_utc": {
+      "type": "string",
+      "minLength": 20,
+      "maxLength": 32,
+      "description": "Wall-clock UTC instant of the filing, ISO-8601. Provenance, never a key (4.12)."
+    }
+  }
+}

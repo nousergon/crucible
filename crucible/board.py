@@ -54,6 +54,7 @@ from typing import Any
 import yaml
 from pydantic import ValidationError
 
+from crucible.bench import BENCHABLE_SLOTS, SlotBenchError, read_slot_bench
 from crucible.calendar import resolve_trading_day
 from crucible.components import Component, load_registry
 from crucible.console.classify import STATES as COMPONENT_STATES
@@ -66,7 +67,7 @@ from crucible.features.depth import (
     check_feature_layer_provenance,
 )
 from crucible.gate import LADDER_STATES, STANDING_SLOS, Ladder, PhaseRow
-from crucible.keys import ALERTS_ROOT, reopen_record_key
+from crucible.keys import ALERTS_ROOT, champion_key, reopen_record_key, slot_bench_key
 from crucible.models import BoardCurrentDocument, BoardDeclarationRow
 from crucible.store import Store
 
@@ -1068,6 +1069,7 @@ def build_board(
 
     touch = human_touch if human_touch is not None else _read_human_touch_count(moment.date())
     rows.extend(_standing_rows(store, day, touch))
+    rows.extend(_slot_bench_rows(store))
 
     for row_id, declaration in decl.cutover.items():
         rows.append(_declared_row(store, f"cutover:{row_id}", declaration, day))
@@ -1780,6 +1782,76 @@ def _schedule_rows(ladder: Ladder | None, trading_day: str) -> list[BoardRow]:
                     f"Tracker: {phase.tracker} ({phase.tracker_url})."
                 ),
                 last_read=phase_row.read_on if phase_row is not None else None,
+            )
+        )
+    return rows
+
+
+def _slot_bench_rows(store: Store) -> list[BoardRow]:
+    """`alpha-engine-config-I12024`: one grey `DECLARED_OFF` row per ruled slot bench,
+    `cutover:slot_m_bench`.
+
+    "M benched at zero weight — no lift (ruled 2026-10-18 …)". A decision, so
+    grey and never red: rendering a ruling as a defect is how a board trains
+    its reader to ignore it (the `DECLARED_OFF` note above). The row exists
+    only while a bench is FILED — a slot nobody benched has nothing to
+    declare, and inventing a row for it would be a claim nobody ruled.
+
+    A record that is filed and cannot be honoured is the opposite of a
+    decision, and red: `UNMEASURABLE` when it does not read as a bench,
+    `UNMET` when it benches an arm the pointer no longer names. The readers
+    that serve the book (`crucible.slots.strategy.resolve_session`) refuse
+    both loudly too.
+    """
+    rows: list[BoardRow] = []
+    for slot in BENCHABLE_SLOTS:
+        key = slot_bench_key(slot)
+        try:
+            bench = read_slot_bench(store, slot)
+        except (PermissionError, SlotBenchError) as exc:
+            state, detail = (
+                "UNMEASURABLE",
+                f"{key} is filed and cannot be read as a bench: {exc}. Every reader that "
+                "serves the book refuses it too, so the slot is neither benched nor served "
+                "until it is re-filed.",
+            )
+        else:
+            if bench is None:
+                continue
+            pointer = read_store_document(store, champion_key(slot))
+            named = (pointer.document or {}).get("arm_id")
+            if named != bench.champion_at_bench:
+                state, detail = (
+                    "UNMET",
+                    f"{key} benches {bench.champion_at_bench!r} but {champion_key(slot)} "
+                    f"names {named!r}"
+                    f"{' (' + pointer.problem + ')' if pointer.problem else ''}. The S "
+                    "slot's construction refuses a bench ruled on another arm, so no book "
+                    "is built until the bench or the pointer is put back in agreement.",
+                )
+            else:
+                state = "DECLARED_OFF"
+                evidence = "; ".join(str(e) for e in bench.document["evidence"])
+                detail = f"{bench.describe()} Evidence: {evidence}."
+        rows.append(
+            BoardRow(
+                # `cutover`, not a new `slot` source: the bench is a phase-4
+                # cutover ruling, and every source in `SOURCES` must contribute
+                # a row on every render — a source that appears only while a
+                # bench is filed would read as unwired the rest of the time.
+                id=f"cutover:slot_{slot}_bench",
+                source="cutover",
+                section="phase 4 — cutover",
+                title=f"slot {slot.upper()} benched at zero weight by ruling, recording no lift",
+                state=state,
+                detail=detail,
+                surface="crucible board",
+                artifact=key,
+                means_when_red=(
+                    "a bench record is filed and does not validate, or names a champion the "
+                    "pointer no longer names — the S slot's construction refuses to serve "
+                    "either way, so no book is built until the record is re-filed"
+                ),
             )
         )
     return rows

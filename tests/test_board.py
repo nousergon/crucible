@@ -2210,3 +2210,58 @@ class TestTheGateReadingsFreshnessRow:
         row = self._row(store)
         assert "{" not in row.artifact and "}" not in row.artifact
         assert row.artifact.startswith("crucible/gates")
+
+
+class TestARuledBenchIsADeclaredDecision:
+    """`alpha-engine-config-I12024`: "M benched at zero weight — no lift
+    (ruled 2026-10-18)" is a grey `DECLARED_OFF` row — a decision rendered as
+    a decision — while a bench that cannot be honoured is red."""
+
+    CHAMPION = "m:residual_momentum:5349050484f6"
+
+    def _seat(self, store, arm_id: str) -> None:
+        from crucible.keys import champion_key
+
+        store.put_bytes(
+            champion_key("m"),
+            json.dumps(
+                {"schema_version": "champion_pointer.v1", "slot": "m", "arm_id": arm_id}
+            ).encode(),
+        )
+
+    @staticmethod
+    def _row(board):
+        rows = [r for r in board.rows if r.id == "cutover:slot_m_bench"]
+        return rows[0] if rows else None
+
+    def test_no_bench_filed_means_no_row(self, store) -> None:
+        assert self._row(build_board(store)) is None
+
+    def test_a_filed_bench_is_a_grey_declared_off_row(self, store) -> None:
+        from tests.support.bench import file_bench
+
+        self._seat(store, self.CHAMPION)
+        file_bench(store, self.CHAMPION, effective="2026-10-22", filed_on="2026-10-19")
+        row = self._row(build_board(store))
+        assert row is not None
+        assert row.state == "DECLARED_OFF" and not row.red
+        assert row.source == "cutover"
+        assert row.artifact == "slots/m/bench.json"
+        assert "M benched at zero weight — no lift (ruled 2026-10-18" in row.detail
+        assert "re-exam 2026-11-20" in row.detail
+        assert "pull/12406" in row.detail, "the failed confirmation it was ruled on"
+
+    def test_a_bench_ruled_on_another_arm_is_red(self, store) -> None:
+        from tests.support.bench import file_bench
+
+        self._seat(store, "m:other:cccccccccccc")
+        file_bench(store, self.CHAMPION, effective="2026-10-22", filed_on="2026-10-19")
+        row = self._row(build_board(store))
+        assert row is not None and row.state == "UNMET"
+        assert "m:other:cccccccccccc" in row.detail
+
+    def test_a_bench_that_does_not_validate_is_unmeasurable(self, store) -> None:
+        store.put_bytes("slots/m/bench.json", b"{}")
+        row = self._row(build_board(store))
+        assert row is not None and row.state == "UNMEASURABLE"
+        assert "cannot be read as a bench" in row.detail

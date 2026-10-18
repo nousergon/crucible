@@ -66,6 +66,7 @@ from crucible.keys import (  # noqa: F401 - manifest_key/manifest_prefix re-expo
     manifest_prefix,
     money_path_claim_key,
     predictions_key,
+    slot_bench_key,
     strategy_holdout_key,
     trader_reconciliation_key,
 )
@@ -301,6 +302,10 @@ def read_manifest(
 MONEY_PATH_PREDICATES: tuple[Callable[[str], bool], ...] = (
     # The four champion pointers — the trader's whole read surface.
     lambda key: key in {champion_key(slot) for slot in ("u", "r", "m", "s")},
+    # A ruled slot bench (`alpha-engine-config-I12024`): it decides that the M
+    # champion's alpha reaches the book at weight ZERO, so it is as much a
+    # decision about where money goes as the pointer beside it.
+    lambda key: key in {slot_bench_key(slot) for slot in ("u", "r", "m", "s")},
     # The champion's serving feed for one trading day. Matched by rebuilding
     # the key from the day the candidate claims, so `arm_predictions/` (a
     # different artifact answering a different question, I9822) can never
