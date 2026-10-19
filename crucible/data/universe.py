@@ -58,6 +58,7 @@ from crucible.store import sha256_hex
 
 __all__ = [
     "DECLARED_UNIVERSE_SCHEMA_VERSION",
+    "DanglingUniversePointerError",
     "DeclaredUniverse",
     "MalformedUniverseError",
     "load_declared_universe",
@@ -85,6 +86,29 @@ class MalformedUniverseError(ValueError):
     source's own symbol set — that fallback is option (b) above, by the back
     door.
     """
+
+
+class DanglingUniversePointerError(FileNotFoundError):
+    """A pointer was read and names a target that does not exist.
+
+    A data-pointer fault, not a crash and not a malformed document: the
+    producer advanced the pointer to a prefix it never wrote
+    ``constituents.json`` into (alpha-engine-config-I12410 — a weekly Phase 1
+    whose constituents collector failed). It used to surface as a raw
+    ``botocore`` ``NoSuchKey`` naming only the target, which read as a crash
+    in this repo; it carries BOTH keys so the fault is attributable to the
+    pointer's writer from the message alone. A ``FileNotFoundError`` so any
+    caller already treating a missing document as missing still does.
+    """
+
+    def __init__(self, pointer_uri: str, target_uri: str) -> None:
+        self.pointer_uri = pointer_uri
+        self.target_uri = target_uri
+        super().__init__(
+            f"universe pointer {pointer_uri} names {target_uri}, which does not exist: "
+            "the pointer's writer advanced it to a prefix without a membership "
+            "document (a data-pointer fault upstream, not a fault in this run)"
+        )
 
 
 @dataclass(frozen=True)
@@ -161,12 +185,22 @@ def universe_from_argv(raw: str) -> DeclaredUniverse:
 
 def _read_s3(uri: str) -> bytes:
     import boto3  # noqa: PLC0415 - lazy: the laptop replay path never needs it
+    from botocore.exceptions import ClientError  # noqa: PLC0415 - lazy, as above
 
     rest = uri.removeprefix("s3://")
     bucket, _, key = rest.partition("/")
     if not bucket or not key:
         raise MalformedUniverseError(f"{uri}: an s3:// universe URI needs a bucket and a key")
-    return boto3.client("s3").get_object(Bucket=bucket, Key=key)["Body"].read()
+    try:
+        return boto3.client("s3").get_object(Bucket=bucket, Key=key)["Body"].read()
+    except ClientError as exc:
+        # A missing object reads as missing — the same `FileNotFoundError` the
+        # local branch raises — so a pointer's dangling target is recognisable
+        # by one type whichever branch fetched it. Anything else (denied,
+        # throttled) is not "missing" and propagates unchanged.
+        if exc.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+            raise FileNotFoundError(uri) from exc
+        raise
 
 
 def _read(uri: str) -> bytes:
@@ -216,7 +250,10 @@ def load_declared_universe(
                 f"(`{_POINTER_FIELD}`)"
             )
         target = _sibling(uri, prefix)
-        payload = fetch(target)
+        try:
+            payload = fetch(target)
+        except FileNotFoundError as exc:
+            raise DanglingUniversePointerError(uri, target) from exc
         document = _parse(payload, where=target)
         if _TICKERS_FIELD not in document:
             raise MalformedUniverseError(
