@@ -117,6 +117,7 @@ __all__ = [
     "ledger_key",
     "legacy_dead_lambdas_key",
     "legacy_weekly_executions_key",
+    "legacy_weekly_ruling_key",
     "manifest_calendar_day",
     "manifest_key",
     "manifest_prefix",
@@ -1771,6 +1772,31 @@ def legacy_weekly_executions_key(week_anchor: str) -> str:
     grade the same fixture from the two sides.
     """
     return f"legacy/weekly/{week_anchor}/executions.json"
+
+
+def legacy_weekly_ruling_key(week_anchor: str) -> str:
+    """A human's recorded ruling that one v1 weekly cycle SUCCEEDED.
+
+    Sibling of :func:`legacy_weekly_executions_key`, keyed by the same
+    :func:`weekly_anchor` session. Read by phase 0's
+    `crucible.gate._clause_old_weekly_within_cadence` only when that week's
+    filed executions do not meet the success floor on their own, neither by a
+    SUCCEEDED status nor by the 2026-10-06 partial-runs combination.
+
+    It is a **ruled record, never a cleared one** (`crucible.bench`'s pattern):
+    the failed reading is still printed beside it, and the record must name who
+    ruled (`ruled_by`), when (`ruled_at`), where the words are (`ruling_ref`),
+    what they were ruled on (`evidence`) and the exact executions it covers
+    (`executions`), so a later execution filed under the same week is never
+    covered by a ruling made before it existed. The field contract is
+    `crucible.gate.legacy_weekly_ruling_refusals`.
+
+    Written by an operator, never by the producer that files the executions:
+    an identity that could write the ruling could clear its own failure.
+    """
+    if not week_anchor:
+        raise ValueError("week_anchor must be non-empty")
+    return f"legacy/weekly/{week_anchor}/ruling.json"
 
 
 def legacy_dead_lambdas_key(week_anchor: str) -> str:

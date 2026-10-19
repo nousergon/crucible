@@ -102,6 +102,14 @@
           "title": "Generated Utc",
           "type": "string"
         },
+        "held_at_exit": {
+          "description": "One-time exit-evidence clauses of a LATCHED phase (crucible.gate.EXIT_ANCHORED_CLAUSES) that today's rolling window no longer contains, graded from the closing record, which lists each one met. Never a regression; always empty for a phase graded live.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Held At Exit",
+          "type": "array"
+        },
         "latched_by": {
           "anyOf": [
             {

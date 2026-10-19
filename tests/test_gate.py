@@ -21,6 +21,7 @@ from crucible.gate import (
     LEGACY_DEAD_LAMBDA_NAMES,
     LEGACY_DEAD_LAMBDAS_SCHEMA_VERSION,
     LEGACY_WEEKLY_EXECUTIONS_SCHEMA_VERSION,
+    LEGACY_WEEKLY_RULING_SCHEMA_VERSION,
     PHASE0_DELIVERABLES,
     PHASES,
     SOURCE_SCAN_SCOPE,
@@ -32,6 +33,7 @@ from crucible.gate import (
     gate_key,
     legacy_dead_lambdas_key,
     legacy_weekly_executions_key,
+    legacy_weekly_ruling_refusals,
     muted_alerts_topic_name,
     weekly_anchor,
 )
@@ -40,6 +42,7 @@ from crucible.keys import (
     arena_cycle_key,
     arm_register_key,
     gate_prefix,
+    legacy_weekly_ruling_key,
     review_key,
     review_prefix,
     runs_prefix,
@@ -2646,3 +2649,133 @@ class TestEveryLlmArmClauseIsControlArmIsRegisterBacked:
         # the LLM-arm join, so the only registered arm is itself and there is
         # nothing left to grade — the empty-set trap, never a pass.
         assert clause.unmeasurable and not clause.met, clause.detail
+
+
+class TestARecordedWeeklyRulingIsHonouredAndNamed:
+    """`legacy/weekly/{anchor}/ruling.json` (`alpha-engine-config-I12024`).
+
+    The week ending 2026-10-09 was ruled a SUCCESS by Brian at 10-10 19:11Z,
+    yet phase 0 read it UNMET every day after: both of its gate-passing
+    executions ended FAILED, and the per-stage record lists stages the
+    evidence shows ran as NOT_REACHED. A recorded ruling naming who, when,
+    where, on what, and exactly which executions now meets the floor, and the
+    failed reading is still printed beside it.
+    """
+
+    RUNS = ("uuid_run_0", "weekly-rerun-2026-08-22-1")
+
+    def _failed_week(self, store: LocalStore, anchor: dt.date) -> None:
+        document = _legacy_week(anchor, runs=1, run_status="FAILED")
+        document["executions"].append(
+            {
+                "name": self.RUNS[1],
+                "start": f"{anchor.isoformat()}T13:44:45+00:00",
+                "stop": f"{anchor.isoformat()}T17:36:10+00:00",
+                "duration_seconds": 13885.0,
+                "status": "FAILED",
+                "sns_topic_arn": f"arn:aws:sns:us-east-1:acct:{muted_alerts_topic_name()}",
+            }
+        )
+        document["executions_started"] = len(document["executions"])
+        _put(store, legacy_weekly_executions_key(anchor.isoformat()), document)
+
+    def _ruling(self, anchor: dt.date, **overrides) -> dict:
+        document = {
+            "schema_version": LEGACY_WEEKLY_RULING_SCHEMA_VERSION,
+            "week": anchor.isoformat(),
+            "verdict": "SUCCEEDED",
+            "executions": list(self.RUNS),
+            "ruled_by": "Brian",
+            "ruled_at": f"{(anchor + dt.timedelta(days=1)).isoformat()}T19:11:00Z",
+            "ruling_ref": "https://example.invalid/thread/ruling",
+            "reason": "every stage ran across the combined reruns; the lock-only degrade counts",
+            "evidence": ["acceptance/weekly-evidence.md"],
+        }
+        document.update(overrides)
+        return document
+
+    def _read(self, store: LocalStore):
+        return _clause(
+            evaluate(store, gate="phase0", trading_day=FRIDAY), "old_weekly_within_cadence"
+        )
+
+    def test_without_a_ruling_the_failed_week_is_unmet(self, tmp_path) -> None:
+        store = _seed_phase0_met(tmp_path)
+        self._failed_week(store, weekly_anchor(FRIDAY))
+        clause = self._read(store)
+        assert not clause.met
+        assert "0 SUCCEEDED" in clause.detail
+        assert "ruled SUCCEEDED" not in clause.detail
+
+    def test_a_valid_ruling_meets_the_floor_and_names_itself(self, tmp_path) -> None:
+        store = _seed_phase0_met(tmp_path)
+        anchor = weekly_anchor(FRIDAY)
+        self._failed_week(store, anchor)
+        _put(store, legacy_weekly_ruling_key(anchor.isoformat()), self._ruling(anchor))
+        clause = self._read(store)
+        assert clause.met, clause.detail
+        # Ruled, never cleared: the failed runs are still printed beside it.
+        assert "0 SUCCEEDED (floor 1)" in clause.detail
+        assert "uuid_run_0: FAILED" in clause.detail
+        assert "ruled SUCCEEDED by Brian at" in clause.detail
+        assert "https://example.invalid/thread/ruling" in clause.detail
+        assert "evidence: acceptance/weekly-evidence.md" in clause.detail
+        assert legacy_weekly_ruling_key(anchor.isoformat()) in clause.evidence
+        assert "recorded ruling" in clause.requirement
+
+    @pytest.mark.parametrize(
+        ("overrides", "problem"),
+        [
+            ({"ruled_by": ""}, "field 'ruled_by' is missing or empty"),
+            ({"ruling_ref": "a thread somewhere"}, "is not an https link"),
+            ({"ruled_at": "yesterday"}, "is not a UTC"),
+            ({"evidence": []}, "evidence is not a non-empty list"),
+            ({"verdict": "FAILED"}, "verdict is 'FAILED'"),
+            ({"week": "2026-08-14"}, "it rules on week '2026-08-14'"),
+            ({"schema_version": "v0"}, "schema_version is 'v0'"),
+            ({"executions": ["uuid_run_0"]}, "a ruling covers exactly the executions"),
+        ],
+    )
+    def test_an_invalid_ruling_is_named_and_never_honoured(
+        self, tmp_path, overrides: dict, problem: str
+    ) -> None:
+        store = _seed_phase0_met(tmp_path)
+        anchor = weekly_anchor(FRIDAY)
+        self._failed_week(store, anchor)
+        _put(store, legacy_weekly_ruling_key(anchor.isoformat()), self._ruling(anchor, **overrides))
+        clause = self._read(store)
+        assert not clause.met
+        assert not clause.unmeasurable
+        assert "not honoured" in clause.detail
+        assert problem in clause.detail
+        assert "0 SUCCEEDED" in clause.detail
+
+    def test_a_ruling_that_is_not_an_object_is_refused(self) -> None:
+        assert legacy_weekly_ruling_refusals(
+            ["a list"], anchor=weekly_anchor(FRIDAY), executions=[]
+        ) == ["the ruling is not a JSON object"]
+
+    def test_a_ruling_does_not_cover_an_execution_filed_after_it(self, tmp_path) -> None:
+        """A third run filed under the week after the ruling was made is not
+        covered by it, so the week reads UNMET until the ruling is re-made."""
+        store = _seed_phase0_met(tmp_path)
+        anchor = weekly_anchor(FRIDAY)
+        self._failed_week(store, anchor)
+        _put(store, legacy_weekly_ruling_key(anchor.isoformat()), self._ruling(anchor))
+        key = legacy_weekly_executions_key(anchor.isoformat())
+        document = json.loads(store.get_bytes(key))
+        document["executions"].append(dict(document["executions"][-1], name="later-run"))
+        document["executions_started"] += 1
+        _put(store, key, document)
+        clause = self._read(store)
+        assert not clause.met
+        assert "'later-run'" in clause.detail
+
+    def test_an_unreadable_ruling_is_named_and_never_honoured(self, tmp_path) -> None:
+        store = _seed_phase0_met(tmp_path)
+        anchor = weekly_anchor(FRIDAY)
+        self._failed_week(store, anchor)
+        store.put_bytes(legacy_weekly_ruling_key(anchor.isoformat()), b"{not json")
+        clause = self._read(store)
+        assert not clause.met
+        assert "not honoured" in clause.detail

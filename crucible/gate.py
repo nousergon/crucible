@@ -120,6 +120,7 @@ from crucible.keys import (
     is_manifest_key,
     legacy_dead_lambdas_key,
     legacy_weekly_executions_key,
+    legacy_weekly_ruling_key,
     manifest_prefix,
     parse_acceptance_reading,
     parse_bus_key,
@@ -183,6 +184,8 @@ if TYPE_CHECKING:
 __all__ = [
     "ACCEPTANCE_RATCHET_PATH",
     "CLAUSE_MEMBER_RANK",
+    "EXIT_ANCHORED_CLAUSES",
+    "exit_record_clauses",
     "GATE_SCHEMA_VERSION",
     "GATES",
     "LEGACY_DEAD_LAMBDAS_SCHEMA_VERSION",
@@ -191,6 +194,8 @@ __all__ = [
     "LEGACY_WEEKLY_MAX_STARTS_PER_WEEK",
     "LEGACY_WEEKLY_MIN_RUNS_PER_WEEK",
     "LEGACY_WEEKLY_RERUN_NAME_PREFIX",
+    "LEGACY_WEEKLY_RULING_SCHEMA_VERSION",
+    "legacy_weekly_ruling_refusals",
     "LEGACY_WEEKLY_TOPIC_FIELD",
     "muted_alerts_topic_name",
     "V2_STORE_VERSIONING_ENABLED",
@@ -2601,6 +2606,109 @@ def _legacy_weekly_executions(
     return (None, out)
 
 
+#: The schema token a `legacy/weekly/{anchor}/ruling.json` record declares
+#: (:func:`crucible.keys.legacy_weekly_ruling_key`).
+LEGACY_WEEKLY_RULING_SCHEMA_VERSION = "legacy-weekly-ruling.v1"
+
+#: The one verdict a weekly ruling records: the cycle counts as SUCCEEDED.
+LEGACY_WEEKLY_RULING_VERDICT = "SUCCEEDED"
+
+#: The string fields every weekly ruling must carry, non-empty.
+LEGACY_WEEKLY_RULING_FIELDS: tuple[str, ...] = (
+    "week",
+    "verdict",
+    "ruled_by",
+    "ruled_at",
+    "ruling_ref",
+    "reason",
+)
+
+_RULED_AT_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(:[0-9]{2})?Z$")
+
+
+def legacy_weekly_ruling_refusals(
+    document: Any, *, anchor: dt.date, executions: list[str]
+) -> list[str]:
+    """Why ``document`` is NOT a ruling that the week ending ``anchor`` SUCCEEDED.
+
+    Empty means it is. ``executions`` names the week's gate-passing
+    executions as filed; the ruling must name exactly that set. A ruling made
+    on two executions does not cover a third filed after it, and a ruling that
+    names an execution the week does not contain was made about a different
+    reading.
+    """
+    if not isinstance(document, dict):
+        return ["the ruling is not a JSON object"]
+    if document.get("schema_version") != LEGACY_WEEKLY_RULING_SCHEMA_VERSION:
+        return [
+            f"schema_version is {document.get('schema_version')!r}, not "
+            f"{LEGACY_WEEKLY_RULING_SCHEMA_VERSION!r}"
+        ]
+    problems = [
+        f"field {name!r} is missing or empty"
+        for name in LEGACY_WEEKLY_RULING_FIELDS
+        if not isinstance(document.get(name), str) or not document[name].strip()
+    ]
+    week = document.get("week")
+    if isinstance(week, str) and week and week != anchor.isoformat():
+        problems.append(f"it rules on week {week!r}, not {anchor.isoformat()!r}")
+    verdict = document.get("verdict")
+    if isinstance(verdict, str) and verdict and verdict != LEGACY_WEEKLY_RULING_VERDICT:
+        problems.append(f"verdict is {verdict!r}, not {LEGACY_WEEKLY_RULING_VERDICT!r}")
+    ruled_at = document.get("ruled_at")
+    if isinstance(ruled_at, str) and ruled_at and not _RULED_AT_RE.match(ruled_at):
+        problems.append(f"ruled_at {ruled_at!r} is not a UTC YYYY-MM-DDTHH:MM[:SS]Z instant")
+    ref = document.get("ruling_ref")
+    if isinstance(ref, str) and ref and not re.match(r"^https://\S+$", ref):
+        problems.append(f"ruling_ref {ref!r} is not an https link to the ruling")
+    evidence = document.get("evidence")
+    if (
+        not isinstance(evidence, list)
+        or not evidence
+        or not all(isinstance(e, str) and e.strip() for e in evidence)
+    ):
+        problems.append("evidence is not a non-empty list of links or store keys")
+    named = document.get("executions")
+    if not isinstance(named, list) or not named or not all(isinstance(e, str) and e for e in named):
+        problems.append("executions is not a non-empty list of execution names")
+    elif sorted(set(named)) != sorted(set(executions)):
+        problems.append(
+            f"it names executions {sorted(set(named))} while the week files "
+            f"{sorted(set(executions))}; a ruling covers exactly the executions it was "
+            "made on"
+        )
+    return problems
+
+
+def _legacy_weekly_ruling(
+    store: Store, anchor: dt.date, executions: list[str]
+) -> tuple[str, str | None, str] | None:
+    """Read the week's ruling record: `None` when absent, else (key, problem, line).
+
+    ``problem`` is `None` for a ruling the clause honours, and ``line`` then
+    names who ruled, when, where and on what. A ruling that is present but
+    unreadable or malformed is never honoured and never ignored: the caller
+    renders its problem beside the failed reading.
+    """
+    key = legacy_weekly_ruling_key(anchor.isoformat())
+    read = _read_store_document(store, key)
+    if read.absent:
+        return None
+    if read.problem is not None:
+        return (key, read.problem, "")
+    document = read.document
+    refusals = legacy_weekly_ruling_refusals(document, anchor=anchor, executions=executions)
+    if refusals:
+        return (key, "; ".join(refusals), "")
+    assert isinstance(document, dict)  # refusals is empty only for an object
+    line = (
+        f"ruled {LEGACY_WEEKLY_RULING_VERDICT} by {document['ruled_by']} at "
+        f"{document['ruled_at']} ({key}; {document['ruling_ref']}): "
+        f"{str(document['reason']).rstrip('.')}; evidence: {', '.join(document['evidence'])}"
+    )
+    return (key, None, line)
+
+
 def _clause_old_weekly_within_cadence(
     store: Store,
     window: list[dt.date],
@@ -2644,6 +2752,19 @@ def _clause_old_weekly_within_cadence(
       stage meets the success floor (`_legacy_partial_runs_complete`). Phase 0
       passes ``True``; phase 4 leaves it ``False``, because it grades a
       pipeline that must emit nothing at all.
+
+    * **A recorded ruling** (`crucible.keys.legacy_weekly_ruling_key`). When
+      neither a SUCCEEDED status nor the stage combination meets the floor,
+      a human's ruling that the week SUCCEEDED does — but only a valid one
+      (:func:`legacy_weekly_ruling_refusals`: who, when, where the words are,
+      what it was ruled on, and exactly the executions it covers). The
+      failed reading is still printed beside it on the MET detail; a ruling
+      that is present and invalid is named as malformed and never honoured.
+      First used for the week ending 2026-10-09, ruled SUCCESS at 10-10
+      19:11Z: its executions' per-stage record (derived by the producer from
+      the state machine's history) lists stages the evidence shows ran as
+      NOT_REACHED, and the run that completed them ended FAILED on a lock
+      degrade the ruling counted.
 
     ``maximum=None`` removes the ceiling, which is what "rerun until it is
     successful" means; phase 4 keeps ``0``.
@@ -2778,6 +2899,12 @@ def _clause_old_weekly_within_cadence(
             else ""
         )
         + (
+            " — or that a human ruled SUCCEEDED in a recorded ruling at "
+            "`legacy/weekly/{anchor}/ruling.json` naming exactly those executions"
+            if minimum_succeeded
+            else ""
+        )
+        + (
             ", and no `watch-rerun-*` execution at all"
             if reruns_fail
             else " (reruns permitted and named)"
@@ -2807,6 +2934,7 @@ def _clause_old_weekly_within_cadence(
     rerun_notes: list[str] = []
     elsewhere: list[str] = []
     combined: list[str] = []
+    ruled_keys: list[str] = []
     skipped_total = 0
     for anchor, key in zip(anchors, evidence, strict=True):
         # Read through the guarded reader, never `json.loads` + indexing. This
@@ -2910,9 +3038,31 @@ def _clause_old_weekly_within_cadence(
                 partial_ok, partial_detail = (
                     _legacy_partial_runs_complete(runs) if partial_runs_count else (False, "")
                 )
+                ruling = (
+                    None
+                    if partial_ok
+                    else _legacy_weekly_ruling(store, anchor, [e.name for e in runs])
+                )
                 if partial_ok:
                     combined.append(f"{key}: {partial_detail}")
+                elif ruling is not None and ruling[1] is None:
+                    ruling_key, _, line = ruling
+                    ruled_keys.append(ruling_key)
+                    combined.append(
+                        f"{key}: {len(runs)} gate-passing execution(s), {len(succeeded)} "
+                        f"SUCCEEDED (floor {minimum_succeeded}) — "
+                        + ", ".join(f"{e.name}: {e.status}" for e in runs[:4])
+                        + f"; {line}"
+                        + (
+                            f"; the reading stands beside the ruling: {partial_detail}"
+                            if partial_detail
+                            else ""
+                        )
+                    )
                 else:
+                    if ruling is not None:
+                        ruled_keys.append(ruling[0])
+                        malformed.append(f"{ruling[0]}: not honoured: {ruling[1]}")
                     failed = [e for e in runs if e.status != "SUCCEEDED"]
                     unsucceeded.append(
                         f"{key}: {len(runs)} gate-passing execution(s), "
@@ -2954,7 +3104,7 @@ def _clause_old_weekly_within_cadence(
             requirement,
             False,
             "; ".join(parts),
-            tuple(evidence),
+            tuple(evidence) + tuple(ruled_keys),
             # UNMEASURABLE only when nothing else is wrong. A window with one
             # stale week and one week genuinely over the ceiling has a finding
             # in it, and `[?]` would hide the finding behind the stale read.
@@ -2981,7 +3131,7 @@ def _clause_old_weekly_within_cadence(
         + ("; " + "; ".join(combined) if combined else "")
         + ("; " + "; ".join(rerun_notes) if rerun_notes else "")
         + ("; " + "; ".join(elsewhere) if elsewhere else ""),
-        tuple(evidence),
+        tuple(evidence) + tuple(ruled_keys),
     )
 
 
@@ -10927,6 +11077,10 @@ class PhaseRow:
     regressions: tuple[str, ...] = ()
     #: The clauses of a latched phase that could not be read today.
     regressions_unmeasurable: tuple[str, ...] = ()
+    #: The one-time exit-evidence clauses of a latched phase
+    #: (:data:`EXIT_ANCHORED_CLAUSES`) that today's rolling window does not
+    #: contain, graded from the closing record instead. Never a regression.
+    held_at_exit: tuple[str, ...] = ()
 
     @property
     def exited(self) -> bool:
@@ -10960,6 +11114,7 @@ class PhaseRow:
             "blocked_by": self.blocked_by,
             "latched_by": self.latched_by,
             "regressions": list(self.regressions),
+            "held_at_exit": list(self.held_at_exit),
             "generated_utc": generated_utc,
         }
 
@@ -11044,6 +11199,39 @@ def reopen_record_refusals(document: dict[str, Any] | None, *, phase_id: str) ->
     if isinstance(stamp, str) and stamp and not _UTC_STAMP_RE.match(stamp):
         problems.append(f"filed_utc {stamp!r} is not a YYYY-MM-DDTHH:MM:SSZ timestamp")
     return problems
+
+
+#: The clauses of each gate that grade ONE-TIME exit evidence, not a standing
+#: invariant. On a LATCHED phase (:func:`read_phase_latch`) these are graded
+#: from the closing record, never from today's rolling window.
+#:
+#: The defect (`alpha-engine-config-I12024`, 2026-10-19): phase 1's exit review
+#: was filed 2026-09-04 and its explain walk 2026-08-07. Both are events that
+#: happen once, at the exit. A rolling window from TODAY can never contain
+#: them again, so every latched phase whose exit rested on one read as
+#: "regressed" by construction, a false page in the morning report.
+#:
+#: A clause here is held only when the closing record itself lists it `met`;
+#: the record has already passed :func:`closing_reading_refusals`. A clause
+#: absent from the record (added after the exit) is graded live like any
+#: other. Every clause NOT named here is a standing invariant and can still
+#: regress. Add a clause only when its evidence is anchored to the exit, never
+#: to quiet a standing check that has started failing.
+EXIT_ANCHORED_CLAUSES: dict[str, frozenset[str]] = {
+    # The independent adversarial review of the phase's exit (plan §11 risk
+    # 1) and the one `explain` walk that exercised lineage on real output.
+    "phase1": frozenset({"independently_reviewed", "explain_walks_a_verdict"}),
+}
+
+
+def exit_record_clauses(document: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    """The closing record's per-clause verdicts, by clause name."""
+    clauses = (document or {}).get("clauses")
+    if not isinstance(clauses, list):
+        return {}
+    return {
+        str(c["name"]): c for c in clauses if isinstance(c, dict) and isinstance(c.get("name"), str)
+    }
 
 
 @dataclass(frozen=True)
@@ -11177,6 +11365,7 @@ class _GradedPhase:
     latched_by: dict[str, Any] | None = None
     regressions: tuple[str, ...] = ()
     regressions_unmeasurable: tuple[str, ...] = ()
+    held_at_exit: tuple[str, ...] = ()
 
 
 def build_ladder(
@@ -11262,8 +11451,31 @@ def build_ladder(
         unmeasurable_names = [c.name for c in reading.clauses if c.unmeasurable]
         latch = read_phase_latch(store, phase)
         detail = f"{met}/{total} clauses met"
+        held: list[str] = []
         if latch.held:
             detail = f"{latch.line}; today's reading: {detail}"
+            # One-time exit evidence is graded from the closing record, not
+            # from today's rolling window, which can never contain it again.
+            # Only a clause the record itself lists `met` is held; anything
+            # else stays a live reading and can regress.
+            anchored = EXIT_ANCHORED_CLAUSES.get(phase.gate, frozenset())
+            at_exit = exit_record_clauses(latch.document)
+            held = [
+                c.name
+                for c in reading.clauses
+                if not c.met
+                and c.name in anchored
+                and at_exit.get(c.name, {}).get("met") is True
+                and not at_exit.get(c.name, {}).get("unmeasurable")
+            ]
+            unmet = [name for name in unmet if name not in held]
+            unmeasurable_names = [name for name in unmeasurable_names if name not in held]
+            if held:
+                detail = (
+                    f"{detail}; exit evidence graded from {latch.key} (met at the exit on "
+                    f"{(latch.document or {}).get('trading_day')}, not re-read over today's "
+                    f"window): {', '.join(held)}"
+                )
         if unmeasurable_names:
             detail = f"{detail}; unmeasurable: {', '.join(unmeasurable_names)}"
         if unmet:
@@ -11311,6 +11523,7 @@ def build_ladder(
                 latched_by=latch.latched_by,
                 regressions=tuple(unmet) if latch.held else (),
                 regressions_unmeasurable=tuple(unmeasurable_names) if latch.held else (),
+                held_at_exit=tuple(held),
             )
         )
 
@@ -11349,6 +11562,7 @@ def build_ladder(
                 latched_by=g.latched_by,
                 regressions=g.regressions,
                 regressions_unmeasurable=g.regressions_unmeasurable,
+                held_at_exit=g.held_at_exit,
             )
         )
 

@@ -2983,6 +2983,13 @@ class PhaseLadderRow(_Strict):
         "A regression is rendered red on the board and never un-latches the phase; "
         "always empty for a phase graded live.",
     )
+    held_at_exit: list[str] = Field(
+        default_factory=list,
+        description="One-time exit-evidence clauses of a LATCHED phase "
+        "(crucible.gate.EXIT_ANCHORED_CLAUSES) that today's rolling window no longer "
+        "contains, graded from the closing record, which lists each one met. Never a "
+        "regression; always empty for a phase graded live.",
+    )
     generated_utc: str = Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 
 
