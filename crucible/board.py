@@ -1244,7 +1244,16 @@ def _regression_row(phase: Any, ladder_row: PhaseRow) -> BoardRow:
         )
     else:
         state = "MET"
-        detail = f"no regression — {exit_line}, and every clause still reads met today."
+        standing = "standing clause" if ladder_row.held_at_exit else "clause"
+        detail = f"no regression — {exit_line}, and every {standing} still reads met today."
+    if ladder_row.held_at_exit:
+        # One-time exit evidence (`crucible.gate.EXIT_ANCHORED_CLAUSES`) is
+        # graded from the closing record, and the row says so rather than
+        # implying today's window read it.
+        detail = (
+            f"{detail} Graded from the closing record, not today's window (one-time exit "
+            f"evidence, met at the exit): {', '.join(ladder_row.held_at_exit)}."
+        )
     return BoardRow(
         id=f"phase:{phase.id}:regression",
         source="phase",

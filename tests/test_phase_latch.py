@@ -24,6 +24,7 @@ import pytest
 
 from crucible.board import RED_STATES, _phase_rows
 from crucible.gate import (
+    EXIT_ANCHORED_CLAUSES,
     GATE_DELIVERABLES,
     GATES,
     PHASES,
@@ -31,6 +32,7 @@ from crucible.gate import (
     build_ladder,
     closing_reading,
     evaluate,
+    exit_record_clauses,
     gate_key,
     ladder_payload,
 )
@@ -296,3 +298,128 @@ class TestOnlyAValidClosingRecordLatches:
         assert "latched" not in rows["phase0"]["detail"]
         assert rows["phase1"]["state"] == "OUT_OF_ORDER"
         assert rows["phase1"]["blocked_by"] == "phase0"
+
+
+class TestOneTimeExitEvidenceIsGradedFromTheClosingRecord:
+    """`alpha-engine-config-I12024`, 2026-10-19: phase 1 read "UNMET
+    regression" every morning because its exit review, filed 2026-09-04,
+    sat outside a rolling window from TODAY. A one-time review can never sit
+    inside that window again, so every latched phase read as regressed by
+    construction. Exit-anchored clauses (`EXIT_ANCHORED_CLAUSES`) are graded
+    from the closing record; standing invariants still regress."""
+
+    NAMES = ("arc_runs_ok", "independently_reviewed", "explain_walks_a_verdict")
+
+    def test_an_aged_out_review_is_held_by_the_record_not_a_regression(
+        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _close(store, monkeypatch, "phase1", self.NAMES)
+        _set_gate(
+            monkeypatch,
+            "phase1",
+            ("arc_runs_ok", True),
+            ("independently_reviewed", False),
+            ("explain_walks_a_verdict", False),
+        )
+        row = _rows(store)["phase1"]
+        assert row["regressions"] == []
+        assert row["held_at_exit"] == ["independently_reviewed", "explain_walks_a_verdict"]
+        assert "regressed" not in row["detail"]
+        # Said, never silent: the detail names the record and the clauses.
+        assert (
+            "exit evidence graded from gates/phase1/closing.json (met at the exit on "
+            "2026-08-28, not re-read over today's window): independently_reviewed, "
+            "explain_walks_a_verdict"
+        ) in row["detail"]
+        # The live reading is kept: today's window still reads them unmet.
+        assert row["gate_state"] == "UNMET"
+        assert "today's reading: 1/3 clauses met" in row["detail"]
+
+        ladder = build_ladder(store, trading_day=FRIDAY, now=NOW)
+        ladder_payload(ladder)
+        regression = {r.id: r for r in _phase_rows(ladder, FRIDAY.isoformat())}[
+            "phase:phase1:regression"
+        ]
+        assert regression.state == "MET"
+        assert "every standing clause still reads met today" in regression.detail
+        assert "Graded from the closing record" in regression.detail
+        assert "independently_reviewed" in regression.detail
+
+    def test_an_unmeasurable_exit_anchored_clause_is_held_too(
+        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _close(store, monkeypatch, "phase1", self.NAMES)
+        monkeypatch.setitem(
+            GATES,
+            "phase1",
+            (
+                5,
+                lambda *_a, **_k: [
+                    Clause("arc_runs_ok", "r", True, "met", ()),
+                    Clause("independently_reviewed", "r", False, "denied", (), unmeasurable=True),
+                    Clause("explain_walks_a_verdict", "r", True, "met", ()),
+                ],
+            ),
+        )
+        row = _rows(store)["phase1"]
+        assert row["held_at_exit"] == ["independently_reviewed"]
+        assert row["regressions"] == []
+
+    def test_a_standing_clause_on_the_same_phase_still_regresses(
+        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _close(store, monkeypatch, "phase1", self.NAMES)
+        _set_gate(
+            monkeypatch,
+            "phase1",
+            ("arc_runs_ok", False),
+            ("independently_reviewed", False),
+            ("explain_walks_a_verdict", True),
+        )
+        row = _rows(store)["phase1"]
+        assert row["regressions"] == ["arc_runs_ok"]
+        assert row["held_at_exit"] == ["independently_reviewed"]
+        assert "regressed: arc_runs_ok" in row["detail"]
+
+        ladder = build_ladder(store, trading_day=FRIDAY, now=NOW)
+        regression = {r.id: r for r in _phase_rows(ladder, FRIDAY.isoformat())}[
+            "phase:phase1:regression"
+        ]
+        assert regression.state == "UNMET"
+        assert "REGRESSED: arc_runs_ok" in regression.detail
+        assert "Graded from the closing record" in regression.detail
+
+    def test_an_exit_anchored_clause_the_record_does_not_list_still_regresses(
+        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A clause added after the exit has no exit verdict to be graded
+        from, so it is read live like any other."""
+        _close(store, monkeypatch, "phase1", ("arc_runs_ok",))
+        _set_gate(monkeypatch, "phase1", ("arc_runs_ok", True), ("independently_reviewed", False))
+        row = _rows(store)["phase1"]
+        assert row["held_at_exit"] == []
+        assert row["regressions"] == ["independently_reviewed"]
+
+    def test_an_unlatched_phase_grades_exit_evidence_live(
+        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _set_gate(monkeypatch, "phase1", ("arc_runs_ok", True), ("independently_reviewed", False))
+        _file_reading(store, "phase1")
+        row = _rows(store)["phase1"]
+        assert row["held_at_exit"] == []
+        assert row["state"] != "MET"
+        assert "holding: independently_reviewed" in row["detail"]
+
+    def test_every_exit_anchored_name_is_a_real_clause_of_its_gate(self, store: LocalStore) -> None:
+        """A misspelled name would hold nothing and silently stop protecting
+        the clause it meant to. Read against the real clause lists."""
+        for gate, names in EXIT_ANCHORED_CLAUSES.items():
+            reading = evaluate(store, gate=gate, trading_day=FRIDAY)
+            assert names <= {c.name for c in reading.clauses}, gate
+
+    def test_a_record_without_a_clause_list_holds_nothing(self) -> None:
+        assert exit_record_clauses(None) == {}
+        assert exit_record_clauses({"clauses": "x"}) == {}
+        assert exit_record_clauses({"clauses": [{"name": "a", "met": True}, "junk"]}) == {
+            "a": {"name": "a", "met": True}
+        }
