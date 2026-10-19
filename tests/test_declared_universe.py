@@ -21,6 +21,7 @@ from crucible.data.daily import UndeclaredUniverseError
 from crucible.data.point_in_time import UnavailablePointInTimeSource
 from crucible.data.universe import (
     DECLARED_UNIVERSE_SCHEMA_VERSION,
+    DanglingUniversePointerError,
     MalformedUniverseError,
     load_declared_universe,
     universe_from_argv,
@@ -123,6 +124,71 @@ class TestTheDocumentShapes:
             "s3://some-bucket/market_data/weekly/2026-09-03/constituents.json",
         ]
         assert declared.symbols == ("MSFT",)
+
+
+class TestADanglingPointer:
+    """alpha-engine-config-I12410: a weekly Phase 1 whose constituents
+    collector failed advanced `latest_weekly.json` to a prefix with no
+    `constituents.json`, and this module surfaced it as a raw botocore
+    `NoSuchKey` naming only the target. The error must name BOTH keys so it
+    reads as a data-pointer fault, not a crash."""
+
+    POINTER = "s3://bkt/market_data/latest_weekly.json"
+    TARGET = "s3://bkt/market_data/weekly/2026-10-16/constituents.json"
+
+    def test_a_local_pointer_to_a_missing_target_names_both(self, tmp_path) -> None:
+        pointer = _write(
+            tmp_path / "market_data" / "latest_weekly.json",
+            {"date": "2026-10-16", "s3_prefix": "market_data/weekly/2026-10-16/"},
+        )
+        with pytest.raises(DanglingUniversePointerError) as caught:
+            load_declared_universe(pointer, origin="argument")
+        assert caught.value.pointer_uri == pointer
+        assert caught.value.target_uri.endswith("market_data/weekly/2026-10-16/constituents.json")
+        assert pointer in str(caught.value) and caught.value.target_uri in str(caught.value)
+        assert isinstance(caught.value, FileNotFoundError)
+
+    @staticmethod
+    def _s3_raising(monkeypatch, code: str):
+        import boto3
+        from botocore.exceptions import ClientError
+
+        class _Body:
+            def read(self) -> bytes:
+                return json.dumps({"s3_prefix": "market_data/weekly/2026-10-16/"}).encode()
+
+        class _Client:
+            def get_object(self, *, Bucket: str, Key: str) -> dict:
+                if Key == "market_data/latest_weekly.json":
+                    return {"Body": _Body()}
+                raise ClientError({"Error": {"Code": code, "Message": "x"}}, "GetObject")
+
+        monkeypatch.setattr(boto3, "client", lambda *_a, **_k: _Client())
+
+    def test_an_s3_no_such_key_on_the_target_names_both(self, monkeypatch) -> None:
+        """The production branch: the raw `NoSuchKey` from `_read_s3` is what
+        crucible used to surface at `universe.py:219`."""
+        self._s3_raising(monkeypatch, "NoSuchKey")
+        with pytest.raises(DanglingUniversePointerError) as caught:
+            load_declared_universe(self.POINTER, origin="environ:CRUCIBLE_UNIVERSE_URI")
+        assert (caught.value.pointer_uri, caught.value.target_uri) == (self.POINTER, self.TARGET)
+        assert self.POINTER in str(caught.value) and self.TARGET in str(caught.value)
+
+    def test_a_denied_target_is_not_reported_as_dangling(self, monkeypatch) -> None:
+        """Only a MISSING object is a dangling pointer; a denied or throttled
+        read is a different fault and must surface as itself."""
+        from botocore.exceptions import ClientError
+
+        self._s3_raising(monkeypatch, "AccessDenied")
+        with pytest.raises(ClientError) as caught:
+            load_declared_universe(self.POINTER, origin="argument")
+        assert not isinstance(caught.value, DanglingUniversePointerError)
+
+    def test_a_missing_membership_document_is_missing_not_dangling(self, tmp_path) -> None:
+        """No pointer was followed, so there is no pointer to blame."""
+        with pytest.raises(FileNotFoundError) as caught:
+            load_declared_universe(str(tmp_path / "absent.json"), origin="argument")
+        assert not isinstance(caught.value, DanglingUniversePointerError)
 
 
 class TestTheArgvForm:
