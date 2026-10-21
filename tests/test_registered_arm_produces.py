@@ -31,8 +31,15 @@ import datetime as dt
 import pytest
 
 from crucible import gate as gate_module
+from crucible.calendar import count_trading_days
+from crucible.carryover import read_latest_production, read_production
 from crucible.features import PENDING_COLUMNS
-from crucible.keys import arm_register_key, experiments_prefix, strategy_arm_key
+from crucible.keys import (
+    arm_predictions_key,
+    arm_register_key,
+    experiments_prefix,
+    strategy_arm_key,
+)
 from crucible.registration import load_registrable_recipes
 from crucible.slots import dispatchable_slots
 from crucible.slots.arms import control_specs, read_register, register_arms, write_register
@@ -181,8 +188,14 @@ def _register(store: LocalStore, *, filed_on: str, names: tuple[str, ...]) -> li
     return [s.arm_id for s in specs]
 
 
-def _produce(store: LocalStore, arm_id: str) -> None:
-    store.put_bytes(f"{experiments_prefix(arm_id)}2026-09-18/shadow.json", b"{}")
+def _produce(store: LocalStore, arm_id: str, day: str = "2026-09-18") -> None:
+    store.put_bytes(f"{experiments_prefix(arm_id)}{day}/shadow.json", b"{}")
+
+
+#: `SILENCE_SESSIONS` (10) trading sessions before `AS_OF`, and one more.
+#: Labor Day (2026-09-07) is not a session, so these are not calendar offsets.
+TEN_SESSIONS_AGO = "2026-09-09"
+ELEVEN_SESSIONS_AGO = "2026-09-08"
 
 
 def _clause(store: LocalStore, monkeypatch):
@@ -366,3 +379,105 @@ class TestTheDetector:
 
     def test_phase_3_assembles_it(self) -> None:
         assert "_clause_every_registered_arm_produces" in gate_module._phase3.__code__.co_names
+
+
+class TestProducedOnceIsNotProducing:
+    """`alpha-engine-config-I12539`. The predicate was "ever produced", so an
+    arm that wrote once and then went silent read produced forever: two
+    stacked M arms last wrote on 2026-09-25 and 2026-08-12, every weekly run
+    refused them, and this clause stayed MET. An ACTIVE arm whose NEWEST
+    output is more than `SILENCE_SESSIONS` sessions old now reads mute."""
+
+    def test_the_fixture_dates_are_the_declared_threshold(self) -> None:
+        assert gate_module.SILENCE_SESSIONS == 10
+        as_of = AS_OF
+        assert count_trading_days(dt.date.fromisoformat(TEN_SESSIONS_AGO), as_of) == 10
+        assert count_trading_days(dt.date.fromisoformat(ELEVEN_SESSIONS_AGO), as_of) == 11
+
+    def test_an_arm_silent_past_the_threshold_reads_unmet(self, store, monkeypatch) -> None:
+        _seed(store, PRODUCIBLE)
+        (quant,) = _register(store, filed_on=FILED_LONG_AGO, names=("no_agent_quant",))
+        _produce(store, quant, "2026-08-12")
+        _produce(store, quant, ELEVEN_SESSIONS_AGO)
+        clause = _clause(store, monkeypatch)
+        assert not clause.met and not clause.unmeasurable
+        assert "1 registered arm(s) MUTE" in clause.detail
+        assert f"{quant} last produced {ELEVEN_SESSIONS_AGO}, 11 sessions ago" in clause.detail
+        assert f"{experiments_prefix(quant)}{ELEVEN_SESSIONS_AGO}/shadow.json" in clause.evidence
+
+    def test_an_arm_that_produced_inside_the_threshold_reads_met(self, store, monkeypatch) -> None:
+        _seed(store, PRODUCIBLE)
+        (quant,) = _register(store, filed_on=FILED_LONG_AGO, names=("no_agent_quant",))
+        _produce(store, quant, "2026-08-12")
+        _produce(store, quant, TEN_SESSIONS_AGO)
+        clause = _clause(store, monkeypatch)
+        assert clause.met, clause.detail
+        assert "0 mute" in clause.detail
+
+    def test_the_newest_output_under_either_prefix_counts(self, store, monkeypatch) -> None:
+        """An M arm's daily output is `arm_predictions/{arm}/{day}.json`; the
+        old `experiments/` session does not make it silent."""
+        _seed(store, PRODUCIBLE)
+        (quant,) = _register(store, filed_on=FILED_LONG_AGO, names=("no_agent_quant",))
+        _produce(store, quant, "2026-08-12")
+        store.put_bytes(arm_predictions_key(quant, "2026-09-22"), b"{}")
+        assert _clause(store, monkeypatch).met
+
+        reading = read_latest_production(store, quant)
+        assert reading.produced is True
+        assert reading.newest == "2026-09-22"
+        assert reading.newest_key == arm_predictions_key(quant, "2026-09-22")
+
+    def test_a_silent_arm_is_named_beside_a_never_produced_one(
+        self, store, monkeypatch, producer_landed
+    ) -> None:
+        _seed(store, PRODUCIBLE, PENDING)
+        quant, scanner = _register(
+            store, filed_on=FILED_LONG_AGO, names=("no_agent_quant", "scanner_predictor_direct")
+        )
+        _produce(store, quant, ELEVEN_SESSIONS_AGO)
+        clause = _clause(store, monkeypatch)
+        assert not clause.met
+        assert "2 registered arm(s) MUTE" in clause.detail
+        assert f"{quant} last produced" in clause.detail
+        assert f"{scanner} is ACTIVE" in clause.detail and "has written nothing" in clause.detail
+
+    def test_a_silent_arm_waiting_on_a_producer_is_still_waiting(self, store, monkeypatch) -> None:
+        """Waiting is about arms that never produced; it is untouched."""
+        _seed(store, PRODUCIBLE, PENDING)
+        quant, scanner = _register(
+            store, filed_on=FILED_LONG_AGO, names=("no_agent_quant", "scanner_predictor_direct")
+        )
+        _produce(store, quant)
+        clause = _clause(store, monkeypatch)
+        assert clause.met, clause.detail
+        assert f"{scanner} waits on predicted_alpha_ratio" in clause.detail
+
+    def test_read_production_keeps_its_meaning(self, store) -> None:
+        """The migration admission rule and the carry-over clause still ask
+        "ever": an arm silent for months has produced."""
+        arm = "r:no_agent_quant:0123456789ab"
+        _produce(store, arm, "2026-03-02")
+        assert read_production(store, arm).produced is True
+        assert read_latest_production(store, arm).newest == "2026-03-02"
+
+    def test_an_undated_key_is_production_but_dates_nothing(self, store) -> None:
+        arm = "r:no_agent_quant:0123456789ab"
+        store.put_bytes(f"{experiments_prefix(arm)}notes/readme.json", b"{}")
+        store.put_bytes(f"{experiments_prefix(arm)}2026-13-40/shadow.json", b"{}")
+        reading = read_latest_production(store, arm)
+        assert reading.produced is True
+        assert reading.newest is None and reading.newest_key is None
+
+    def test_nothing_produced_reads_not_produced(self, store) -> None:
+        reading = read_latest_production(store, "r:no_agent_quant:0123456789ab")
+        assert reading.produced is False and reading.newest is None
+
+    def test_an_unlistable_prefix_is_unknown_never_silent(self, store, monkeypatch) -> None:
+        def denied(self, prefix):
+            raise PermissionError("AccessDenied on ListObjectsV2")
+
+        monkeypatch.setattr(LocalStore, "list_keys", denied)
+        reading = read_latest_production(store, "r:no_agent_quant:0123456789ab")
+        assert reading.produced is None
+        assert "PermissionError" in (reading.problem or "")
