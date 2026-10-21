@@ -1343,8 +1343,17 @@ def build_trader_pin_request(
     request records what the pin actually said when it was made.
     """
     _assert_sha(sha)
+    meta_key = release_json_key(sha)
+    if not _release_object_exists(store, meta_key):
+        raise StaleReleasePointerError(
+            f"refusing to queue a trader pin to {sha}: it was never published, so there is "
+            f"no release record at {meta_key}. Queue a sha the deploy workflow published. "
+            "This workflow's role cannot list `releases/*`, so S3 answers it with 403 for an "
+            f"absent release key; that 403 counts as absence only while {POINTER_KEY}, read "
+            "under the same grant, is readable."
+        )
     wheel = published_wheel_key(store, sha)
-    if not store.exists(wheel):
+    if not _release_object_exists(store, wheel):
         raise StaleReleasePointerError(
             f"refusing to queue a trader pin to {sha}: no wheel at {wheel}. The pin would "
             "refuse it too, so the request could never be applied."
@@ -1382,6 +1391,51 @@ def write_trader_pin_request(
     )
     store.put_bytes(TRADER_PIN_REQUEST_KEY, payload)
     return model
+
+
+#: The error codes S3 (and botocore) give a HEAD or GET that was refused,
+#: rather than answered. To a caller without `s3:ListBucket` covering the key,
+#: an ABSENT key is answered this way too.
+_REFUSAL_CODES = frozenset({"403", "AccessDenied", "Forbidden"})
+
+
+def _is_refusal(exc: BaseException) -> bool:
+    if isinstance(exc, PermissionError):
+        return True
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return False
+    return str(response.get("Error", {}).get("Code", "")) in _REFUSAL_CODES
+
+
+def _release_object_exists(store: Store, key: str) -> bool:
+    """Whether the release object ``key`` exists, for an identity that may GET
+    `releases/*` but may not list it (`trader-pin.yml`'s role).
+
+    alpha-engine-config-I11917: a HEAD on an ABSENT release key is a 403 to
+    that role, so a never-published sha surfaced as a bare `403 Forbidden`
+    (run 39178022107), which reads as an IAM defect. A refusal on ``key`` is
+    read as ABSENCE only when :data:`POINTER_KEY` — under the same
+    `releases/*` `s3:GetObject` grant, and present after every deploy — is
+    readable in the same call: that proves the grant works, which leaves
+    absence as the remaining reason for the 403. When the pointer is refused
+    or missing too, nothing proves the grant, and the original refusal is
+    raised unchanged: "never published" would send the operator to the wrong
+    place if the grant itself were gone. Any error that is not a refusal is
+    re-raised as it is.
+    """
+    try:
+        return store.exists(key)
+    except Exception as exc:
+        if not _is_refusal(exc):
+            raise
+        try:
+            control_readable = store.exists(POINTER_KEY)
+        except Exception:
+            raise exc from None
+        if not control_readable:
+            raise
+        return False
 
 
 def _listed(store: Store, key: str) -> bool:

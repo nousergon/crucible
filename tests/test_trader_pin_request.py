@@ -221,6 +221,81 @@ class TestTheNeverSetPinUnderAListOnlyGrant:
         document = _request(self._store(tmp_path), SHA_B)
         assert document.from_sha is None
 
+    def test_an_unpublished_sha_is_refused_as_never_published_not_as_a_bare_403(
+        self, tmp_path
+    ) -> None:
+        """alpha-engine-config-I11917: `trader-pin.yml` run 39178022107 queued a
+        sha that was never published, and the operator got a bare `403
+        Forbidden` from the HEAD on its `release.json`, which reads as an IAM
+        defect. The role reads `releases/current` under the SAME
+        `releases/*` `s3:GetObject` grant, so a refused HEAD on the record
+        while the pointer reads is S3's answer for an absent key."""
+        store = self._store(tmp_path)
+        LocalStore(tmp_path).put_bytes(release.POINTER_KEY, json.dumps({"sha": SHA_A}).encode())
+        with pytest.raises(StaleReleasePointerError, match="never published") as refused:
+            _request(store, SHA_C)
+        assert "releases/current" in str(refused.value)
+        assert not LocalStore(tmp_path).exists(TRADER_PIN_REQUEST_KEY)
+
+    def test_a_published_record_whose_wheel_is_gone_is_named_not_a_bare_403(self, tmp_path) -> None:
+        store = self._store(tmp_path)
+        LocalStore(tmp_path).put_bytes(release.POINTER_KEY, json.dumps({"sha": SHA_A}).encode())
+        record = _published(LocalStore(tmp_path), SHA_C)
+        (tmp_path / record.wheel_key).unlink()
+        with pytest.raises(StaleReleasePointerError, match="no wheel at"):
+            _request(store, SHA_C)
+
+    def test_botocores_403_on_a_head_is_read_the_same_way(self, tmp_path) -> None:
+        """What `S3Store.exists` actually raises for the refused HEAD: a
+        `ClientError` whose code is `403` (run 39178022107's traceback)."""
+        from botocore.exceptions import ClientError
+
+        store = self._store(tmp_path)
+        LocalStore(tmp_path).put_bytes(release.POINTER_KEY, json.dumps({"sha": SHA_A}).encode())
+
+        def head(key):
+            if not LocalStore.exists(store, key):
+                raise ClientError({"Error": {"Code": "403", "Message": "Forbidden"}}, "HeadObject")
+            return True
+
+        store.exists = head  # type: ignore[method-assign]
+        with pytest.raises(StaleReleasePointerError, match="never published"):
+            _request(store, SHA_C)
+
+    def test_a_refusal_with_no_readable_control_stays_a_permission_failure(self, tmp_path) -> None:
+        """With `releases/current` unreadable too, nothing shows the grant
+        works, so the refusal is NOT relabelled as an absence: it may be the
+        grant itself that is gone, and "never published" would send the
+        operator to the wrong place."""
+        store = self._store(tmp_path)
+        with pytest.raises(PermissionError, match="AccessDenied"):
+            _request(store, SHA_C)
+        assert not LocalStore(tmp_path).exists(TRADER_PIN_REQUEST_KEY)
+
+    def test_a_refusal_on_the_control_is_never_read_as_absence_of_the_sha(self, tmp_path) -> None:
+        """A grant that is gone refuses the pointer AND the record; the
+        original refusal surfaces, not a "never published"."""
+        LocalStore(tmp_path).put_bytes(release.POINTER_KEY, json.dumps({"sha": SHA_A}).encode())
+        store = self._store(tmp_path)
+
+        def refused(key):
+            raise PermissionError(f"AccessDenied: HeadObject {key} (grant removed)")
+
+        store.exists = refused  # type: ignore[method-assign]
+        with pytest.raises(PermissionError, match="grant removed"):
+            _request(store, SHA_C)
+
+    def test_a_non_refusal_error_is_never_relabelled(self, tmp_path) -> None:
+        LocalStore(tmp_path).put_bytes(release.POINTER_KEY, json.dumps({"sha": SHA_A}).encode())
+        store = self._store(tmp_path)
+
+        def throttled(key):
+            raise RuntimeError("SlowDown")
+
+        store.exists = throttled  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="SlowDown"):
+            _request(store, SHA_C)
+
     def test_the_first_request_reads_as_fresh_against_the_absent_pin(self, tmp_path) -> None:
         store = self._store(tmp_path)
         _request(store, SHA_B)
