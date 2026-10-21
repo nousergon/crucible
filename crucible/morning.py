@@ -105,6 +105,7 @@ from crucible.keys import (
     acceptance_reading_key,
     board_key,
     manifest_key,
+    manifest_prefix,
     morning_history_row_key,
     morning_report_key,
     morning_trigger_key,
@@ -1668,6 +1669,42 @@ def render_history_body(store: Store, *, console_url: str | None = None) -> str:
     return "\n".join(lines)
 
 
+#: Who started this run, as the workflow states it: `relay` (the on-time
+#: 12:15Z dispatch from alpha-engine-config), `schedule` (the GitHub cron
+#: backstop) or `manual` (a person). Set by `morning-report.yml` from
+#: `inputs.source` or the event name. Unset means a person ran the CLI, and
+#: that delivers.
+REPORT_SOURCE_VAR = "CRUCIBLE_REPORT_SOURCE"
+
+#: The starters that send at most ONE message per market close. Brian's
+#: 2026-10-21 ruling: one ping per close, sent the morning after (Tue-Sat).
+#: `resolve_trading_day` collapses Saturday, Sunday and Monday onto Friday
+#: (§4.12), so without this the Sunday and Monday mornings repeat Friday's
+#: reading. A manual run always delivers: a person asking for it gets it.
+ONCE_PER_CLOSE_SOURCES = frozenset({"relay", "schedule"})
+
+
+def earlier_delivery(store: Store, *, trading_day: str, calendar_date: str) -> str | None:
+    """The calendar date that already delivered this close, or None.
+
+    Only a filed `message.txt` counts: it is recorded AFTER `deliver`
+    returns, so its presence means the message went out. A morning whose
+    delivery failed has none and is retried on the next one. A listing that
+    fails counts as not delivered: a duplicate costs one message, a skipped
+    close costs the reading.
+    """
+    prefix = manifest_prefix(MORNING_JOB, trading_day)
+    try:
+        keys = sorted(store.list_keys(prefix))
+    except Exception:  # noqa: BLE001 - fail toward delivering
+        return None
+    for key in keys:
+        other = key[len(prefix) :].split("/", 1)[0]
+        if other != calendar_date and key == morning_report_key(trading_day, other):
+            return other
+    return None
+
+
 def morning_handler(args: argparse.Namespace) -> int:
     """`crucible report.morning [--date] [--dry-run] [--store]`.
 
@@ -1714,8 +1751,38 @@ def morning_handler(args: argparse.Namespace) -> int:
 
     console_url = _settings().console_url or None
 
+    source = optional_env(REPORT_SOURCE_VAR, default="")
+
     def body(ctx: RunContext) -> None:
         now = ctx.started
+        if not dry_run and source in ONCE_PER_CLOSE_SOURCES:
+            earlier = earlier_delivery(
+                store,
+                trading_day=ctx.trading_day.isoformat(),
+                calendar_date=ctx.calendar_date.isoformat(),
+            )
+            if earlier is not None:
+                # One message per close. The run still files an `ok`
+                # manifest, so this morning reads as a run that chose not to
+                # send, never as an absence; the metric says why.
+                ctx.record_metric(
+                    {
+                        "name": "morning_report_close_already_delivered",
+                        "module": "crucible.morning",
+                        "metric_type": "operational",
+                        "value": 0.0,
+                        "unit": "count",
+                        "n_floor": 1,
+                        "status": "OK",
+                        "status_reason": (
+                            f"the {ctx.trading_day.isoformat()} close was already "
+                            f"delivered on {earlier}; one message per close"
+                        ),
+                        "source_path": morning_report_key(ctx.trading_day.isoformat(), earlier),
+                        "last_updated_utc": now.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    }
+                )
+                return
         inputs = read_inputs(store, trading_day=ctx.trading_day, now=now, console_url=console_url)
         update = render_full_update(inputs, now=now)
         if dry_run:
