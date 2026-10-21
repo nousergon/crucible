@@ -129,6 +129,7 @@ __all__ = [
     "ChampionPointerReading",
     "Dimension",
     "DimensionFindings",
+    "LatestProductionReading",
     "LedgerError",
     "LedgerRow",
     "ProductionReading",
@@ -137,6 +138,7 @@ __all__ = [
     "V2Evidence",
     "dimension",
     "grade_carryover",
+    "read_latest_production",
     "read_production",
     "parse_ledger",
     "read_v1_live",
@@ -838,6 +840,85 @@ def read_production(
         if found:
             return ProductionReading(True, registered_on, where)
     return ProductionReading(False, registered_on, where)
+
+
+@dataclass(frozen=True)
+class LatestProductionReading(ProductionReading):
+    """:class:`ProductionReading` plus the NEWEST session the arm produced for.
+
+    ``newest`` is the latest ISO trading day any dated key under the arm's two
+    output prefixes carries, or ``None`` when the arm has produced nothing
+    dated (``produced`` is then whatever the listing found; an undated key
+    still counts as production, exactly as :func:`read_production` reads it).
+    ``newest_key`` is the key that carried it.
+    """
+
+    newest: str | None = None
+    newest_key: str | None = None
+
+
+#: A dated output key's session: `experiments/{arm}/{day}/...` or
+#: `arm_predictions/{arm}/{day}.json`, the layout `crucible.keys` owns.
+_SESSION_SEGMENT = re.compile(r"^([0-9]{4}-[0-9]{2}-[0-9]{2})(?:/|\.json$)")
+
+
+def read_latest_production(
+    store: Store, arm_id: str, registered_on: str | None = None
+) -> LatestProductionReading:
+    """When did ``arm_id`` LAST produce? (`alpha-engine-config-I12539`.)
+
+    :func:`read_production` answers "ever", which is the right question for
+    the migration's admission rule and the carry-over clause, and the wrong
+    one for a detector of SILENCE: an arm that produced once and then went
+    quiet reads produced forever. Measured 2026-10-21: two stacked M arms
+    last wrote `arm_predictions.v1` on 2026-09-25 and 2026-08-12, every weekly
+    `experiment.run[m]` refused them, and `every_registered_arm_produces`
+    stayed MET throughout. This reads the same two prefixes in full and
+    returns the newest dated session under either.
+
+    A sibling rather than a change to :func:`read_production`, whose two
+    callers keep their meaning. A listing that cannot be run makes production
+    UNKNOWN, never absent — the same reading :func:`read_production` gives.
+    """
+    from crucible.keys import (  # noqa: PLC0415 - cycle: keys is light, this stays local
+        ARM_PREDICTIONS_PREFIX,
+        arm_key_segment,
+        experiments_prefix,
+    )
+
+    prefixes = (experiments_prefix(arm_id), f"{ARM_PREDICTIONS_PREFIX}{arm_key_segment(arm_id)}/")
+    where = " or ".join(prefixes)
+    produced = False
+    newest: str | None = None
+    newest_key: str | None = None
+    for prefix in prefixes:
+        try:
+            keys = list(store.list_keys(prefix))
+        except Exception as exc:
+            return LatestProductionReading(
+                None,
+                registered_on,
+                where,
+                f"{prefix} could not be listed: {type(exc).__name__}: {exc}. That is a "
+                "statement about our access, not about the system being measured",
+            )
+        for key in keys:
+            produced = True
+            match = _SESSION_SEGMENT.match(key[len(prefix) :])
+            if match is None:
+                continue
+            day = match.group(1)
+            try:
+                dt.date.fromisoformat(day)
+            except ValueError:
+                # Not a session: a date-shaped segment that is no calendar
+                # day dates nothing, and it already counted as production.
+                continue
+            if newest is None or day > newest:
+                newest, newest_key = day, key
+    return LatestProductionReading(
+        produced, registered_on, where, newest=newest, newest_key=newest_key
+    )
 
 
 @dataclass(frozen=True)

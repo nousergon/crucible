@@ -389,7 +389,11 @@ components:
     # session; U ranks one cross-section and S resolves one session, both in
     # seconds. The trader reads the feed at the next session's open and the
     # shadow books read S's inputs after the next session's close, so the
-    # deadline is hours ahead of every consumer.
+    # deadline is hours ahead of every consumer. Since
+    # alpha-engine-config-I12539 the M run also re-derives and scores each
+    # registered stack's bases outside the champion's closure, AFTER the feed
+    # is written and best-effort (one `stack_base_scored` row per base), so
+    # that extra work can lengthen the run but never delay or fail the feed.
     schedule: weekdays after data.daily
     dispatch: scheduler
     deadline:

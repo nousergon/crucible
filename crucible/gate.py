@@ -79,6 +79,7 @@ from crucible.carryover import (
     V2Evidence,
     grade_carryover,
     parse_ledger,
+    read_latest_production,
     read_production,
     read_v1_live,
 )
@@ -8762,6 +8763,14 @@ def _absent_upstream_champion(store: Store, slot: str) -> str | None:
     return None if hook is None else hook(store)
 
 
+#: Trading sessions an ACTIVE arm that HAS produced may go without producing
+#: before `every_registered_arm_produces` reads it mute
+#: (`alpha-engine-config-I12539`). Two weekly cycles: every slot's
+#: `experiment.run` writes at least once per weekly arc, so one missed arc
+#: (a holiday week, one failed run) is tolerated and a second is not.
+SILENCE_SESSIONS = 10
+
+
 def _clause_every_registered_arm_produces(store: Store, window: list[dt.date]) -> Clause:
     """Every ACTIVE, non-control registered arm has produced something once
     its slot's settle window has passed (`alpha-engine-config-I11030`,
@@ -8780,11 +8789,22 @@ def _clause_every_registered_arm_produces(store: Store, window: list[dt.date]) -
     `v1_arms_carried_or_excluded` catches the same condition only for arms a
     v1 ledger row names. This clause holds EVERY registered arm to it.
 
-    The production predicate is `crucible.carryover.read_production`, the
+    The production predicate is `crucible.carryover.read_latest_production`
+    (a sibling of `read_production` that also dates the newest output), the
     arm's own artifacts, never the register. The settle window matches the
     carry-over clause: `DEFAULT_HORIZON_TRADING_DAYS` sessions after the day
     the arm's `registered` event was FILED. An arm filed yesterday has not
     been asked.
+
+    **Produced once is not producing** (`alpha-engine-config-I12539`). The
+    predicate used to be "ever produced", so an arm that wrote once and then
+    went silent passed forever. Measured 2026-10-21: two stacked M arms last
+    wrote on 2026-09-25 and 2026-08-12, every weekly `experiment.run[m]`
+    refused them at registration as `unservable` on an `ok` manifest, the M
+    arena lost its champion on 2026-10-09, and this clause read MET
+    throughout. An arm that has produced is now mute when its NEWEST dated
+    output (`crucible.carryover.read_latest_production`) is more than
+    :data:`SILENCE_SESSIONS` trading sessions before the reading day.
 
     **Waiting is not mute** (the 2026-09-24 ruling: the three arms stay in
     the mix, parked on purpose). An arm that has produced nothing is WAITING
@@ -8801,7 +8821,8 @@ def _clause_every_registered_arm_produces(store: Store, window: list[dt.date]) -
     * UNMEASURABLE when a register cannot be read, an arm's production
       cannot be listed, or whether a silent arm is waiting cannot be read,
       and nothing else is red. Unknown output is never a pass.
-    * UNMET while any such arm is mute past its window. The fix is output,
+    * UNMET while any such arm is mute past its window, or has produced and
+      then gone silent for more than `SILENCE_SESSIONS`. The fix is output,
       or a `retired` register event saying why the arm never will produce.
       Silence is not a fix (deliverable 4).
     * MET otherwise. Arms still inside their window, and waiting arms, are
@@ -8821,7 +8842,9 @@ def _clause_every_registered_arm_produces(store: Store, window: list[dt.date]) -
         "every ACTIVE non-control arm in each slot's register has written output under "
         "its own `experiments/` or `arm_predictions/` prefix once "
         f"{DEFAULT_HORIZON_TRADING_DAYS} trading sessions have passed since its "
-        "`registered` event was filed; an arm that will never produce carries a `retired` "
+        "`registered` event was filed, and whose newest dated output is no more than "
+        f"{SILENCE_SESSIONS} trading sessions old; an arm that will never produce "
+        "carries a `retired` "
         "event saying why, never silence; an arm whose recipe waits on a declared pending "
         "producer for a column the feature catalogue does not yet produce is named as "
         "waiting, never counted mute"
@@ -8851,13 +8874,21 @@ def _clause_every_registered_arm_produces(store: Store, window: list[dt.date]) -
             filed_on = (
                 register.state(arm_id).filed_date or register.state(arm_id).record.created_date
             )
-            reading = read_production(store, arm_id, filed_on)
+            reading = read_latest_production(store, arm_id, filed_on)
             if reading.produced is None:
                 n_checked += 1
                 access.append(f"{arm_id}: {reading.problem}")
                 continue
             if reading.produced:
                 n_checked += 1
+                if reading.newest is not None:
+                    silent = count_trading_days(dt.date.fromisoformat(reading.newest), as_of)
+                    if silent > SILENCE_SESSIONS:
+                        evidence.append(reading.newest_key or reading.key)
+                        mute.append(
+                            f"{arm_id} last produced {reading.newest}, {silent} sessions ago "
+                            f"(ACTIVE in {key}; silence allowed: {SILENCE_SESSIONS})"
+                        )
                 continue
             if waits is None:
                 try:

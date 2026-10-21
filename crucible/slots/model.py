@@ -4686,6 +4686,14 @@ DAILY_SERVE_JOB = "serve.daily"
 #: "tried and could not".
 DAILY_FEED_METRIC = "daily_feed_published"
 
+#: One row per stack base `serve.daily --slot m` scores AFTER the feed is
+#: published (`alpha-engine-config-I12539`): `OK` when the base's
+#: `arm_predictions.v1` for the session was written, `FAIL` with the exception
+#: class and message when it was not. Best-effort by design — the feed is the
+#: money path and is already written — so this row is the surface a failure
+#: is recorded on, never the run's status.
+STACK_BASE_METRIC = "stack_base_scored"
+
 
 class FitReconstructionError(TrainingIntegrityError):
     """The carried-forward fit does not reproduce the cross-section its own
@@ -4859,6 +4867,166 @@ def _serving_closure(champion: ModelRecipe, recipes: Sequence[ModelRecipe]) -> l
     return [spec.recipe for spec in ordered]
 
 
+def _stack_bases(recipes: Sequence[ModelRecipe]) -> list[ModelRecipe]:
+    """Every base a registered stacked arm reads, transitively, bases first.
+
+    A stacked arm is one declaring a `predictions[...]` input. The stacked
+    arms themselves are not included unless another stack reads them: a
+    stack's registration needs its BASES' `arm_predictions.v1` on every
+    session of its training panel (`alpha-engine-config-I12539`), not its own.
+    Order is :func:`_in_dependency_order`'s, the rule :func:`_serving_closure`
+    and the weekly fit share, so a base that is itself a stack is scored after
+    the bases it reads.
+    """
+    wanted: dict[str, ModelRecipe] = {}
+    for recipe in recipes:
+        if not _base_arm_ids(recipe, recipes):
+            continue
+        for member in _serving_closure(recipe, recipes):
+            if member.arm_id != recipe.arm_id:
+                wanted[member.name] = member
+    ordered = _in_dependency_order([RegisteredModelArm(recipe=r) for r in wanted.values()])
+    return [spec.recipe for spec in ordered]
+
+
+def _score_from_fit_of_record(
+    ctx: Any,
+    recipe: ModelRecipe,
+    *,
+    trading_day: str,
+    recipes: Sequence[ModelRecipe],
+    strategy_dir: Path | str | None,
+) -> str:
+    """Score ``recipe`` for ``trading_day`` from its fit of record and write
+    its `arm_predictions.v1`. Returns the session the fit was made as of.
+
+    The one scoring sequence `serve.daily --slot m` runs, for the champion's
+    closure and for the stack bases alike, so the two can never drift apart.
+    """
+    anchor = _fit_of_record(ctx.store, recipe, trading_day=trading_day)
+    fit, version = _carried_forward_fit(
+        ctx, recipe, anchor=anchor, recipes=recipes, strategy_dir=strategy_dir
+    )
+    panel = design_panel(
+        recipe,
+        source=FeatureLayerSource(store=ctx.store, version=version),
+        trading_day=trading_day,
+        recipes=recipes,
+        store=ctx.store,
+        ctx=ctx,
+        strategy_dir=strategy_dir,
+    )
+    _, serving = score_cross_section(fit, panel, trading_day=trading_day)
+    ctx.record_metric(serving.as_metric(slot=SLOT, phase="serving"))
+    if serving.rows_excluded:
+        ctx.record_rejected(serving.detail, serving.rows_excluded)
+    produce_arm_predictions(ctx, fit=fit, panel=panel, trading_day=trading_day)
+    return anchor
+
+
+def _serve_stack_bases(
+    ctx: Any,
+    *,
+    trading_day: str,
+    recipes: Sequence[ModelRecipe],
+    already: set[str],
+    strategy_dir: Path | str | None,
+) -> tuple[dict[str, str], list[str], dict[str, str]]:
+    """Best-effort: score every stack base not in ``already`` for the session.
+
+    Returns `(scored {arm_id: fit-of-record session}, present [arm_id],
+    failed {arm_id: reason})`. Runs only AFTER the feed is published, and
+    never raises an `Exception`: each base's failure is caught, recorded as a
+    `FAIL` :data:`STACK_BASE_METRIC` row naming the arm and the exception, and
+    the next base is tried. See :func:`serve_daily` for why.
+    """
+    scored: dict[str, str] = {}
+    present: list[str] = []
+    failed: dict[str, str] = {}
+    try:
+        bases = _stack_bases(recipes)
+    except Exception as exc:  # noqa: BLE001 - recorded as the FAIL row below
+        # Swallowed: an unresolvable stack graph. The feed is already
+        # published; the failure is recorded on this run's manifest as a
+        # FAIL `stack_base_scored` row, and the weekly registration's own
+        # refusal of the stack still names it.
+        reason = f"{type(exc).__name__}: {exc}"
+        failed["<stack graph>"] = reason
+        ctx.record_metric(
+            _stack_base_metric(
+                0.0,
+                "FAIL",
+                f"slot {SLOT}: the stack bases for {trading_day} could not be resolved "
+                f"({reason}); the feed was published regardless",
+                "arm_predictions/",
+            )
+        )
+        return scored, present, failed
+    for recipe in bases:
+        if recipe.arm_id in already:
+            continue
+        key = arm_predictions_key(recipe.arm_id, trading_day)
+        try:
+            if ctx.store.exists(key):
+                # Produced already (the arc, a backfill, an earlier run of
+                # this job): never overwritten with a carried-forward score.
+                present.append(recipe.arm_id)
+                continue
+            anchor = _score_from_fit_of_record(
+                ctx,
+                recipe,
+                trading_day=trading_day,
+                recipes=recipes,
+                strategy_dir=strategy_dir,
+            )
+        except Exception as exc:  # noqa: BLE001 - recorded as the FAIL row below
+            # Swallowed per arm: a base with no fit of record, a stale fit, a
+            # fit that does not reproduce, absent features. The feed is the
+            # money path and is already written, so this is never the run's
+            # failure; it is recorded as a FAIL `stack_base_scored` row on
+            # this manifest naming the arm and the exception, and the gap it
+            # leaves is what `experiment.run[m]`'s registration refusal and
+            # the gate's `every_registered_arm_produces` silence reading see.
+            reason = f"{type(exc).__name__}: {exc}"
+            failed[recipe.arm_id] = reason
+            ctx.record_metric(
+                _stack_base_metric(
+                    0.0,
+                    "FAIL",
+                    f"slot {SLOT}: stack base {recipe.arm_id} was NOT scored for "
+                    f"{trading_day}: {reason}",
+                    key,
+                )
+            )
+            continue
+        scored[recipe.arm_id] = anchor
+        ctx.record_metric(
+            _stack_base_metric(
+                1.0,
+                "OK",
+                f"slot {SLOT}: stack base {recipe.arm_id} scored for {trading_day} from its "
+                f"fit of record as of {anchor}",
+                key,
+            )
+        )
+    return scored, present, failed
+
+
+def _stack_base_metric(value: float, status: str, reason: str, source: str) -> dict[str, Any]:
+    return {
+        "name": STACK_BASE_METRIC,
+        "module": f"crucible.slots.{SLOT}",
+        "metric_type": "count",
+        "value": value,
+        "unit": "cross_sections",
+        "n_floor": 0,
+        "status": status,
+        "status_reason": reason,
+        "source_path": source,
+        "last_updated_utc": _utc_now(),
+    }
+
+
 def serve_daily(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
     """Publish `predictions/{trading_day}.json` for the CURRENT champion. Never fits.
 
@@ -4879,14 +5047,31 @@ def serve_daily(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
     check (`champion` equals the pointer's `arm_id`, `trading_day` equals the
     key's) holds by construction.
 
+    **Then the stack bases, best-effort** (`alpha-engine-config-I12539`).
+    After the feed is published, every base a REGISTERED stacked arm reads
+    (transitively, :func:`_stack_bases`) that the champion's closure did not
+    already cover is scored the same way, when its `arm_predictions.v1` for
+    the session does not exist yet. A stacked arm's training panel needs its
+    bases' cross-sections on EVERY session, and `experiment.run[m]` refuses
+    the stack at registration on a single gap; the weekly arc alone writes
+    one base session per week. Scoring only the champion's closure therefore
+    left every non-champion stack refused every week, forever — measured
+    2026-10-21: two stacks silent since 2026-09-25 and 2026-08-12, and the M
+    arena without a champion since 2026-10-09. Each base is one `OK` or
+    `FAIL` :data:`STACK_BASE_METRIC` row; a failure is caught per arm and can
+    neither fail the run nor touch the feed, which is already written.
+
     **What it never does.** It does not refit, so the weights served Monday to
     Friday are the weights the arc fitted — exactly the walk-forward
     `grade_arm` grades, which carries a fit forward between refits on the
-    recipe's cadence. It writes no `shadow.json` or `cross_section.json`, so it
-    adds nothing to any arm's graded series and no session it serves becomes a
+    recipe's cadence. It writes no `shadow.json` or `cross_section.json` for
+    any arm it scores — the champion, its bases, or a stack base — so it adds
+    nothing to any arm's graded series and no session it serves becomes a
     fit of record. It does not overwrite an arm's `arm_predictions.v1`: a
     session the fitting path already produced (the arc day, a backfilled day,
-    a re-run) is served from that document as it stands.
+    a re-run) is served from that document as it stands. It scores no arm
+    that is neither in the champion's closure nor a stack base: an unstacked
+    challenger's `arm_predictions.v1` stays the weekly arc's.
 
     **No champion is not a failure** — the same reading
     :func:`crucible.serving.publish_predictions_feed` gives: nothing has been
@@ -4952,25 +5137,9 @@ def serve_daily(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
             # stands and never overwritten with a carried-forward score.
             reused.append(recipe.arm_id)
             continue
-        anchor = _fit_of_record(ctx.store, recipe, trading_day=trading_day)
-        fit, version = _carried_forward_fit(
-            ctx, recipe, anchor=anchor, recipes=recipes, strategy_dir=strategy_dir
+        scored[recipe.arm_id] = _score_from_fit_of_record(
+            ctx, recipe, trading_day=trading_day, recipes=recipes, strategy_dir=strategy_dir
         )
-        panel = design_panel(
-            recipe,
-            source=FeatureLayerSource(store=ctx.store, version=version),
-            trading_day=trading_day,
-            recipes=recipes,
-            store=ctx.store,
-            ctx=ctx,
-            strategy_dir=strategy_dir,
-        )
-        _, serving = score_cross_section(fit, panel, trading_day=trading_day)
-        ctx.record_metric(serving.as_metric(slot=SLOT, phase="serving"))
-        if serving.rows_excluded:
-            ctx.record_rejected(serving.detail, serving.rows_excluded)
-        produce_arm_predictions(ctx, fit=fit, panel=panel, trading_day=trading_day)
-        scored[recipe.arm_id] = anchor
 
     feed = publish_predictions_feed(
         ctx.store, trading_day=trading_day, ctx=ctx, strategy_dir=strategy_dir
@@ -4985,6 +5154,15 @@ def serve_daily(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
             f"served {len(reused)} already-produced cross-section(s) as they stand",
         )
     )
+    # `alpha-engine-config-I12539`: AFTER the feed, and best-effort — see the
+    # docstring. Nothing below can change or fail what was published above.
+    bases_scored, bases_present, bases_failed = _serve_stack_bases(
+        ctx,
+        trading_day=trading_day,
+        recipes=recipes,
+        already=set(scored) | set(reused),
+        strategy_dir=strategy_dir,
+    )
     return {
         "slot": SLOT,
         "trading_day": trading_day,
@@ -4993,6 +5171,11 @@ def serve_daily(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
         # `{arm_id: the session its fit of record was made as of}`.
         "scored_from_fit_of": scored,
         "reused": reused,
+        # Stack bases outside the champion's closure (`-I12539`): scored
+        # `{arm_id: fit session}`, already present, and `{arm_id: reason}`.
+        "stack_bases_scored": bases_scored,
+        "stack_bases_present": bases_present,
+        "stack_bases_failed": bases_failed,
     }
 
 

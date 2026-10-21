@@ -50,6 +50,7 @@ from crucible.slots.model import (
     DAILY_FEED_METRIC,
     DAILY_SERVE_JOB,
     SLOT,
+    STACK_BASE_METRIC,
     FeatureLayerSource,
     FitReconstructionError,
     UnsignedChampionTargetError,
@@ -456,3 +457,152 @@ class TestTheJobSurface:
         holiday = manifest_key(DAILY_SERVE_JOB, "2026-09-04", discriminator="m.2026-09-07")
         assert json.loads(store.get_bytes(holiday))["status"] == "ok"
         assert not store.exists(predictions_key("2026-09-04"))
+
+
+class TestStackBasesAreScoredEverySession:
+    """`alpha-engine-config-I12539`. `experiment.run[m]` refuses a stacked arm
+    at registration on ONE missing base session, and the weekly arc writes one
+    base session per week. Scoring only the champion's closure therefore left
+    every non-champion stack refused every week. After the feed, the job also
+    scores each registered stack's bases — best-effort, never the run's
+    failure, never a change to the feed."""
+
+    def _seat_an_unstacked_champion(self, store, settings) -> dict:
+        """`other` holds the pointer and stacks on nothing, so `base` — read
+        by the registered `stacked` — is outside the champion's closure."""
+        _write_recipe(settings.strategy_dir / "arms" / SLOT, "other", features=[SECOND_COLUMN])
+        recipes = _recipes(settings)
+        _fit_on_the_arc(store, settings, arm="other")
+        _seat(store, recipes["other"].arm_id)
+        return recipes
+
+    def _stack_rows(self, store) -> list[dict]:
+        return [m for m in _manifest(store)["metrics"] if m["name"] == STACK_BASE_METRIC]
+
+    def test_a_non_champion_stack_base_is_scored_for_the_session(self, store, settings) -> None:
+        recipes = self._seat_an_unstacked_champion(store, settings)
+        _fit_on_the_arc(store, settings, arm="base")
+        base, stacked = recipes["base"], recipes["stacked"]
+
+        result = _serve(store, settings)
+
+        _trader_resolves(store, SERVE_DAY)
+        assert result["scored_from_fit_of"] == {recipes["other"].arm_id: FIT_DAY}
+        assert result["stack_bases_scored"] == {base.arm_id: FIT_DAY}
+        assert result["stack_bases_failed"] == {}
+        assert store.exists(arm_predictions_key(base.arm_id, SERVE_DAY))
+        # The stack itself is not scored, and nothing graded is written.
+        assert not store.exists(arm_predictions_key(stacked.arm_id, SERVE_DAY))
+        assert not store.exists(shadow_key(base.arm_id, SERVE_DAY))
+        assert not store.exists(cross_section_key(base.arm_id, SERVE_DAY))
+        manifest = _manifest(store)
+        assert manifest["status"] == "ok", manifest["reason"]
+        outputs = {o["key"] for o in manifest["outputs"]}
+        assert arm_predictions_key(base.arm_id, SERVE_DAY) in outputs
+        (row,) = self._stack_rows(store)
+        assert row["status"] == "OK" and row["value"] == 1.0
+        assert row["source_path"] == arm_predictions_key(base.arm_id, SERVE_DAY)
+        assert base.arm_id in row["status_reason"]
+
+    def test_the_base_is_scored_from_its_fit_of_record_like_a_champion_would_be(
+        self, store, settings
+    ) -> None:
+        """The same scoring sequence as the champion's closure: the bytes a
+        stack base gets are the bytes it would get holding the pointer."""
+        recipes = self._seat_an_unstacked_champion(store, settings)
+        _fit_on_the_arc(store, settings, arm="base")
+        _serve(store, settings)
+        as_a_stack_base = store.get_bytes(arm_predictions_key(recipes["base"].arm_id, SERVE_DAY))
+
+        store._path(arm_predictions_key(recipes["base"].arm_id, SERVE_DAY)).unlink()
+        _seat(store, recipes["base"].arm_id)
+        _serve(store, settings)
+        as_the_champion = json.loads(
+            store.get_bytes(arm_predictions_key(recipes["base"].arm_id, SERVE_DAY))
+        )
+        assert json.loads(as_a_stack_base)["predicted_alpha"] == as_the_champion["predicted_alpha"]
+
+    def test_a_base_that_cannot_be_scored_is_a_fail_row_not_a_failed_run(
+        self, store, settings
+    ) -> None:
+        """`base` was never fitted: refused by `_fit_of_record`, recorded as a
+        FAIL row naming the class, and the feed is published regardless."""
+        recipes = self._seat_an_unstacked_champion(store, settings)
+        base = recipes["base"]
+
+        result = _serve(store, settings)
+
+        pointer, feed = _trader_resolves(store, SERVE_DAY)
+        assert pointer.arm_id == recipes["other"].arm_id
+        assert feed.source_key == arm_predictions_key(recipes["other"].arm_id, SERVE_DAY)
+        assert result["stack_bases_scored"] == {}
+        assert set(result["stack_bases_failed"]) == {base.arm_id}
+        assert "MissingArtifactError" in result["stack_bases_failed"][base.arm_id]
+        assert not store.exists(arm_predictions_key(base.arm_id, SERVE_DAY))
+        manifest = _manifest(store)
+        assert manifest["status"] == "ok", manifest["reason"]
+        (feed_metric,) = [m for m in manifest["metrics"] if m["name"] == DAILY_FEED_METRIC]
+        assert feed_metric["value"] == 1.0
+        (row,) = self._stack_rows(store)
+        assert row["status"] == "FAIL" and row["value"] == 0.0
+        assert "MissingArtifactError" in row["status_reason"]
+        assert "never been fitted" in row["status_reason"]
+        assert row["source_path"] == arm_predictions_key(base.arm_id, SERVE_DAY)
+
+    def test_an_unexpected_error_scoring_a_base_never_reaches_the_feed(
+        self, store, settings, monkeypatch
+    ) -> None:
+        """Whatever a base's scoring raises, it is caught AFTER the feed: the
+        feed is byte-identical to one served with no stack in the release."""
+        import crucible.slots.model as model
+
+        recipes = self._seat_an_unstacked_champion(store, settings)
+        _fit_on_the_arc(store, settings, arm="base")
+        real = model._score_from_fit_of_record
+
+        def explodes_on_the_base(ctx, recipe, **kwargs):
+            if recipe.arm_id == recipes["base"].arm_id:
+                raise RuntimeError("boom")
+            return real(ctx, recipe, **kwargs)
+
+        monkeypatch.setattr(model, "_score_from_fit_of_record", explodes_on_the_base)
+        result = _serve(store, settings)
+        with_the_stack = json.loads(store.get_bytes(predictions_key(SERVE_DAY)))
+
+        assert result["stack_bases_failed"] == {recipes["base"].arm_id: "RuntimeError: boom"}
+        assert _manifest(store)["status"] == "ok"
+        (row,) = self._stack_rows(store)
+        assert row["status"] == "FAIL" and "RuntimeError: boom" in row["status_reason"]
+
+        monkeypatch.setattr(model, "_score_from_fit_of_record", real)
+        (settings.strategy_dir / "arms" / SLOT / "stacked.yaml").unlink()
+        store._path(predictions_key(SERVE_DAY)).unlink()
+        store._path(arm_predictions_key(recipes["other"].arm_id, SERVE_DAY)).unlink()
+        _serve(store, settings)
+        without = json.loads(store.get_bytes(predictions_key(SERVE_DAY)))
+        assert with_the_stack["predicted_alpha"] == without["predicted_alpha"]
+        assert with_the_stack["champion"] == without["champion"]
+
+    def test_a_base_already_produced_for_the_session_is_left_as_it_stands(
+        self, store, settings
+    ) -> None:
+        recipes = self._seat_an_unstacked_champion(store, settings)
+        _fit_on_the_arc(store, settings, arm="base")
+        _serve(store, settings)
+        first = store.get_bytes(arm_predictions_key(recipes["base"].arm_id, SERVE_DAY))
+
+        again = _serve(store, settings)
+
+        assert again["stack_bases_scored"] == {}
+        assert again["stack_bases_present"] == [recipes["base"].arm_id]
+        assert store.get_bytes(arm_predictions_key(recipes["base"].arm_id, SERVE_DAY)) == first
+        assert self._stack_rows(store) == []
+
+    def test_a_base_in_the_champions_closure_is_not_scored_twice(self, store, settings) -> None:
+        """`base` is the champion: the closure scored it; the stack-base pass
+        records nothing for it."""
+        _fit_on_the_arc(store, settings)
+        _seat(store, _recipes(settings)["base"].arm_id)
+        result = _serve(store, settings)
+        assert result["stack_bases_scored"] == {} and result["stack_bases_present"] == []
+        assert self._stack_rows(store) == []
