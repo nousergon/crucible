@@ -1494,6 +1494,66 @@ class TestTheJob:
         assert keys == []
 
 
+class TestOneMessagePerClose:
+    """Brian's 2026-10-21 ruling: one ping per market close, sent the morning
+    after. Sunday and Monday mornings carry Friday's close, which Saturday
+    already sent, so the relay and the cron do not send it again."""
+
+    EARLIER = "1999-01-02"
+
+    def _seed_earlier_delivery(self, store: LocalStore) -> None:
+        store.put_bytes(morning_report_key(DAY.isoformat(), self.EARLIER), b"sent")
+
+    @pytest.mark.parametrize("source", ["relay", "schedule"])
+    def test_a_close_already_delivered_is_not_sent_again(self, tmp_path, monkeypatch, source):
+        store = _seed(tmp_path, previous=_board())
+        self._seed_earlier_delivery(store)
+        calls = _stub_tracker(monkeypatch, existing_issue=7)
+        transport = _Transport()
+        monkeypatch.setattr("crucible.morning._krepis_publish", transport)
+        monkeypatch.setenv("CRUCIBLE_REPORT_SOURCE", source)
+
+        assert morning_handler(_args(tmp_path, dry_run=False)) == 0
+
+        assert transport.calls == []
+        assert calls["post"] == []
+        keys = [k for k in store.list_keys(f"runs/{MORNING_JOB}/") if k.endswith("run.json")]
+        (key,) = keys
+        manifest = json.loads(store.get_bytes(key))
+        assert manifest["status"] == "ok"
+        (metric,) = [
+            m for m in manifest["metrics"] if m["name"] == "morning_report_close_already_delivered"
+        ]
+        assert self.EARLIER in metric["status_reason"]
+
+    @pytest.mark.parametrize("source", ["manual", ""])
+    def test_a_person_always_gets_the_report(self, tmp_path, monkeypatch, source):
+        store = _seed(tmp_path, previous=_board())
+        self._seed_earlier_delivery(store)
+        _stub_tracker(monkeypatch, existing_issue=7)
+        transport = _Transport()
+        monkeypatch.setattr("crucible.morning._krepis_publish", transport)
+        monkeypatch.setenv("CRUCIBLE_REPORT_SOURCE", source)
+
+        assert morning_handler(_args(tmp_path, dry_run=False)) == 0
+        assert len(transport.calls) == 1
+
+    def test_a_close_never_delivered_is_sent(self, tmp_path, monkeypatch):
+        _seed(tmp_path, previous=_board())
+        _stub_tracker(monkeypatch, existing_issue=7)
+        transport = _Transport()
+        monkeypatch.setattr("crucible.morning._krepis_publish", transport)
+        monkeypatch.setenv("CRUCIBLE_REPORT_SOURCE", "relay")
+
+        assert morning_handler(_args(tmp_path, dry_run=False)) == 0
+        assert len(transport.calls) == 1
+
+    def test_the_workflow_states_who_started_the_run(self):
+        root = pathlib.Path(__file__).resolve().parents[1]
+        text = (root / ".github/workflows/morning-report.yml").read_text()
+        assert "CRUCIBLE_REPORT_SOURCE: ${{ inputs.source || github.event_name }}" in text
+
+
 # ── the history index (deliverable 7) ───────────────────────────────────
 
 
