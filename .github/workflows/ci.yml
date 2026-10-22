@@ -34,16 +34,37 @@ on:
     # on `push`, where nothing is waiting on the result. The extra runs are
     # metered while the repo is private, and cost a few minutes a month
     # against the §4.11 budget.
-  # STILL no `schedule:`. `alpha-engine-config-I9828` gave the acceptance
-  # job's one live-state clause (`TestCost`) a distinct UNMEASURABLE outcome,
-  # and `alpha-engine-config-I9895` (this change) gives the job the read-only
-  # OIDC it needs to actually read the account on the paths that already run
-  # it (`push: [main]`) — but a cron here would still regrade an UNCHANGED
-  # tree against an unchanged lockfile and republish the identical reading
-  # every day, forever: metered minutes on a private repo buying a signal
-  # that only a merge, not the clock, can move. A schedule earns its keep
-  # once there is a reason the account can drift without a push — that is a
-  # separate change, not a reason to withhold OIDC from this one.
+  # The post-close arm (alpha-engine-config-I12483). The reading is keyed by
+  # TRADING DAY (`acceptance_reading_key(resolve_trading_day(started))`, the
+  # last session whose close has passed), and `crucible report.morning` reads
+  # exactly that day's key with no fallback. A push binds to whichever
+  # session last closed when it landed, so with `push: [main]` as the only
+  # live arm a session got its reading only if some merge happened to land
+  # between its close and the next one. 2026-09-29, 10-12, 10-15 and 10-19
+  # had none, and their morning-report rows read `acceptance_met: null` — a
+  # day with no merge looked like an acceptance outage.
+  #
+  # The earlier comment here held the line against a cron because "only a
+  # merge, not the clock, can move" the reading. That was the wrong test: the
+  # consumer keys the reading by day, so the clock is exactly what decides
+  # whether a day HAS one, and `TestCost` reads live account state that can
+  # drift without a push. The cost is one ~1-minute job per weekday (the
+  # `test` job does not run on this arm).
+  #
+  # 21:17 UTC Monday-Friday: after the 16:00 ET close in both EST (21:00Z) and
+  # EDT (20:00Z), off the top of the hour GitHub congests. ANY delivery
+  # before the next session's close still binds to the same day, so GitHub's
+  # measured multi-hour schedule lag (morning-report.yml) cannot move the
+  # key — it can only move the instant, which `components.yaml`'s
+  # `acceptance.publish.deadline` bounds and `alerts.sweep` pages past. On a
+  # weekday holiday it re-files the previous session's key, exactly as a push
+  # that day already does. `tests/test_acceptance_reading_every_session.py`
+  # holds all of this against the trading calendar.
+  schedule:
+    - cron: '17 21 * * 1-5'
+  # The manual catch-up for a dropped scheduled event: run after the close,
+  # it files that session's reading (`gh workflow run ci.yml --ref main`).
+  workflow_dispatch:
 
 # Default-deny at the workflow level; each job re-grants only what it needs.
 # `contents: read` is NOT optional while this repo is private: with no
@@ -96,8 +117,8 @@ env:
 concurrency:
   # The event name is part of the group so that two arms sharing a ref never
   # cancel each other — a cancelled run is neither green nor red, which is the
-  # one outcome nothing notices. There is no scheduled arm today (see above),
-  # but the group is written so adding one does not silently reintroduce that.
+  # one outcome nothing notices — which is what keeps the post-close
+  # scheduled arm (above) from cancelling, or being cancelled by, a push.
   group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
@@ -105,6 +126,12 @@ jobs:
   test:
     name: lint + foundation tests
     runs-on: ubuntu-latest
+    # Grades the TREE, so only the two events that change one run it. The
+    # post-close `schedule` / `workflow_dispatch` arms exist to file the
+    # day's acceptance reading (alpha-engine-config-I12483); re-running the
+    # foundation suite on an unchanged tree every weekday would buy nothing
+    # against the §4.11 minutes budget.
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     # Measured 2026-09-24: this job runs 6–10 min (one run cancelled at the old
     # 10-minute limit, another finished in 9m51s), so 20 leaves ~2x headroom.
     timeout-minutes: 20
@@ -322,7 +349,9 @@ jobs:
     #
     # The reading is not lost — it moves to `push: [main]`, which is where a
     # phase gate belongs: graded minutes after each merge, with a deploy behind
-    # it, rather than attributed to an author who cannot change the answer.
+    # it, rather than attributed to an author who cannot change the answer —
+    # and to the weekday post-close `schedule`, so every session is filed
+    # whether or not anything merged after its close (alpha-engine-config-I12483).
     if: github.event_name != 'pull_request'
     timeout-minutes: 10
     permissions:

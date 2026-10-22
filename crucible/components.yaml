@@ -1312,9 +1312,19 @@ components:
     # report.morning`, `crucible board` and phase 0's own gate clause all read
     # it as evidence.
     #
-    # `schedule`/`dispatch`/`deadline` all null: it runs on `ci.yml`'s
-    # `push`/`pull_request` triggers. A deadline would page for a day nobody
-    # merged anything, which is a fact about the week, not about this job.
+    # Scheduled since alpha-engine-config-I12483. This row used to declare
+    # `schedule`/`dispatch`/`deadline` all null — "a deadline would page for a
+    # day nobody merged anything" — and that was the defect, not a reason:
+    # the reading is filed per TRADING DAY and `report.morning` reads that
+    # day's key, so a session with no post-close merge simply had no reading
+    # (2026-09-29, 10-12, 10-15, 10-19), and nothing paged because nothing
+    # was declared due. `ci.yml` now carries a weekday post-close cron, and
+    # the deadline below is what makes a dropped cron a page instead of a
+    # null on the morning report.
+    #
+    # 10h after the close = 02:00 ET the next calendar day: past the cron
+    # (21:17Z) plus GitHub's measured multi-hour schedule lag, and before
+    # `report.morning` reads the key.
     description: Publish the plan section 12 rule-3 acceptance reading a commit measured.
     lifecycle: ACTIVE
     signals:
@@ -1329,9 +1339,13 @@ components:
     console_surface: crucible/runs
     artifact_retention: forever
     absence_watched_by: alerts.sweep
-    schedule: null
-    dispatch: null
-    deadline: null
+    schedule: weekdays after close
+    dispatch: github-actions
+    dispatch_workflow: ci.yml
+    deadline:
+      anchor: close_plus
+      cadence: daily
+      offset_hours: 10
 
   trader.reconcile:
     # alpha-engine-config-I10651 / -I10413. The daily broker reconciliation,

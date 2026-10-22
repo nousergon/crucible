@@ -930,7 +930,8 @@ JOBS: dict[str, JobSpec] = {
     ACCEPTANCE_PUBLISH_JOB: JobSpec(
         ACCEPTANCE_PUBLISH_JOB,
         "Publish the plan §12 rule-3 acceptance reading this commit measured",
-        False,
+        # Scheduled: ci.yml's weekday post-close cron (alpha-engine-config-I12483).
+        True,
     ),
 }
 
