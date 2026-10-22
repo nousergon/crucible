@@ -22,6 +22,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import urllib.parse
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -688,6 +689,41 @@ def read_cache_from_env() -> S3ReadCache | None:
     return cache
 
 
+# ── The S3-compatible endpoint setting (alpha-engine-config-I12531, S-44) ────
+
+#: The environment variable naming an S3-compatible endpoint (MinIO, Cloudflare
+#: R2) for :class:`S3Store`'s client. Unset or blank -- the case on every
+#: production box and job -- means AWS S3 exactly as before: the client is
+#: built with ``boto3.client("s3")`` and nothing else, so the endpoint, region
+#: and addressing are botocore's own resolution, unchanged.
+ENDPOINT_URL_VAR = "CRUCIBLE_S3_ENDPOINT_URL"
+
+
+def endpoint_url_from_env() -> str | None:
+    """The endpoint :data:`ENDPOINT_URL_VAR` names, or ``None`` when unset.
+
+    A set value must be an ``http://`` or ``https://`` URL with a host. Any
+    other value RAISES rather than being ignored: a typo silently falling
+    back to AWS would send a run meant for a test store to production.
+    """
+    raw = os.environ.get(ENDPOINT_URL_VAR, "").strip()
+    if not raw:
+        return None
+    return _validated_endpoint_url(raw, origin=f"${ENDPOINT_URL_VAR}")
+
+
+def _validated_endpoint_url(url: str, *, origin: str) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError(
+            f"{origin} is {url!r}, which is not an http(s) URL with a host. An S3-compatible "
+            "endpoint looks like `http://localhost:9000` or "
+            "`https://<account>.r2.cloudflarestorage.com`. It is refused rather than "
+            "ignored, because ignoring it would point this store at AWS S3."
+        )
+    return url
+
+
 class S3Store(Store):
     """The production backend: one bucket, one prefix, no other AWS resource.
 
@@ -709,21 +745,41 @@ class S3Store(Store):
     the tests and `crucible --help` all import this module; none of them
     should need an AWS SDK on the import path, and a Lambda cold start should
     not pay for one it may never call.
+
+    ``endpoint_url`` points the client at an S3-compatible store instead of
+    AWS (`alpha-engine-config-I12531`). The explicit argument wins over
+    :data:`ENDPOINT_URL_VAR`. With neither set, the client is
+    ``boto3.client("s3")``, exactly the production call it always was.
     """
 
-    def __init__(self, bucket: str, prefix: str = "", *, client: Any = None) -> None:
+    def __init__(
+        self,
+        bucket: str,
+        prefix: str = "",
+        *,
+        client: Any = None,
+        endpoint_url: str | None = None,
+    ) -> None:
         if not bucket:
             raise ValueError("S3Store needs a bucket; an empty one would write nowhere")
         self.bucket = bucket
         self.prefix = prefix.strip("/")
         self._client = client
+        self.endpoint_url = (
+            _validated_endpoint_url(endpoint_url, origin="endpoint_url")
+            if endpoint_url is not None
+            else endpoint_url_from_env()
+        )
 
     @property
     def client(self) -> Any:
         if self._client is None:
             import boto3  # noqa: PLC0415 - lazy on purpose; see the class docstring
 
-            self._client = boto3.client("s3")
+            if self.endpoint_url is None:
+                self._client = boto3.client("s3")
+            else:
+                self._client = boto3.client("s3", endpoint_url=self.endpoint_url)
         return self._client
 
     def _s3_key(self, key: str) -> str:
