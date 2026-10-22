@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import sys
 from types import SimpleNamespace
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -160,7 +161,12 @@ class TestTheRealSdkClient:
     def test_unset_resolves_to_aws_s3(self) -> None:
         store = S3Store("bucket")
         assert store.client.meta.endpoint_url == "https://s3.amazonaws.com"
-        assert "amazonaws.com" in self._presigned(store)
+        presigned = urlsplit(self._presigned(store))
+        assert (presigned.scheme, presigned.hostname, presigned.path) == (
+            "https",
+            "bucket.s3.amazonaws.com",
+            "/k",
+        )
 
     def test_a_minio_endpoint_is_used_path_style(self, monkeypatch) -> None:
         """Path-style (`host/bucket/key`), which a MinIO on `localhost`
