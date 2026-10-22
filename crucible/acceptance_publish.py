@@ -31,9 +31,13 @@ read the document with, so a file that parser would reject is refused HERE,
 at the producer, naming the file — rather than published and rendered as
 "no acceptance reading" on two surfaces that cannot say why.
 
-**No schedule, no deadline.** The row declares both `null`: this job is
-triggered by `ci.yml`'s own `push`/`pull_request` triggers, never a clock. A
-deadline would page for a Saturday on which nobody merged anything.
+**Scheduled, with a deadline** (`alpha-engine-config-I12483`). The reading
+is filed per trading day and `crucible.morning` reads that day's key, so a
+merge-only trigger left every session with no post-close merge without a
+reading. `ci.yml` runs this job on a weekday post-close cron as well as on
+`push: [main]`, and the registry row's `close_plus` deadline pages a session
+whose reading never arrived. A weekend is never due: the deadline's cadence
+is the trading calendar's, not the week's.
 """
 
 from __future__ import annotations
