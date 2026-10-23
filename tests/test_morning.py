@@ -65,6 +65,7 @@ from crucible.morning import (
     DELIVERY_CRON_UTC,
     DELIVERY_CRON_UTC_HOUR,
     DELIVERY_TZ,
+    HEADLINE_BOARD_IN_UPDATE,
     HEADLINE_TARGET_LINES,
     MORNING_JOB,
     NO_OPERATOR_ACTION,
@@ -79,6 +80,7 @@ from crucible.morning import (
     deliver,
     morning_handler,
     read_inputs,
+    render_full_update,
     render_history_body,
     render_message,
     resolve_trigger,
@@ -958,8 +960,43 @@ class TestTheHeadline:
         assert len(lines) <= HEADLINE_TARGET_LINES
         assert lines[0] == "<b>CRUCIBLE V2 — 2026-09-02</b>"
         assert f'<a href="{UPDATE_URL}">Full update</a>' in message
+        # No console configured: the page is reachable only by a presign,
+        # which the headline never carries (alpha-engine-config-I10707). It
+        # points at the full update, which does carry it.
         board_uri = (tmp_path / "board" / "index.html").resolve().as_uri()
-        assert f'<a href="{board_uri}">Board</a>' in message
+        assert board_uri not in message
+        assert HEADLINE_BOARD_IN_UPDATE in message
+        assert board_uri in render_full_update(inputs, now=FIRED_AT)
+
+    def test_a_real_length_presign_never_reaches_the_headline(self, tmp_path, monkeypatch):
+        """alpha-engine-config-I10707. With `CRUCIBLE_CONSOLE_URL` unset, a
+        presigned S3 URL (SigV4 query string: measured 1393 wire characters
+        on the links line, 228 over the whole budget) made the headline
+        undeliverable for every store. The headline renders inside the
+        budget, without the presign, and the full update carries it."""
+        store = _seed(tmp_path, previous=_board())
+        presign = (
+            "https://example-bucket.s3.amazonaws.com/crucible/board/index.html"
+            "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential="
+            + "A" * 120
+            + "&X-Amz-Security-Token="
+            + "T" * 1100
+            + "&X-Amz-Signature="
+            + "f" * 64
+        )
+        budget = UPDATE_MESSAGE_MAX_CHARS - wire_length(TRANSPORT_PREFIX)
+        assert wire_length(presign) > budget  # the guard's own precondition
+        monkeypatch.setattr(type(store), "presigned_url", lambda self, key, expires: presign)
+        inputs = read_inputs(store, trading_day=DAY, now=FIRED_AT)
+        assert inputs.board_console_url is None and inputs.board_url == presign
+
+        message = render_message(
+            inputs, now=FIRED_AT, update_url=UPDATE_URL, history_url=HISTORY_URL
+        )
+        assert wire_length(TRANSPORT_PREFIX + message) <= UPDATE_MESSAGE_MAX_CHARS
+        assert "X-Amz-Signature" not in message
+        assert HEADLINE_BOARD_IN_UPDATE in message
+        assert presign in render_full_update(inputs, now=FIRED_AT)
 
     def test_a_latched_phase_says_so_and_names_a_regression(self, tmp_path):
         """A phase latched by its closing record reads MET with a live
@@ -1690,15 +1727,15 @@ class TestTheHistoryIndex:
 
 class TestTheThirdHeadlineLink:
     def test_the_headline_carries_all_three_links(self, tmp_path):
+        console = "https://console.example.test"
         store = _seed(tmp_path, previous=_board())
-        inputs = read_inputs(store, trading_day=DAY, now=FIRED_AT)
+        inputs = read_inputs(store, trading_day=DAY, now=FIRED_AT, console_url=console)
         message = render_message(
             inputs, now=FIRED_AT, update_url=UPDATE_URL, history_url=HISTORY_URL
         )
         assert f'<a href="{UPDATE_URL}">Full update</a>' in message
         assert f'<a href="{HISTORY_URL}">History</a>' in message
-        board_uri = (tmp_path / "board" / "index.html").resolve().as_uri()
-        assert f'<a href="{board_uri}">Board</a>' in message
+        assert f'<a href="{console}/decision?pipeline=crucible-board">Board</a>' in message
         wire = wire_length(TRANSPORT_PREFIX + message)
         assert wire <= UPDATE_MESSAGE_MAX_CHARS
 
