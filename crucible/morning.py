@@ -131,6 +131,7 @@ __all__ = [
     "DELIVERY_SEVERITY",
     "DELIVERY_SOURCE",
     "DELIVERY_TZ",
+    "HEADLINE_BOARD_IN_UPDATE",
     "HEADLINE_TARGET_LINES",
     "HISTORY_ROW_BASENAME",
     "MORNING_JOB",
@@ -1147,16 +1148,26 @@ def render_full_update(inputs: MorningInputs, *, now: dt.datetime) -> str:
     return "\n".join(lines)
 
 
+#: The headline's stand-in for a Board link it cannot carry: only a presigned
+#: page is available (`CRUCIBLE_CONSOLE_URL` unset). The full update carries
+#: that link with its expiry caveat (:func:`_board_link_lines_plain`).
+HEADLINE_BOARD_IN_UPDATE = "Board: link in Full update"
+
+
 def _headline_board_link(inputs: MorningInputs) -> str | None:
-    """The headline's "Board" link target, or `None` when there is nothing
-    to link — the full update still names why (see
-    :func:`_board_link_lines_plain`), so the headline simply omits the line
-    rather than repeating the explanation in twelve lines instead of one."""
-    if inputs.board_console_url is not None:
-        return inputs.board_console_url
-    if inputs.board_url_denied_code is not None or inputs.board_url is None:
-        return None
-    return inputs.board_url
+    """The headline's "Board" link target: the console address, or `None`.
+
+    A presigned board URL is NEVER the headline's link
+    (`alpha-engine-config-I10707`). It carries the full SigV4 query string —
+    measured 1393 wire characters for the links line alone against the
+    integration store, 228 over the WHOLE headline's budget — so a headline
+    that offered it could not be delivered for any store, and failed with a
+    budget error naming the wrong field. The full update, which has no such
+    budget, carries it instead; :func:`render_message` says so in one short
+    part of the links line. When there is no page at all, the full update
+    names why (see :func:`_board_link_lines_plain`) and the headline simply
+    omits the Board part."""
+    return inputs.board_console_url
 
 
 def render_message(
@@ -1241,6 +1252,8 @@ def render_message(
     board_link = _headline_board_link(inputs)
     if board_link:
         link_parts.append(f'<a href="{report.escape(board_link)}">Board</a>')
+    elif inputs.board_url is not None and inputs.board_url_denied_code is None:
+        link_parts.append(HEADLINE_BOARD_IN_UPDATE)
     lines.append(" · ".join(link_parts))
 
     message = "\n".join(lines)
@@ -1251,8 +1264,10 @@ def render_message(
             f"{budget}-character budget left after the transport prefix. The headline's "
             "shape is fixed (a title, one line per plan phase, three more fixed lines, "
             "one links line) and should never reach this — a board with more phases than "
-            "the plan declares, or an operator action of unbounded length, is the "
-            "likeliest cause, and the fix is at the source of that field, not a "
+            "the plan declares, an operator action of unbounded length, or an overlong "
+            "link target on the links line (a presigned S3 URL is ~1,400 characters, "
+            "which is why the headline never carries one) "
+            "is the likeliest cause, and the fix is at the source of that field, not a "
             "truncation here: a headline that silently shortened itself would be the "
             "illegible message this ruling exists to end, in a new shape."
         )
