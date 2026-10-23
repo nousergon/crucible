@@ -27,7 +27,7 @@ import os
 import threading
 import urllib.parse
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -53,7 +53,10 @@ __all__ = [
     "S3ReadCache",
     "S3Store",
     "Store",
+    "CONDITIONAL_APPEND_ATTEMPTS",
+    "ConditionalAppendError",
     "active_capture_ledger",
+    "append_conditionally",
     "begin_capture",
     "capture_ledger_of",
     "capturing",
@@ -389,6 +392,68 @@ class Store(ABC):
                 f"{len(offenders)} offending key(s):\n"
                 + "\n".join(f"  - {o}" for o in sorted(offenders))
             )
+
+
+#: How many lost conditional writes :func:`append_conditionally` absorbs by
+#: re-reading before it raises. Each loss means another writer's append LANDED,
+#: so the log is making progress; running out means contention no cadence in
+#: this repo produces, and that is reported, not absorbed.
+CONDITIONAL_APPEND_ATTEMPTS = 8
+
+
+class ConditionalAppendError(RuntimeError):
+    """An append-only log could not be extended without dropping someone's rows."""
+
+
+def append_conditionally(
+    store: Store,
+    key: str,
+    extend: Callable[[bytes], bytes | None],
+    *,
+    attempts: int = CONDITIONAL_APPEND_ATTEMPTS,
+) -> bool:
+    """Extend the object at ``key`` with a version-checked write. True if it wrote.
+
+    The shared persistence boundary for every append-only JSONL log in this
+    repo that S3's lack of an append forces into a read-modify-write
+    (`alpha-engine-config-I12562`, audit CR-01's same-class sweep). The
+    version token is read BEFORE the body, ``extend`` decides the new body
+    from the body it was given, and the write is a
+    :meth:`Store.compare_and_swap` against that token — so it lands only on
+    the version ``extend`` saw. On a lost race the body is re-read and
+    ``extend`` is asked AGAIN, which is why it must re-derive its rows from
+    what it is handed (de-duplication included) rather than close over an
+    earlier read.
+
+    ``extend`` returns the full new body, or ``None`` for "nothing to add".
+    It may raise to refuse a body it cannot extend safely. A returned body
+    that does not start with the bytes it was given is refused here: that
+    would rewrite history, not append to it.
+    """
+    for _attempt in range(attempts):
+        token = store.etag(key)
+        current = b"" if token == ETAG_ABSENT else store.get_bytes(key)
+        new = extend(current)
+        if new is None:
+            return False
+        if not new.startswith(current):
+            raise ConditionalAppendError(
+                f"refusing to write {key!r}: the new body does not begin with the "
+                f"{len(current)} byte(s) already there, so writing it would drop or "
+                "rewrite existing rows of an append-only log."
+            )
+        try:
+            store.compare_and_swap(key, token, new)
+        except PointerConflictError:
+            # Deliberate retry, not a swallow: another writer's append landed
+            # between our read and our write. Re-read it and re-decide.
+            continue
+        return True
+    raise ConditionalAppendError(
+        f"lost the conditional write of {key!r} to a concurrent writer {attempts} times in "
+        "a row; nothing from this call was recorded. Each loss means another writer "
+        "appended, so the log itself is intact — re-run this append."
+    )
 
 
 def _writer_tag() -> str:
