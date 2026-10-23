@@ -18,10 +18,13 @@ needing a second test written after the fact.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
+import fcntl
 import hashlib
 import json
 import os
+import threading
 import urllib.parse
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
@@ -388,6 +391,34 @@ class Store(ABC):
             )
 
 
+def _writer_tag() -> str:
+    """A temp-file tag unique to this process AND thread.
+
+    The pid alone is shared by every thread in a process, so two threads
+    writing one key reached `open(tmp, "xb")` on the same name and the second
+    raised `FileExistsError` — neither a conflict nor a success
+    (`alpha-engine-config-I12562`).
+    """
+    return f"{os.getpid()}.{threading.get_ident()}"
+
+
+@contextlib.contextmanager
+def _exclusive_directory_lock(directory: Path) -> Iterator[None]:
+    """An exclusive `flock` on ``directory``, released on exit.
+
+    Advisory: it excludes every writer that takes it, which is every
+    :meth:`LocalStore.compare_and_swap` replace. Nothing is created on disk,
+    so :meth:`LocalStore.list_keys` sees no lock file.
+    """
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        # Closing the descriptor releases the lock.
+        os.close(fd)
+
+
 class LocalStore(Store):
     """A directory on disk. The laptop backend, and the test backend.
 
@@ -481,15 +512,22 @@ class LocalStore(Store):
         return sha256_hex(path.read_bytes())
 
     def compare_and_swap(self, key: str, expected: str, payload: bytes) -> str:
-        """Check-then-write under an exclusive create, then rename.
+        """Check-then-write under an exclusive directory lock, then rename.
 
-        **Weaker than S3's conditional PUT, and deliberately named so.** Two
-        processes racing on the same directory could both observe the same
-        `expected` before either writes. The exclusive temp file narrows the
-        window to the check itself rather than removing it, which is honest
-        for the backend whose stated purpose is "a developer runs the whole
-        thing against a directory": the production pointer lives in S3, where
-        :class:`S3Store` makes this atomic at the service.
+        **Atomic for every writer that goes through this method**
+        (`alpha-engine-config-I12562`). The version check and the
+        `os.replace` that publishes the new body both happen while holding an
+        exclusive `flock` on the key's parent directory, so two writers —
+        threads or processes — that observed the same `expected` cannot both
+        win: the second one in re-checks after the first has published, sees
+        a different version and raises. Before this, two writers could both
+        pass the check before either replaced, and the later replace silently
+        discarded the earlier one's write — the lost update the trial ledger
+        (`crucible.ledger.append_trials`) reproduced. The lock is on the
+        DIRECTORY, not the file, because `os.replace` swaps the file's inode:
+        a lock held on the old inode does not exclude a writer that opened
+        the new one. An unconditional :meth:`put_bytes` takes no lock and is
+        not excluded — it is unconditional by contract.
 
         **The CREATE case is atomic here too** (`alpha-engine-config-I12020`).
         With ``expected`` = :data:`ETAG_ABSENT` the payload is written to an
@@ -502,26 +540,27 @@ class LocalStore(Store):
         """
         if expected == ETAG_ABSENT:
             return self._create_if_absent(key, payload)
-        current = self.etag(key)
-        if current != expected:
-            raise PointerConflictError(
-                f"{key!r} is at version {current[:12]!r}, not the expected "
-                f"{expected[:12]!r}. Re-read it and decide — a retry here would "
-                "overwrite whatever the winning writer just published."
-            )
         path = self._path(key)
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        with open(tmp, "xb") as fh:
-            fh.write(payload)
-        os.replace(tmp, path)
+        with _exclusive_directory_lock(path.parent):
+            current = self.etag(key)
+            if current != expected:
+                raise PointerConflictError(
+                    f"{key!r} is at version {current[:12]!r}, not the expected "
+                    f"{expected[:12]!r}. Re-read it and decide — a retry here would "
+                    "overwrite whatever the winning writer just published."
+                )
+            tmp = path.with_name(f".{path.name}.{_writer_tag()}.tmp")
+            with open(tmp, "xb") as fh:
+                fh.write(payload)
+            os.replace(tmp, path)
         return sha256_hex(payload)
 
     def _create_if_absent(self, key: str, payload: bytes) -> str:
         """Publish ``payload`` at ``key`` only if nothing is there; atomically."""
         path = self._path(key)
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f".{path.name}.{os.getpid()}.create.tmp")
+        tmp = path.with_name(f".{path.name}.{_writer_tag()}.create.tmp")
         with open(tmp, "xb") as fh:
             fh.write(payload)
         try:
