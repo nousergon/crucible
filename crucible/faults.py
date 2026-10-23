@@ -143,7 +143,9 @@ class ClosedPath:
 
     __slots__ = ("expected", "mechanism", "observed", "path", "probe")
 
-    def __init__(self, *, path: str, mechanism: str, probe: str, expected: str, observed: str):
+    def __init__(
+        self, *, path: str, mechanism: str, probe: str, expected: str, observed: str
+    ) -> None:
         self.path = path
         self.mechanism = mechanism
         self.probe = probe

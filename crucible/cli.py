@@ -35,8 +35,10 @@ import datetime as dt
 import importlib
 import json
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 from crucible import __version__, morning, track_c, track_e, track_f  # track-C, track-E, track-F
 from crucible.acceptance_publish import ACCEPTANCE_PUBLISH_JOB, acceptance_publish_handler
@@ -67,6 +69,11 @@ from crucible.review import REVIEW_RECORD_JOB, review_record_handler
 from crucible.runmode import RUN_MODES, RunModeError, resolve_run_mode
 from crucible.track_a import HANDLERS as TRACK_A_HANDLERS
 from crucible.track_a import add_track_a_arguments
+
+if TYPE_CHECKING:
+    from crucible.migrate import V1ModelTree
+    from crucible.runner import RunContext
+    from crucible.store import Store
 
 __all__ = [
     "FAULT_CAPABILITY_CLASS_JOBS",
@@ -156,7 +163,7 @@ def is_stub(handler: Callable[[argparse.Namespace], int]) -> bool:
 # --------------------------------------------------------------------------
 
 
-def _resolve_store(args: argparse.Namespace):
+def _resolve_store(args: argparse.Namespace) -> Store:
     """The store this invocation writes to.
 
     `--store` wins, then `CRUCIBLE_STORE`. An `s3://` URI is the S3 backend; a
@@ -188,7 +195,7 @@ def _resolve_store(args: argparse.Namespace):
         raise SystemExit(str(exc)) from exc
 
 
-def _newer_pointer_as_of(store, slot: str, as_of: str) -> str | None:
+def _newer_pointer_as_of(store: Store, slot: str, as_of: str) -> str | None:
     """The live pointer's `as_of` when it is later than ``as_of``, else ``None``.
 
     Read from the document itself rather than through `read_champion`, whose
@@ -264,7 +271,7 @@ def _promote(args: argparse.Namespace) -> int:
     # `explain` walks a promotion back to a manifest belonging to another slot.
     promote_manifest = _promote_manifest_key("promote", args.trading_day, discriminator=args.slot)
 
-    def job(ctx) -> None:
+    def job(ctx: RunContext) -> None:
         as_of = ctx.trading_day.isoformat()
         # `alpha-engine-config-I10506`: neither call below used to receive a
         # `code_sha` at all, so `crucible.promote`'s own `code_sha or "0" * 40`
@@ -474,7 +481,7 @@ def _fault_record(args: argparse.Namespace) -> int:
     store = _resolve_store(args)
     trading_day = args.trading_day.isoformat()
 
-    def job(ctx) -> None:
+    def job(ctx: RunContext) -> None:
         record_fault(
             ctx,
             store,
@@ -654,7 +661,7 @@ def _migrate_history(args: argparse.Namespace) -> int:
                 )
             recipes[recipe.name] = recipe
 
-    def job(ctx) -> None:
+    def job(ctx: RunContext) -> None:
         result = run_migrate_history(
             ctx,
             v1_store=v1_store,
@@ -680,7 +687,7 @@ def _migrate_history(args: argparse.Namespace) -> int:
     return 0
 
 
-def _model_tree(*, store, strategy_dir):
+def _model_tree(*, store: Store, strategy_dir: Path | str | None) -> V1ModelTree:
     """The M slot's recipe tree for `migrate.history`, both halves of it.
 
     ``declared`` is every filed recipe (`crucible.slots.model.
@@ -692,8 +699,6 @@ def _model_tree(*, store, strategy_dir):
     migration defers M naming the refusal, instead of this arc stage raising
     and taking every later stage down with it (`crucible-PR317`).
     """
-    from pathlib import Path
-
     from crucible.migrate import V1ModelTree
     from crucible.registration import load_registrable_recipes
     from crucible.slots.inputs import SlotUnservableError
@@ -716,7 +721,7 @@ def _model_tree(*, store, strategy_dir):
     )
 
 
-def _record_written(ctx, store, keys) -> None:
+def _record_written(ctx: RunContext, store: Store, keys: Iterable[str]) -> None:
     """Record artifacts the job wrote through the store directly.
 
     Re-reads each key and records it through `ctx.record_output`, which
