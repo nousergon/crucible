@@ -61,7 +61,7 @@ from crucible.keys import arm_register_key, strategy_arms_prefix
 from crucible.models import ArmRecipeDocument
 from crucible.slots import ControlArm, SlotSpec
 from crucible.slots.rankers import get_ranker, ranker_identity
-from crucible.store import Store
+from crucible.store import Store, append_conditionally
 
 __all__ = [
     "CONTROL_REGISTERED_AT",
@@ -78,6 +78,7 @@ __all__ = [
     "register_arms",
     "resolve_declared_lineage",
     "write_register",
+    "ArmRegisterConflictError",
 ]
 
 #: The controls' registration date. Fixed and early, for the reason given at
@@ -461,19 +462,63 @@ def read_register(store: Store, slot: str) -> ArmRegister:
     return ArmRegister.from_dicts([json.loads(line) for line in lines if line.strip()])
 
 
+class ArmRegisterConflictError(RuntimeError):
+    """The stored register holds events the register being written never saw."""
+
+
+def _serialize_events(events: Sequence[dict[str, Any]]) -> bytes:
+    return "".join(json.dumps(event, sort_keys=True) + "\n" for event in events).encode("utf-8")
+
+
 def write_register(store: Store, slot: str, register: ArmRegister) -> bytes:
-    """Serialize the event log. Append-only in content, rewritten as one object.
+    """Extend the event log with ``register``'s new events. Returns the log's bytes.
 
     One object rather than an S3 append because S3 has no append. The log's
     append-only property is a property of the EVENTS — `ArmRegister` never
     mutates or drops one — and `tests/test_slots_arms.py` asserts that a
     rewrite is a strict prefix extension of what was there.
+
+    **A version-checked extension, not an overwrite** (`alpha-engine-config-
+    I12562`, audit CR-01's arm-register sweep). Every caller reads the
+    register, folds new events into it in memory and writes it back; with an
+    unconditional PUT, two writers that read the same log both "succeeded"
+    and the later one silently erased the earlier one's `registered` or
+    `retired` event. The write now goes through
+    :func:`crucible.store.append_conditionally`: it lands only on the version
+    it checked, and the check is that the stored events are a prefix of this
+    register's. When they are not — another writer appended an event this
+    register was never folded from — it raises
+    :class:`ArmRegisterConflictError` instead of dropping that event. The
+    caller re-reads and re-folds; `crucible.runner.run_job` re-enters a job
+    from the top for exactly that.
     """
-    payload = (
-        "\n".join(json.dumps(event, sort_keys=True) for event in register.to_dicts()) + "\n"
-    ).encode("utf-8")
-    store.put_bytes(arm_register_key(slot), payload)
-    return payload
+    key = arm_register_key(slot)
+    events = register.to_dicts()
+    written: dict[str, bytes] = {}
+
+    def extend(current: bytes) -> bytes | None:
+        stored = [json.loads(line) for line in current.decode("utf-8").splitlines() if line.strip()]
+        # Compared after the library's own fold, so a stored event the library
+        # normalises on read is not mistaken for a foreign one.
+        stored_events = ArmRegister.from_dicts(stored).to_dicts() if stored else []
+        if events[: len(stored_events)] != stored_events:
+            missing = [e for e in stored_events if e not in events]
+            raise ArmRegisterConflictError(
+                f"{key!r} holds {len(stored_events)} event(s) and the register being "
+                f"written does not begin with them ({len(missing)} not in it, e.g. "
+                f"{missing[:1]}). Another writer appended after this register was read; "
+                "writing it would erase that event. Re-read the register and re-fold."
+            )
+        tail = events[len(stored_events) :]
+        if not tail and current:
+            written["body"] = current
+            return None
+        new = current + _serialize_events(tail) if current else _serialize_events(events) or b"\n"
+        written["body"] = new
+        return new
+
+    append_conditionally(store, key, extend)
+    return written["body"]
 
 
 class SupersededArmUndeclaredError(ValueError):
