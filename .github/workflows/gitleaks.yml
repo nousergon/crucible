@@ -1,19 +1,28 @@
-# Weekly full-history secret scan (alpha-engine-config-I3005).
+# Full-history secret scan on every push to main (alpha-engine-config-I3005).
 #
 # GitHub's native secret scanning matches its known provider-token formats on
 # push only. It does not catch internal-shaped secrets, and it cannot see
 # history committed before push protection existed. This caller runs the
-# fleet's shared, checksum-pinned gitleaks scan over the whole history: on
-# every push to main and weekly. A clean local run of the same gitleaks
+# fleet's shared, checksum-pinned gitleaks scan over the whole history on
+# every push to main, and on demand. A clean local run of the same gitleaks
 # version (8.30.1) over this repo's full history found 0 leaks on 2026-10-23,
 # so this starts green. No baseline file is needed.
+#
+# No `on.schedule` cron, unlike the sibling repos' copies of this caller.
+# In this repo every cron workflow must be named by a `components.yaml` row
+# (`dispatch: github-actions`), checked by nous-ergon-ops
+# `tests/crossrepo/test_crucible_dispatch_lockstep.py`. A row is one CLI or
+# workflow job that writes a run manifest, and this scan writes none, so a
+# row would declare signals that do not exist. The cron also adds nothing
+# here: every push already rescans the whole history, and between pushes the
+# history and the pinned gitleaks ruleset are both unchanged, so a weekly
+# rerun could only repeat the last push's result. A ruleset bump arrives as a
+# pin change, which is itself a push and so is scanned.
 name: Gitleaks scan
 
 on:
   push:
     branches: [main]
-  schedule:
-    - cron: "0 6 * * MON"
   workflow_dispatch:
 
 permissions:
