@@ -63,6 +63,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    import numpy as np
     import pandas as pd
 
 __all__ = [
@@ -143,7 +144,7 @@ def _classify_absent_symbols(
     return sorted(missing), sorted(unlisted)
 
 
-def _frame_dates(frame: Any):
+def _frame_dates(frame: Any) -> np.ndarray:
     """Every date a source frame carries, as a numpy array of `dt.date`.
 
     Mirrors `normalize_panel`'s own index handling exactly (``trading_day``

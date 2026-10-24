@@ -82,7 +82,8 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from types import ModuleType
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import yaml
@@ -90,6 +91,9 @@ from jsonschema import Draft202012Validator
 
 from crucible.keys import strategy_slot_key
 from crucible.store import Store
+
+if TYPE_CHECKING:
+    import cvxpy
 
 __all__ = [
     "COST_MODELS",
@@ -1088,8 +1092,8 @@ def _resolve_ref_sigma(
 
 
 def _build_tcost_term(
-    cp,
-    w,
+    cp: ModuleType,
+    w: cvxpy.Variable,
     w_prev: np.ndarray,
     adv_usd: np.ndarray | None,
     portfolio_notional: float | None,
@@ -1195,7 +1199,7 @@ def _build_tcost_term(
 
 
 def _apply_max_pct_adv_constraint(
-    w,
+    w: cvxpy.Variable,
     w_prev: np.ndarray,
     constraints: list,
     adv_usd: np.ndarray | None,
@@ -1379,7 +1383,9 @@ def _real_sectors(sectors: list[str]) -> set[str]:
     return {s for s in sectors if not (s.startswith("__") and s.endswith("__"))}
 
 
-def _solve_with_fallback(problem, w) -> tuple[np.ndarray | None, str, list[dict]]:
+def _solve_with_fallback(
+    problem: cvxpy.Problem, w: cvxpy.Variable
+) -> tuple[np.ndarray | None, str, list[dict]]:
     """Solve with the primary conic solver, then the declared alternatives.
 
     Returns ``(weights, status, attempts)``. ``attempts`` records every solver
@@ -1655,8 +1661,8 @@ def compute_conviction_budget_multiplier(
 
 
 def _apply_turnover_constraint(
-    cp,
-    w,
+    cp: ModuleType,
+    w: cvxpy.Variable,
     w_prev: np.ndarray,
     constraints: list,
     effective_caps: np.ndarray,
