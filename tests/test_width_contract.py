@@ -25,6 +25,7 @@ from nousergon_lib.arena.engine import promotion_statistic
 from nousergon_lib.arena.window import ArmSeries, pair_on_common_window
 
 from crucible.slots import (
+    EVIDENCE_ANYTIME_VALID,
     EVIDENCE_POINT,
     SLOTS,
     STATISTIC_INFORMATION_RATIO,
@@ -68,7 +69,7 @@ class TestTheRBinding:
     def test_the_pinned_r_family_now_passes_the_gate(self) -> None:
         record = assert_width_contract(SLOTS["r"], R_FAMILY)
         assert record["width_semantics"] == WIDTH_EXPERIMENTAL
-        assert record["widths"]["no_agent_quant"] == 15
+        assert record["widths"]["r:no_agent_quant:0"] == 15
 
 
 class TestCarryoverGate:
@@ -156,7 +157,14 @@ class TestTenVersusFifteen:
 
     def test_the_default_mean_statistic_would_have_picked_concentration(self) -> None:
         """The CR-05 defect, kept as the reason the gate exists."""
-        assert not self._challenger_leads(_slot(width_semantics=None))
+        # R's pre-ruling declaration: no width semantics, the library default
+        # statistic and the default evidence rule.
+        undeclared = _slot(
+            width_semantics=None,
+            promote_statistic=STATISTIC_MEAN_DIFF,
+            promote_evidence=EVIDENCE_ANYTIME_VALID,
+        )
+        assert not self._challenger_leads(undeclared)
 
 
 HORIZON = 21

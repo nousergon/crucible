@@ -66,10 +66,11 @@ This module holds the slot *shape* only, which is why it is publishable.
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict, cast
 
 from nousergon_lib.arena import ArmRegister
 from nousergon_lib.arena.engine import (
@@ -295,7 +296,16 @@ class SlotSpec:
             )
 
 
-def selection_widths(specs: Any) -> dict[str, int]:
+class WidthContract(TypedDict):
+    """What :func:`assert_width_contract` validated, stamped on the cycle."""
+
+    width_semantics: str | None
+    widths: dict[str, int]
+    promote_statistic: str
+    promote_evidence: str
+
+
+def selection_widths(specs: Iterable[object]) -> dict[str, int]:
     """Each non-control recipe's declared selection width (``params.top_n``).
 
     A recipe that declares no ``top_n`` has no selection width (the S slot's
@@ -306,15 +316,21 @@ def selection_widths(specs: Any) -> dict[str, int]:
     for spec in specs:
         if getattr(spec, "control", False):
             continue
-        params = getattr(spec, "params", None) or {}
-        if "top_n" not in params:
+        raw: object = getattr(spec, "params", None) or {}
+        if not isinstance(raw, Mapping):
             continue
+        params = cast("Mapping[str, object]", raw)
+        top_n = params.get("top_n")
+        if top_n is None:
+            continue
+        if not isinstance(top_n, (int, float, str)):
+            raise TypeError(f"params.top_n must be a number, not {type(top_n).__name__}")
         name = str(getattr(spec, "arm_id", None) or getattr(spec, "name", spec))
-        widths[name] = int(params["top_n"])
+        widths[name] = int(top_n)
     return widths
 
 
-def assert_width_contract(slot_spec: SlotSpec, specs: Any) -> dict[str, Any]:
+def assert_width_contract(slot_spec: SlotSpec, specs: Iterable[object]) -> WidthContract:
     """Validate a family's declared width semantics; return what was validated.
 
     The CR-05 carryover gate (`alpha-engine-config-I12565`). Refuses:
