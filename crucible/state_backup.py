@@ -22,7 +22,15 @@ is a JUDGMENT rather than a side effect:
   the scratch copy one way and re-verifies, and :func:`negative_control_caught`
   says whether the right check noticed. A verifier that has never been shown to
   fail is not yet known to work;
-* the S3 layout and the retention rule.
+* the retention rule (:func:`is_weekly_copy`).
+
+**The S3 layout is NOT here, deliberately.** A key helper in :mod:`crucible.keys`
+declares a store prefix, and nous-ergon-ops's lockstep guard
+(``tests/crossrepo/test_crucible_store_prefix_grants.py``) requires every declared
+prefix to be granted to the runtime role or owned by another named identity. Which
+identity writes ``state_backups/`` is the job's IAM decision (red line 1 in the
+design), so the layout lands with the job and that grant, not before them.
+:func:`latest_pointer` therefore takes the object keys as arguments.
 
 It is pure Python over JSON, so its tests run in the existing test job with no
 Postgres service and no AWS. The side effects (``pg_dump``, ``pg_restore``, the
@@ -68,8 +76,6 @@ from datetime import date, datetime, timedelta
 from typing import Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
-
-from crucible import keys
 
 #: Approved 2026-10-24 by Brian ("RPO 24h / RTO 4h approved"), I12513.
 RPO_OBJECTIVE: Final[timedelta] = timedelta(hours=24)
@@ -407,15 +413,7 @@ def negative_control_caught(mutation: MutationId, report: VerifyReport) -> tuple
     return True, f"{mutation} caught by {', '.join(expected)}"
 
 
-# ── layout and the pointer ────────────────────────────────────────────────────
-# The key shapes live in crucible.keys (its rule: every store key shape in one
-# place). They are re-exported here so the job reads one module.
-
-daily_dump_key = keys.state_backup_daily_dump_key
-daily_manifest_key = keys.state_backup_daily_manifest_key
-verify_key = keys.state_backup_verify_key
-weekly_dump_key = keys.state_backup_weekly_dump_key
-latest_key = keys.state_backup_latest_key
+# ── retention and the pointer ─────────────────────────────────────────────────
 
 
 def is_weekly_copy(on: date) -> bool:
@@ -423,18 +421,36 @@ def is_weekly_copy(on: date) -> bool:
     return on.weekday() == 6
 
 
-def latest_pointer(manifest: Manifest, report: VerifyReport, written_at: datetime) -> str:
+def latest_pointer(
+    manifest: Manifest,
+    report: VerifyReport,
+    written_at: datetime,
+    *,
+    dump_key: str,
+    manifest_key: str,
+    verify_key: str,
+) -> str:
     """The ``latest.json`` body. The freshness row reads ``written_at`` and
-    ``verify_ok``, so a dump whose restore failed never reads as a fresh backup."""
+    ``verify_ok``, so a dump whose restore failed never reads as a fresh backup.
+
+    The keys come from the caller: the layout is declared in :mod:`crucible.keys`
+    together with the job and its write grant (see the module docstring)."""
     if (report.env, report.dump_date) != (manifest.env, manifest.dump_date):
         raise ValueError("report and manifest describe different dumps")
+    for name, key in (
+        ("dump_key", dump_key),
+        ("manifest_key", manifest_key),
+        ("verify_key", verify_key),
+    ):
+        if not key or manifest.dump_date.isoformat() not in key:
+            raise ValueError(f"{name} {key!r} does not name the {manifest.dump_date} dump")
     doc = {
         "schema_version": "crucible_state_backup_latest.v1",
         "env": manifest.env,
         "dump_date": manifest.dump_date.isoformat(),
-        "dump_key": daily_dump_key(manifest.env, manifest.dump_date),
-        "manifest_key": daily_manifest_key(manifest.env, manifest.dump_date),
-        "verify_key": verify_key(manifest.env, manifest.dump_date),
+        "dump_key": dump_key,
+        "manifest_key": manifest_key,
+        "verify_key": verify_key,
         "dump_sha256": manifest.dump_sha256,
         "verify_ok": report.verify_ok,
         "objectives_met": report.objectives_met,

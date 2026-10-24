@@ -235,28 +235,35 @@ def test_fingerprint_ignores_catalog_order_and_sees_a_dropped_constraint():
     assert sb.schema_fingerprint(rows, "0008") != a
 
 
-def test_layout_and_weekly_rule():
+def test_the_weekly_copy_is_the_sunday_dump():
     on = date(2026, 10, 25)  # a Sunday
-    assert sb.daily_dump_key("prod", on) == "state_backups/prod/daily/2026-10-25.dump"
-    assert sb.daily_manifest_key("prod", on) == "state_backups/prod/daily/2026-10-25.manifest.json"
-    assert sb.verify_key("prod", on) == "state_backups/prod/verify/2026-10-25.json"
-    assert sb.weekly_dump_key("prod", on) == "state_backups/prod/weekly/2026-10-25.dump"
-    assert sb.latest_key("prod") == "state_backups/prod/latest.json"
-    assert sb.is_weekly_copy(on) and not sb.is_weekly_copy(on - timedelta(days=1))
+    assert sb.is_weekly_copy(on)
+    assert not any(sb.is_weekly_copy(on - timedelta(days=i)) for i in range(1, 7))
+
+
+def test_the_layout_is_not_declared_before_its_write_grant():
+    """``state_backups/`` stays out of crucible.keys until the job and its grant
+    land together: nous-ergon-ops's store-prefix lockstep guard fails on any
+    declared prefix that no identity is granted to write."""
     from crucible import keys
 
-    for bad in ("prod/../x", "", ".."):
-        with pytest.raises(ValueError):
-            keys.state_backup_prefix(bad)
+    assert not [n for n in keys.__all__ if n.startswith("state_backup")]
+
+
+_KEYS = {
+    "dump_key": "state_backups/staging/daily/2026-10-25.dump",
+    "manifest_key": "state_backups/staging/daily/2026-10-25.manifest.json",
+    "verify_key": "state_backups/staging/verify/2026-10-25.json",
+}
 
 
 def test_the_pointer_carries_verify_ok_and_never_claims_a_failed_restore():
     m = _manifest()
     now = datetime.fromisoformat("2026-10-25T22:52:00+00:00")
-    good = json.loads(sb.latest_pointer(m, sb.verify(m, _restored()), now))
+    good = json.loads(sb.latest_pointer(m, sb.verify(m, _restored()), now, **_KEYS))
     assert good["verify_ok"] is True and good["failed_checks"] == []
     assert good["dump_key"] == "state_backups/staging/daily/2026-10-25.dump"
-    bad = json.loads(sb.latest_pointer(m, sb.verify(m, _mutated("m2")), now))
+    bad = json.loads(sb.latest_pointer(m, sb.verify(m, _mutated("m2")), now, **_KEYS))
     assert bad["verify_ok"] is False and bad["failed_checks"] == ["V3"]
 
 
@@ -265,7 +272,17 @@ def test_the_pointer_refuses_a_mismatched_report():
     report = sb.verify(m, _restored())
     other = m.model_copy(update={"dump_date": date(2026, 10, 24)})
     with pytest.raises(ValueError):
-        sb.latest_pointer(other, report, datetime.fromisoformat("2026-10-25T22:52:00+00:00"))
+        sb.latest_pointer(
+            other, report, datetime.fromisoformat("2026-10-25T22:52:00+00:00"), **_KEYS
+        )
+
+
+def test_the_pointer_refuses_keys_for_another_night():
+    m = _manifest()
+    report = sb.verify(m, _restored())
+    wrong = {**_KEYS, "verify_key": "state_backups/staging/verify/2026-10-24.json"}
+    with pytest.raises(ValueError, match="verify_key"):
+        sb.latest_pointer(m, report, datetime.fromisoformat("2026-10-25T22:52:00+00:00"), **wrong)
 
 
 def test_documents_reject_unknown_fields():

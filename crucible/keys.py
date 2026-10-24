@@ -146,12 +146,6 @@ __all__ = [
     "shadow_key",
     "signals_key",
     "slot_bench_key",
-    "state_backup_daily_dump_key",
-    "state_backup_daily_manifest_key",
-    "state_backup_latest_key",
-    "state_backup_prefix",
-    "state_backup_verify_key",
-    "state_backup_weekly_dump_key",
     "strategy_arm_key",
     "strategy_arms_prefix",
     "strategy_holdout_key",
@@ -2143,45 +2137,3 @@ def edgar_fundamentals_session_key(label: dt.date) -> str:
     reads this new tree instead.
     """
     return f"fundamentals_pit/edgar/v1/sessions/{label.isoformat()}.parquet"
-
-
-# ── crucible-state backups (alpha-engine-config-I12513) ───────────────────────
-#
-# **A calendar-dated namespace, on purpose.** Every other key in this module binds
-# to an NYSE session (plan §4.12). A state backup does not: it is a copy of the
-# database as of a NIGHT, Sundays included (the Sunday dump is the weekly
-# retention copy), so its date is the calendar day the dump was taken. Keying it
-# by session would leave weekend dumps nowhere to go, or overwrite Friday's.
-# :meth:`crucible.store.Store.assert_keys_bind_to_trading_days` is therefore never
-# pointed at ``state_backups/``. That is the same footing as the bare
-# calendar-date manifest discriminators described above. The single producer of
-# these keys is :mod:`crucible.state_backup`.
-#
-# ``latest.json`` is a FIXED-NAME pointer written last. A ``{date}/`` prefix is a
-# row no freshness check can match (alpha-engine-config-I12469).
-
-
-def state_backup_prefix(env: str) -> str:
-    if not env or "/" in env or env.startswith("."):
-        raise ValueError(f"env must be a single path segment, got {env!r}")
-    return f"state_backups/{env}/"
-
-
-def state_backup_daily_dump_key(env: str, on: dt.date) -> str:
-    return f"{state_backup_prefix(env)}daily/{on.isoformat()}.dump"
-
-
-def state_backup_daily_manifest_key(env: str, on: dt.date) -> str:
-    return f"{state_backup_prefix(env)}daily/{on.isoformat()}.manifest.json"
-
-
-def state_backup_verify_key(env: str, on: dt.date) -> str:
-    return f"{state_backup_prefix(env)}verify/{on.isoformat()}.json"
-
-
-def state_backup_weekly_dump_key(env: str, on: dt.date) -> str:
-    return f"{state_backup_prefix(env)}weekly/{on.isoformat()}.dump"
-
-
-def state_backup_latest_key(env: str) -> str:
-    return f"{state_backup_prefix(env)}latest.json"
