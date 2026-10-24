@@ -388,6 +388,17 @@ SLOTS: dict[str, SlotSpec] = {
         slot_kind="selection_producer",
         module="research",
         benchmark="population",
+        # Brian ruling 2026-10-23 (decision card, option (a);
+        # `alpha-engine-config-I12565`, audit CR-05): R's arms select different
+        # numbers of names (`no_agent_quant` 15, the rest 10), and that width is
+        # part of what R tests. So R ranks on the information ratio, not the mean
+        # paired difference, which would hand the pointer to the narrowest arm
+        # for its concentration. The library requires `point` evidence with IR,
+        # which moves R off the 4-week anytime-valid bar. This mirrors v1
+        # research. `promote_min_weeks` and `promote_against` are unchanged.
+        width_semantics=WIDTH_EXPERIMENTAL,
+        promote_statistic=STATISTIC_INFORMATION_RATIO,
+        promote_evidence=EVIDENCE_POINT,
         control_arms=_controls("r"),
     ),
     "m": SlotSpec(

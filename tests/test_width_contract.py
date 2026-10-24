@@ -56,6 +56,21 @@ def _slot(**changes):
     return dataclasses.replace(SLOTS["r"], **changes)
 
 
+class TestTheRBinding:
+    """Brian's 2026-10-23 ruling on I12565 bound option (a): R is experimental."""
+
+    def test_r_declares_experimental_widths_on_ir_and_point(self) -> None:
+        r = SLOTS["r"]
+        assert r.width_semantics == WIDTH_EXPERIMENTAL
+        assert r.promote_statistic == STATISTIC_INFORMATION_RATIO
+        assert r.promote_evidence == EVIDENCE_POINT
+
+    def test_the_pinned_r_family_now_passes_the_gate(self) -> None:
+        record = assert_width_contract(SLOTS["r"], R_FAMILY)
+        assert record["width_semantics"] == WIDTH_EXPERIMENTAL
+        assert record["widths"]["no_agent_quant"] == 15
+
+
 class TestCarryoverGate:
     def test_an_undeclared_variable_width_family_is_refused(self) -> None:
         with pytest.raises(WidthContractError, match="declares no width_semantics"):
