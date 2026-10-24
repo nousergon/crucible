@@ -18,6 +18,14 @@
 # history and the pinned gitleaks ruleset are both unchanged, so a weekly
 # rerun could only repeat the last push's result. A ruleset bump arrives as a
 # pin change, which is itself a push and so is scanned.
+#
+# Push scans stay FULL-history, not the pushed diff (measured 2026-10-24):
+# the whole history (435 commits, ~16 MB of patches) scans in ~1.5 s with
+# gitleaks 8.30.1, and this repo is public, so its hosted-runner minutes are
+# not billed. A diff-only push scan would save nothing, and it would stop
+# rescanning old history when a ruleset bump lands, which is the one event a
+# rescan exists for. A weekly cron would need a `components.yaml` row, and a
+# row's deadline is graded on a run manifest this scan does not write.
 name: Gitleaks scan
 
 on:
