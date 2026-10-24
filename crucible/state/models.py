@@ -50,6 +50,8 @@ anything is applied.
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB
 
@@ -73,17 +75,22 @@ metadata = sa.MetaData(schema=SCHEMA)
 MONEY = sa.Numeric(20, 6)
 QUANTITY = sa.Numeric(20, 6)
 TZ = sa.DateTime(timezone=True)
+#: The value type SQLAlchemy gives a ``JSONB`` column (its private
+#: ``sqltypes._JSON_VALUE``), restated so ``_payload`` can be annotated.
+type JsonValue = str | int | bool | None | dict[str, JsonValue] | list[JsonValue]
+#: ``double precision``, parametrised so the strict type check sees ``float``.
+DOUBLE = sa.Double[float]()
 
 
-def _payload() -> sa.Column:
+def _payload() -> sa.Column[JsonValue]:
     return sa.Column("payload", JSONB, nullable=False)
 
 
-def _schema_version() -> sa.Column:
+def _schema_version() -> sa.Column[str]:
     return sa.Column("schema_version", sa.Text, nullable=False)
 
 
-def _written_at() -> sa.Column:
+def _written_at() -> sa.Column[datetime]:
     return sa.Column("written_at", TZ, nullable=False, server_default=sa.text("now()"))
 
 
@@ -103,7 +110,7 @@ trial = sa.Table(
     sa.Column("n_dates_scored", sa.Integer, nullable=False),
     sa.Column("first_date", sa.Date),
     sa.Column("last_date", sa.Date),
-    sa.Column("mean_score_ratio", sa.Double),
+    sa.Column("mean_score_ratio", DOUBLE),
     # NULL is not '{}': a pre-lineage row carries no key at all (ledger.py).
     sa.Column("lineage", JSONB),
     sa.Column("run_id", sa.Text, nullable=False),
@@ -238,9 +245,9 @@ reconciliation_discrepancy = sa.Table(
     sa.Column("ordinal", sa.Integer, nullable=False),
     sa.Column("klass", sa.Text, nullable=False),
     sa.Column("instrument", sa.Text, nullable=False),
-    sa.Column("expected", sa.Double),
-    sa.Column("actual", sa.Double),
-    sa.Column("delta", sa.Double),
+    sa.Column("expected", DOUBLE),
+    sa.Column("actual", DOUBLE),
+    sa.Column("delta", DOUBLE),
     sa.Column("side", sa.Text, nullable=False),
     sa.Column("detail", sa.Text, nullable=False),
     _written_at(),
@@ -266,7 +273,7 @@ execution_shortfall = sa.Table(
     sa.Column("n_filled", sa.Integer),
     sa.Column("notional_usd", MONEY),
     sa.Column("shortfall_usd", MONEY),
-    sa.Column("shortfall_bps_notional_weighted", sa.Double),
+    sa.Column("shortfall_bps_notional_weighted", DOUBLE),
     _schema_version(),
     _payload(),
     _written_at(),

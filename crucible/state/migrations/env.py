@@ -29,13 +29,17 @@ if config.config_file_name is not None and config.attributes.get("configure_logg
 
 def run_migrations_offline() -> None:
     dsn = os.environ.get(DSN_ENV)
-    kwargs = {"url": dsn} if dsn else {"dialect_name": "postgresql"}
-    context.configure(
-        target_metadata=metadata,
-        literal_binds=True,
-        include_schemas=True,
-        **kwargs,
-    )
+    if dsn:
+        context.configure(
+            url=dsn, target_metadata=metadata, literal_binds=True, include_schemas=True
+        )
+    else:
+        context.configure(
+            dialect_name="postgresql",
+            target_metadata=metadata,
+            literal_binds=True,
+            include_schemas=True,
+        )
     with context.begin_transaction():
         context.run_migrations()
 
