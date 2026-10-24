@@ -1,0 +1,37 @@
+{
+  "schema_version": "crucible_state_backup_manifest.v1",
+  "env": "staging",
+  "dump_date": "2026-10-25",
+  "dump_sha256": "5f1c0e7a9b3d2e4f6a8c0b1d3e5f7a9c1b3d5e7f9a1c3e5b7d9f1a3c5e7b9d1f",
+  "pg_dump_version": "pg_dump (PostgreSQL) 17.2",
+  "alembic_version": "0007_trial_ledger",
+  "schema_fingerprint": "e3c1a6f0d2b4c6e8f0a2b4d6e8f0a2c4e6a8b0d2f4a6c8e0b2d4f6a8c0e2b4d6",
+  "sequences": {
+    "ledger_events_id_seq": {"last_value": 4812, "is_called": true, "max_value_in_table": 4812},
+    "fills_id_seq": {"last_value": 913, "is_called": true, "max_value_in_table": 913}
+  },
+  "tables": {
+    "ledger_events": {"rows": 4812, "row_hash": "a1f0", "range_hashes": {}},
+    "postings": {"rows": 9624, "row_hash": "b2e1", "range_hashes": {}},
+    "fills": {"rows": 913, "row_hash": "c3d2", "range_hashes": {}},
+    "trial_ledger": {"rows": 120417, "row_hash": "d4c3",
+                     "range_hashes": {"1..10000": "r1", "10001..20000": "r2", "20001..120417": "r3"}}
+  },
+  "invariants": {
+    "postings_balance_per_entry": {"holds": true, "value": "0 unbalanced entries"},
+    "ledger_chain_head": {"holds": true, "value": "9c2e41"},
+    "event_sequence_gaps": {"holds": true, "value": "7 declared gaps, 0 undeclared"}
+  },
+  "golden": {
+    "nav_2026-09-30": "1003421.17",
+    "positions_latest_session": "sha256:77ab",
+    "trial_ledger_count_by_family": "{\"m\": 40211, \"u\": 80206}",
+    "champion_row": "arm=u-17 since=2026-10-03"
+  },
+  "snapshot": {
+    "taken_at": "2026-10-25T22:41:07Z",
+    "wal_lsn": "0/3A2B1C0",
+    "max_written_at": "2026-10-25T22:39:55Z"
+  },
+  "previous_max_written_at": "2026-10-24T22:50:55Z"
+}
