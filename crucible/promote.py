@@ -82,7 +82,7 @@ from crucible.serving import (
     servable_source,
 )
 from crucible.slots import EVIDENCE_POINT, SlotSpec, is_control_arm
-from crucible.store import ETAG_ABSENT, Store
+from crucible.store import ETAG_ABSENT, Store, append_conditionally
 
 __all__ = [
     "PROMOTION_SOURCES",
@@ -933,55 +933,64 @@ def _apply_retirements_to_register(
         return None
 
     key = arm_register_key(slot)
-    existing = _read_register_events(store, key)
-    # Both sources, because they answer the question at different moments:
-    # the STORE's log covers a first pass whose write this re-entered pass
-    # cannot see in its own register, and the in-memory register covers an
-    # arm already retired before this cycle began.
-    already_retired = {e["arm_id"] for e in existing if e.get("kind") == EVENT_RETIRED}
-    already_retired |= {
+    in_memory_retired = {
         arm for arm in register.all_arms() if register.state(arm).retired_date is not None
     }
 
-    rows: list[dict[str, Any]] = []
-    for verdict in retiring:
-        if verdict.arm_id in already_retired:
-            continue
-        rows.append(
-            ArmEvent(
-                kind=EVENT_RETIRED,
-                arm_id=verdict.arm_id,
-                date=as_of,
-                reason=verdict.reason,
-            ).to_dict()
-        )
-    if not rows:
-        return None
+    def extend(current: bytes) -> bytes | None:
+        # Re-derived from the bytes handed in, on every attempt: a lost
+        # conditional write re-reads the log, and a retirement another
+        # writer recorded in between must be skipped, not appended twice
+        # (`alpha-engine-config-I12562`, CR-01 sweep).
+        existing = _parse_jsonl(current)
+        # Both sources, because they answer the question at different moments:
+        # the STORE's log covers a first pass whose write this re-entered pass
+        # cannot see in its own register, and the in-memory register covers an
+        # arm already retired before this cycle began.
+        already_retired = {e["arm_id"] for e in existing if e.get("kind") == EVENT_RETIRED}
+        already_retired |= in_memory_retired
 
-    # Fold the log as it WILL be before writing it. The register is the
-    # document every later cycle reads; a malformed one is discovered at the
-    # next promote run otherwise, a week later and one slot at a time.
-    try:
-        ArmRegister.from_dicts(existing + rows)
-    except ImmutableArmError as exc:
-        raise PromotionRefused(
-            f"slot {slot}: this cycle's retirements cannot be appended to {key!r} — "
-            f"the folded log refuses them ({exc}). The usual cause is that the cycle "
-            "ran against a register the store does not hold: `run_promotion` retires "
-            "arms in the SAME document `load_slot_inputs` reads, so a caller that "
-            "supplied an in-memory register while the store's log is absent or "
-            "narrower has no place to record the verdict. Writing the event anyway "
-            "would leave a register no later cycle could load."
-        ) from exc
-    return _append_lines(store, key, rows)
+        rows: list[dict[str, object]] = []
+        for verdict in retiring:
+            if verdict.arm_id in already_retired:
+                continue
+            rows.append(
+                ArmEvent(
+                    kind=EVENT_RETIRED,
+                    arm_id=verdict.arm_id,
+                    date=as_of,
+                    reason=verdict.reason,
+                ).to_dict()
+            )
+        if not rows:
+            return None
+
+        # Fold the log as it WILL be before writing it. The register is the
+        # document every later cycle reads; a malformed one is discovered at the
+        # next promote run otherwise, a week later and one slot at a time.
+        try:
+            ArmRegister.from_dicts(existing + rows)
+        except ImmutableArmError as exc:
+            raise PromotionRefused(
+                f"slot {slot}: this cycle's retirements cannot be appended to {key!r} — "
+                f"the folded log refuses them ({exc}). The usual cause is that the cycle "
+                "ran against a register the store does not hold: `run_promotion` retires "
+                "arms in the SAME document `load_slot_inputs` reads, so a caller that "
+                "supplied an in-memory register while the store's log is absent or "
+                "narrower has no place to record the verdict. Writing the event anyway "
+                "would leave a register no later cycle could load."
+            ) from exc
+        return current + _jsonl_lines(rows)
+
+    return key if append_conditionally(store, key, extend) else None
 
 
-def _read_register_events(store: Store, key: str) -> list[dict[str, Any]]:
-    try:
-        raw = store.get_bytes(key)
-    except KeyError:
-        return []
+def _parse_jsonl(raw: bytes) -> list[dict[str, object]]:
     return [json.loads(line) for line in raw.decode().splitlines() if line.strip()]
+
+
+def _jsonl_lines(rows: list[dict[str, object]]) -> bytes:
+    return b"".join(json.dumps(row, sort_keys=True).encode("utf-8") + b"\n" for row in rows)
 
 
 def _append_retirement_events(store: Store, slot: str, as_of: str, cycle: ArenaCycle) -> str:
@@ -1132,52 +1141,29 @@ def _append_events(store: Store, key: str, rows: list[dict[str, Any]]) -> str:
     the log is the record, and dedupe state that lived anywhere else could
     drift from it.
     """
-    existing_raw = b""
-    seen: set[str] = set()
-    try:
-        existing_raw = store.get_bytes(key)
-    except KeyError:
-        pass
-    for line in existing_raw.decode().splitlines():
-        if not line.strip():
-            continue
-        recorded = json.loads(line).get("event_id")
-        if recorded is not None:
-            seen.add(str(recorded))
 
-    fresh: list[dict[str, Any]] = []
-    for row in rows:
-        stamped = {**row, "event_id": _event_id(key, row)}
-        if stamped["event_id"] in seen:
-            continue
-        seen.add(stamped["event_id"])
-        fresh.append(stamped)
-    if not fresh:
-        return key
-    return _append_lines(store, key, fresh, existing=existing_raw)
+    def extend(current: bytes) -> bytes | None:
+        # Re-derived on every attempt (`alpha-engine-config-I12562`, CR-01
+        # sweep): a lost conditional write re-reads the log, and a row the
+        # concurrent writer already recorded must be skipped, not doubled.
+        seen: set[str] = set()
+        for recorded_row in _parse_jsonl(current):
+            recorded = recorded_row.get("event_id")
+            if recorded is not None:
+                seen.add(str(recorded))
+        fresh: list[dict[str, object]] = []
+        for row in rows:
+            event_id = _event_id(key, row)
+            if event_id in seen:
+                continue
+            seen.add(event_id)
+            stamped: dict[str, object] = {**row, "event_id": event_id}
+            fresh.append(stamped)
+        if not fresh:
+            return None
+        return current + _jsonl_lines(fresh)
 
-
-def _append_lines(
-    store: Store, key: str, rows: list[dict[str, Any]], existing: bytes | None = None
-) -> str:
-    """Write ``rows`` as JSONL after whatever ``key`` already holds.
-
-    The raw half of :func:`_append_events`, used directly by the arm
-    register, whose rows are `nousergon_lib.arena.ArmEvent` documents: that
-    schema is the library's, an ``event_id`` this module invented would be
-    dropped the first time `crucible.slots.arms.write_register` reserialized
-    the log, and the register has a stronger idempotency key of its own — an
-    arm the fold already shows as retired.
-    """
-    if existing is None:
-        try:
-            existing = store.get_bytes(key)
-        except KeyError:
-            existing = b""
-    payload = existing + b"".join(
-        json.dumps(row, sort_keys=True).encode("utf-8") + b"\n" for row in rows
-    )
-    store.put_bytes(key, payload)
+    append_conditionally(store, key, extend)
     return key
 
 

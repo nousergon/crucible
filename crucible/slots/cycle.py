@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Any
 from nousergon_lib.arena.engine import ServingPrecondition
 from nousergon_lib.arena.window import ArmSeries
 
+from crucible.attempts import OUTCOME_FAILED, OUTCOME_KILLED, AttemptLifecycle, unavailable
 from crucible.calendar import assert_trading_day
 from crucible.config import Settings
 from crucible.data.point_in_time import EARLIEST_SNAPSHOT_BACKFILL_MODE, POINT_IN_TIME_MODE
@@ -46,13 +47,15 @@ from crucible.keys import (
     data_panel_key,
     experiments_prefix,
     features_key,
+    ledger_key,
     shadow_key,
     verdict_key,
 )
 from crucible.ledger import append_trials, trial_rows
 from crucible.slots import arm_name as name_component
-from crucible.slots import get_slot, promotable_arms
+from crucible.slots import assert_width_contract, get_slot, promotable_arms
 from crucible.slots.arms import (
+    ArmSpec,
     control_specs,
     load_arm_specs,
     read_register,
@@ -110,10 +113,17 @@ __all__ = [
     "partition_by_catalog",
     "refusal_metric",
     "run_grade",
+    "WIDTH_CONTRACT_FIELD",
     "run_produce",
     "run_produce_history",
     "run_serve_daily",
 ]
+
+
+#: The crucible-owned `arena_cycle` key carrying the validated width contract
+#: (`alpha-engine-config-I12565`, audit CR-05): `width_semantics`, the per-arm
+#: `widths`, and the `promote_statistic`/`promote_evidence` the cycle ran on.
+WIDTH_CONTRACT_FIELD = "width_contract"
 
 #: The version stamped on the per-arm score series `run_grade` writes and
 #: `crucible.promote.load_slot_inputs` reads (`alpha-engine-config-I10705`).
@@ -913,6 +923,22 @@ def run_serve_daily(
     return {"slot": slot, "trading_day": day, "champion": served, "feed_key": written}
 
 
+def _code_sha_or_unavailable() -> str | dict[str, str]:
+    """The running tree's commit, or the named-unavailable marker (CR-02).
+
+    An attempt is registered before its work and must not fail on a
+    provenance field it can only describe — so an unresolvable sha is
+    recorded as unavailable, never guessed and never fatal here. The run
+    manifest's own `code_sha` gate is unchanged.
+    """
+    from crucible.runner import CodeShaError, resolve_code_sha  # noqa: PLC0415 - avoids a cycle
+
+    try:
+        return resolve_code_sha()
+    except CodeShaError as exc:
+        return unavailable(str(exc))
+
+
 def run_grade(
     ctx: RunContext,
     *,
@@ -925,6 +951,58 @@ def run_grade(
     series: dict[str, ArmSeries] | None = None,
     settled_dates: Sequence[str] | None = None,
 ) -> dict[str, Any]:
+    """:func:`_run_grade`, with every arm it scores registered as an attempt.
+
+    `alpha-engine-config-I12563` (audit CR-02): the trial ledger's rows are
+    appended only after a successful grade, so a cycle that raised left no
+    trace of the configurations it was running. Each arm the cycle will
+    score is dispatched as an attempt (:mod:`crucible.attempts`) BEFORE the
+    grade; a grade that completes ends them ``succeeded`` linked to the
+    arena cycle; one that raises ends them ``failed`` (``killed`` for an
+    interrupt) with the exception as the reason, and re-raises it unchanged.
+    A worker killed outright ends nothing, and its attempts stay
+    ``unterminated`` in the store — discoverable, not dropped.
+    """
+    # Built inside `_run_grade` once the arguments are validated and the
+    # scored arms are known; handed back through this list so the handlers
+    # below can end whatever it dispatched.
+    lifecycles: list[AttemptLifecycle] = []
+    try:
+        return _run_grade(
+            ctx,
+            slot=slot,
+            settings=settings,
+            horizon_trading_days=horizon_trading_days,
+            feature_version=feature_version,
+            specs=specs,
+            preconditions=preconditions,
+            series=series,
+            settled_dates=settled_dates,
+            lifecycles=lifecycles,
+        )
+    except (KeyboardInterrupt, SystemExit) as exc:
+        for lifecycle in lifecycles:
+            lifecycle.end_open(OUTCOME_KILLED, f"{type(exc).__name__}: {exc}")
+        raise
+    except Exception as exc:
+        for lifecycle in lifecycles:
+            lifecycle.end_open(OUTCOME_FAILED, f"{type(exc).__name__}: {exc}")
+        raise
+
+
+def _run_grade(
+    ctx: RunContext,
+    *,
+    slot: str,
+    settings: Settings,
+    horizon_trading_days: int,
+    feature_version: str,
+    specs: Sequence[ArmSpec] | None,
+    preconditions: dict[str, list[ServingPrecondition]] | None,
+    series: dict[str, ArmSeries] | None,
+    settled_dates: Sequence[str] | None,
+    lifecycles: list[AttemptLifecycle],
+) -> dict[str, object]:
     """Score every settled shadow, verify the controls, run the cycle, write it.
 
     Four keyword seams, all additive and all defaulting to the U/R behaviour
@@ -994,6 +1072,11 @@ def run_grade(
         if specs is not None
         else load_arm_specs(slot, store=ctx.store, strategy_dir=settings.strategy_dir)
     )
+    # CR-05 carryover gate (`alpha-engine-config-I12565`): BEFORE anything is
+    # registered or scored. A family whose widths vary under no declared
+    # width semantics would be decided on a statistic that rewards
+    # concentration, so it is refused here rather than graded.
+    width_contract = assert_width_contract(slot_spec, loaded_specs)
     controls = control_specs(slot_spec)
     register = read_register(ctx.store, slot)
     register, _ = register_arms(register, loaded_specs + controls, filed_on=as_of.isoformat())
@@ -1005,7 +1088,6 @@ def run_grade(
     control_by_kind = {c.control_kind: c.arm_id for c in controls}
     control_ids = set(control_by_kind.values())
     scored_arms = register.scored_arms(as_of.isoformat(), slot_spec.retired_trailing_cycles)
-
     # A supplied series for an arm the register does not score is a caller
     # error, not a silent extra row on the cycle: `run_cycle` would carry an
     # arm no register row backs, and its verdicts would speak about an arm the
@@ -1017,6 +1099,25 @@ def run_grade(
             f"register does not score as of {as_of}. An arm scored without a register "
             "row is policy §3's defect exactly."
         )
+
+    # CR-02: every configuration this cycle will score is an attempt from
+    # HERE, before any of the work that can fail — so a grade that raises
+    # below still leaves each one discoverable with its family, config and
+    # the panel/recipe it was attempted against.
+    lifecycle = AttemptLifecycle(ctx.store, family=slot, as_of=as_of.isoformat(), run_id=ctx.run_id)
+    lifecycles.append(lifecycle)
+    lifecycle.dispatch(
+        scored_arms,
+        control_ids=control_ids,
+        provenance={
+            "data_panel_key": data_panel_key(as_of.isoformat()),
+            "recipe_sources": {
+                getattr(spec, "arm_id", ""): getattr(spec, "source_key", None)
+                for spec in loaded_specs + controls
+            },
+            "code_sha": _code_sha_or_unavailable(),
+        },
+    )
 
     # One returns cache per settled decision date, shared by every arm: the
     # forward return of a ticker from date d does not depend on who picked it,
@@ -1603,6 +1704,10 @@ def run_grade(
     # (`alpha-engine-config-I10636`; library-side tracking issue filed
     # separately since the shape is `nousergon_lib.arena`'s to own).
     cycle_payload[MIN_ACTIVE_ARMS_FINDING_METRIC] = floor_finding
+    # `alpha-engine-config-I12565`: the primary statistic, evidence rule and
+    # per-arm widths this cycle was decided under, beside the decision. Same
+    # crucible-owned-key shape as the field above.
+    cycle_payload[WIDTH_CONTRACT_FIELD] = width_contract
     # `alpha-engine-config-I10687`: same shape, same reason — a crucible-owned
     # key beside the library's own fields. `decision.incumbent` names WHICH
     # arm; this names WHERE it came from, which is the difference between a
@@ -1629,6 +1734,10 @@ def run_grade(
         arena_cycle_key=cycle_key,
     )
     append_trials(ctx.store, rows)
+    lifecycle.succeed(
+        "graded: the arena cycle was written and its trial rows appended",
+        links={"arena_cycle_key": cycle_key, "trial_ledger_key": ledger_key()},
+    )
 
     ctx.record_rows(
         rows_in=len(series_by_arm),

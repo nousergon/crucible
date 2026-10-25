@@ -18,13 +18,16 @@ needing a second test written after the fact.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
+import fcntl
 import hashlib
 import json
 import os
+import threading
 import urllib.parse
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -50,7 +53,10 @@ __all__ = [
     "S3ReadCache",
     "S3Store",
     "Store",
+    "CONDITIONAL_APPEND_ATTEMPTS",
+    "ConditionalAppendError",
     "active_capture_ledger",
+    "append_conditionally",
     "begin_capture",
     "capture_ledger_of",
     "capturing",
@@ -388,6 +394,96 @@ class Store(ABC):
             )
 
 
+#: How many lost conditional writes :func:`append_conditionally` absorbs by
+#: re-reading before it raises. Each loss means another writer's append LANDED,
+#: so the log is making progress; running out means contention no cadence in
+#: this repo produces, and that is reported, not absorbed.
+CONDITIONAL_APPEND_ATTEMPTS = 8
+
+
+class ConditionalAppendError(RuntimeError):
+    """An append-only log could not be extended without dropping someone's rows."""
+
+
+def append_conditionally(
+    store: Store,
+    key: str,
+    extend: Callable[[bytes], bytes | None],
+    *,
+    attempts: int = CONDITIONAL_APPEND_ATTEMPTS,
+) -> bool:
+    """Extend the object at ``key`` with a version-checked write. True if it wrote.
+
+    The shared persistence boundary for every append-only JSONL log in this
+    repo that S3's lack of an append forces into a read-modify-write
+    (`alpha-engine-config-I12562`, audit CR-01's same-class sweep). The
+    version token is read BEFORE the body, ``extend`` decides the new body
+    from the body it was given, and the write is a
+    :meth:`Store.compare_and_swap` against that token — so it lands only on
+    the version ``extend`` saw. On a lost race the body is re-read and
+    ``extend`` is asked AGAIN, which is why it must re-derive its rows from
+    what it is handed (de-duplication included) rather than close over an
+    earlier read.
+
+    ``extend`` returns the full new body, or ``None`` for "nothing to add".
+    It may raise to refuse a body it cannot extend safely. A returned body
+    that does not start with the bytes it was given is refused here: that
+    would rewrite history, not append to it.
+    """
+    for _attempt in range(attempts):
+        token = store.etag(key)
+        current = b"" if token == ETAG_ABSENT else store.get_bytes(key)
+        new = extend(current)
+        if new is None:
+            return False
+        if not new.startswith(current):
+            raise ConditionalAppendError(
+                f"refusing to write {key!r}: the new body does not begin with the "
+                f"{len(current)} byte(s) already there, so writing it would drop or "
+                "rewrite existing rows of an append-only log."
+            )
+        try:
+            store.compare_and_swap(key, token, new)
+        except PointerConflictError:
+            # Deliberate retry, not a swallow: another writer's append landed
+            # between our read and our write. Re-read it and re-decide.
+            continue
+        return True
+    raise ConditionalAppendError(
+        f"lost the conditional write of {key!r} to a concurrent writer {attempts} times in "
+        "a row; nothing from this call was recorded. Each loss means another writer "
+        "appended, so the log itself is intact — re-run this append."
+    )
+
+
+def _writer_tag() -> str:
+    """A temp-file tag unique to this process AND thread.
+
+    The pid alone is shared by every thread in a process, so two threads
+    writing one key reached `open(tmp, "xb")` on the same name and the second
+    raised `FileExistsError` — neither a conflict nor a success
+    (`alpha-engine-config-I12562`).
+    """
+    return f"{os.getpid()}.{threading.get_ident()}"
+
+
+@contextlib.contextmanager
+def _exclusive_directory_lock(directory: Path) -> Generator[None]:
+    """An exclusive `flock` on ``directory``, released on exit.
+
+    Advisory: it excludes every writer that takes it, which is every
+    :meth:`LocalStore.compare_and_swap` replace. Nothing is created on disk,
+    so :meth:`LocalStore.list_keys` sees no lock file.
+    """
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        # Closing the descriptor releases the lock.
+        os.close(fd)
+
+
 class LocalStore(Store):
     """A directory on disk. The laptop backend, and the test backend.
 
@@ -481,15 +577,22 @@ class LocalStore(Store):
         return sha256_hex(path.read_bytes())
 
     def compare_and_swap(self, key: str, expected: str, payload: bytes) -> str:
-        """Check-then-write under an exclusive create, then rename.
+        """Check-then-write under an exclusive directory lock, then rename.
 
-        **Weaker than S3's conditional PUT, and deliberately named so.** Two
-        processes racing on the same directory could both observe the same
-        `expected` before either writes. The exclusive temp file narrows the
-        window to the check itself rather than removing it, which is honest
-        for the backend whose stated purpose is "a developer runs the whole
-        thing against a directory": the production pointer lives in S3, where
-        :class:`S3Store` makes this atomic at the service.
+        **Atomic for every writer that goes through this method**
+        (`alpha-engine-config-I12562`). The version check and the
+        `os.replace` that publishes the new body both happen while holding an
+        exclusive `flock` on the key's parent directory, so two writers —
+        threads or processes — that observed the same `expected` cannot both
+        win: the second one in re-checks after the first has published, sees
+        a different version and raises. Before this, two writers could both
+        pass the check before either replaced, and the later replace silently
+        discarded the earlier one's write — the lost update the trial ledger
+        (`crucible.ledger.append_trials`) reproduced. The lock is on the
+        DIRECTORY, not the file, because `os.replace` swaps the file's inode:
+        a lock held on the old inode does not exclude a writer that opened
+        the new one. An unconditional :meth:`put_bytes` takes no lock and is
+        not excluded — it is unconditional by contract.
 
         **The CREATE case is atomic here too** (`alpha-engine-config-I12020`).
         With ``expected`` = :data:`ETAG_ABSENT` the payload is written to an
@@ -502,26 +605,27 @@ class LocalStore(Store):
         """
         if expected == ETAG_ABSENT:
             return self._create_if_absent(key, payload)
-        current = self.etag(key)
-        if current != expected:
-            raise PointerConflictError(
-                f"{key!r} is at version {current[:12]!r}, not the expected "
-                f"{expected[:12]!r}. Re-read it and decide — a retry here would "
-                "overwrite whatever the winning writer just published."
-            )
         path = self._path(key)
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        with open(tmp, "xb") as fh:
-            fh.write(payload)
-        os.replace(tmp, path)
+        with _exclusive_directory_lock(path.parent):
+            current = self.etag(key)
+            if current != expected:
+                raise PointerConflictError(
+                    f"{key!r} is at version {current[:12]!r}, not the expected "
+                    f"{expected[:12]!r}. Re-read it and decide — a retry here would "
+                    "overwrite whatever the winning writer just published."
+                )
+            tmp = path.with_name(f".{path.name}.{_writer_tag()}.tmp")
+            with open(tmp, "xb") as fh:
+                fh.write(payload)
+            os.replace(tmp, path)
         return sha256_hex(payload)
 
     def _create_if_absent(self, key: str, payload: bytes) -> str:
         """Publish ``payload`` at ``key`` only if nothing is there; atomically."""
         path = self._path(key)
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f".{path.name}.{os.getpid()}.create.tmp")
+        tmp = path.with_name(f".{path.name}.{_writer_tag()}.create.tmp")
         with open(tmp, "xb") as fh:
             fh.write(payload)
         try:
