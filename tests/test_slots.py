@@ -70,7 +70,7 @@ class TestConfiguredValues:
         assert cfg.min_active_arms == 3
         assert cfg.retired_trailing_cycles == 8
 
-    @pytest.mark.parametrize("slot", ["r", "s"])
+    @pytest.mark.parametrize("slot", ["s"])
     def test_the_promotion_bar_is_four_anytime_valid_weeks(self, slot: str) -> None:
         """Brian's ruling, 2026-09-01: a new arm is promotable only after 4
         paired weeks against the incumbent — 20 paired TRADING days — and
@@ -86,6 +86,16 @@ class TestConfiguredValues:
         assert get_slot(slot).promote_min_weeks == 4
         assert arena_config_for(slot).promote_min_weeks == 4
         assert arena_config_for(slot).promote_evidence == "anytime_valid"
+
+    def test_the_r_slot_ranks_on_ir_with_point_evidence_at_four_weeks(self) -> None:
+        """Brian's ruling, 2026-10-23 (`alpha-engine-config-I12565`, option
+        (a)): R's widths are experimental, so it ranks on the information
+        ratio, and the library requires `point` evidence with IR. Its 4-week
+        age bar against the incumbent is unchanged."""
+        cfg = arena_config_for("r")
+        assert cfg.promote_min_weeks == 4
+        assert cfg.promote_evidence == "point"
+        assert cfg.promote_statistic == "information_ratio"
 
     def test_the_u_slot_promotes_the_point_estimate_leader_at_two_weeks(self) -> None:
         """Brian's ruling, 2026-09-12 (`alpha-engine-config-I10546`,

@@ -51,7 +51,7 @@ from crucible.keys import (
 )
 from crucible.ledger import append_trials, trial_rows
 from crucible.slots import arm_name as name_component
-from crucible.slots import get_slot, promotable_arms
+from crucible.slots import assert_width_contract, get_slot, promotable_arms
 from crucible.slots.arms import (
     control_specs,
     load_arm_specs,
@@ -110,10 +110,17 @@ __all__ = [
     "partition_by_catalog",
     "refusal_metric",
     "run_grade",
+    "WIDTH_CONTRACT_FIELD",
     "run_produce",
     "run_produce_history",
     "run_serve_daily",
 ]
+
+
+#: The crucible-owned `arena_cycle` key carrying the validated width contract
+#: (`alpha-engine-config-I12565`, audit CR-05): `width_semantics`, the per-arm
+#: `widths`, and the `promote_statistic`/`promote_evidence` the cycle ran on.
+WIDTH_CONTRACT_FIELD = "width_contract"
 
 #: The version stamped on the per-arm score series `run_grade` writes and
 #: `crucible.promote.load_slot_inputs` reads (`alpha-engine-config-I10705`).
@@ -994,6 +1001,11 @@ def run_grade(
         if specs is not None
         else load_arm_specs(slot, store=ctx.store, strategy_dir=settings.strategy_dir)
     )
+    # CR-05 carryover gate (`alpha-engine-config-I12565`): BEFORE anything is
+    # registered or scored. A family whose widths vary under no declared
+    # width semantics would be decided on a statistic that rewards
+    # concentration, so it is refused here rather than graded.
+    width_contract = assert_width_contract(slot_spec, loaded_specs)
     controls = control_specs(slot_spec)
     register = read_register(ctx.store, slot)
     register, _ = register_arms(register, loaded_specs + controls, filed_on=as_of.isoformat())
@@ -1603,6 +1615,10 @@ def run_grade(
     # (`alpha-engine-config-I10636`; library-side tracking issue filed
     # separately since the shape is `nousergon_lib.arena`'s to own).
     cycle_payload[MIN_ACTIVE_ARMS_FINDING_METRIC] = floor_finding
+    # `alpha-engine-config-I12565`: the primary statistic, evidence rule and
+    # per-arm widths this cycle was decided under, beside the decision. Same
+    # crucible-owned-key shape as the field above.
+    cycle_payload[WIDTH_CONTRACT_FIELD] = width_contract
     # `alpha-engine-config-I10687`: same shape, same reason — a crucible-owned
     # key beside the library's own fields. `decision.incumbent` names WHICH
     # arm; this names WHERE it came from, which is the difference between a
