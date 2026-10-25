@@ -49,7 +49,7 @@ import datetime as dt
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from crucible.documents import load_store_document
 from crucible.keys import ATTEMPTS_PREFIX, attempt_event_key
@@ -123,7 +123,9 @@ def attempt_id(*, family: str, config_id: str, as_of: str) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
 
 
-def _create_once(store: Store, key: str, event: dict[str, Any], *, same: tuple[str, ...]) -> bool:
+def _create_once(
+    store: Store, key: str, event: Mapping[str, object], *, same: tuple[str, ...]
+) -> bool:
     """Create ``key`` with ``event``; True if this call wrote it.
 
     If the object already exists, it is accepted only when it agrees with
@@ -155,8 +157,8 @@ def dispatch_attempt(
     as_of: str,
     run_id: str,
     control: bool = False,
-    provenance: Mapping[str, Any] | None = None,
-    committed_cost: Mapping[str, Any] | None = None,
+    provenance: Mapping[str, object] | None = None,
+    committed_cost: Mapping[str, object] | None = None,
 ) -> str:
     """Record that ``config_id`` of ``family`` is about to run. Returns its id.
 
@@ -198,8 +200,8 @@ def terminate_attempt(
     outcome: str,
     reason: str,
     run_id: str,
-    actual_cost: Mapping[str, Any] | None = None,
-    links: Mapping[str, Any] | None = None,
+    actual_cost: Mapping[str, object] | None = None,
+    links: Mapping[str, object] | None = None,
 ) -> bool:
     """Record how attempt ``aid`` ended. True if this call wrote the event.
 
@@ -238,8 +240,8 @@ class Attempt:
     """One attempt, folded from its events."""
 
     attempt_id: str
-    dispatched: dict[str, Any]
-    terminal: dict[str, Any] | None = field(default=None)
+    dispatched: dict[str, object]
+    terminal: dict[str, object] | None = field(default=None)
 
     @property
     def family(self) -> str:
@@ -267,7 +269,7 @@ def read_attempts(store: Store) -> list[Attempt]:
     A terminal event with no dispatched event is an orphan this module never
     writes; it is refused here rather than silently counted or dropped.
     """
-    events: dict[str, dict[str, dict[str, Any]]] = {}
+    events: dict[str, dict[str, dict[str, object]]] = {}
     for key in store.list_keys(ATTEMPTS_PREFIX):
         rest = key[len(ATTEMPTS_PREFIX) :]
         aid, _, leaf = rest.partition("/")
@@ -344,8 +346,8 @@ class AttemptLifecycle:
         config_ids: Iterable[str],
         *,
         control_ids: Iterable[str] = (),
-        provenance: Mapping[str, Any] | None = None,
-        committed_cost: Mapping[str, Any] | None = None,
+        provenance: Mapping[str, object] | None = None,
+        committed_cost: Mapping[str, object] | None = None,
     ) -> dict[str, str]:
         controls = set(control_ids)
         for config_id in sorted(set(config_ids)):
@@ -363,7 +365,7 @@ class AttemptLifecycle:
             )
         return self.open_attempts
 
-    def _end(self, config_id: str, outcome: str, reason: str, links: Mapping[str, Any]) -> None:
+    def _end(self, config_id: str, outcome: str, reason: str, links: Mapping[str, object]) -> None:
         aid = self._open.pop(config_id)
         terminate_attempt(
             self.store,
@@ -383,7 +385,7 @@ class AttemptLifecycle:
             links=links,
         )
 
-    def succeed(self, reason: str, *, links: Mapping[str, Any] | None = None) -> None:
+    def succeed(self, reason: str, *, links: Mapping[str, object] | None = None) -> None:
         for config_id in sorted(self._open):
             self._end(config_id, OUTCOME_SUCCEEDED, reason, links or {})
 
