@@ -32,6 +32,7 @@ __all__ = [
     "ALERTS_ROOT",
     "ARM_PREDICTIONS_PREFIX",
     "ARM_SEGMENT_SEPARATOR",
+    "ATTEMPTS_PREFIX",
     "AcceptanceReading",
     "BOARD_CURRENT_KEY",
     "BOARD_HTML_KEY",
@@ -77,6 +78,7 @@ __all__ = [
     "arm_predictions_key",
     "arm_register_key",
     "arm_series_key",
+    "attempt_event_key",
     "attribution_key",
     "backfill_key",
     "board_html_key",
@@ -1497,6 +1499,33 @@ def ledger_key() -> str:
     and a per-date ledger would make "everything ever tried" a join.
     """
     return "ledger/trials.jsonl"
+
+
+#: Where every experiment ATTEMPT's lifecycle events live
+#: (`alpha-engine-config-I12563`, audit CR-02). A sibling of the trial
+#: ledger, not a row shape inside it: the ledger counts graded arm-cycles,
+#: this counts every configuration that was dispatched, whether it graded,
+#: failed, stopped early or never reported back.
+ATTEMPTS_PREFIX = "ledger/attempts/"
+
+#: The two lifecycle phases an attempt can record. One object each, written
+#: create-only, so neither phase can be overwritten once it has landed.
+ATTEMPT_PHASES = ("dispatched", "terminal")
+
+
+def attempt_event_key(attempt_id: str, phase: str) -> str:
+    """One create-only object per (attempt, phase).
+
+    Per-event keys rather than one appended log: a create-only PUT is atomic
+    on both backends, so two workers recording two attempts never share a
+    read-modify-write and neither can lose the other's event — the defect
+    `alpha-engine-config-I12562` found in the trial ledger's rewrite.
+    """
+    if phase not in ATTEMPT_PHASES:
+        raise ValueError(f"attempt phase is one of {ATTEMPT_PHASES}, not {phase!r}")
+    if not re.fullmatch(r"[0-9a-f]{32}", attempt_id):
+        raise ValueError(f"attempt id is 32 lowercase hex characters, not {attempt_id!r}")
+    return f"{ATTEMPTS_PREFIX}{attempt_id}/{phase}.json"
 
 
 # -- the declared board (alpha-engine-config-I9837) --------------------------

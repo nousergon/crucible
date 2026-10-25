@@ -15186,22 +15186,6 @@
             {
                 "code": "reportExplicitAny",
                 "range": {
-                    "startColumn": 68,
-                    "endColumn": 71,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportExplicitAny",
-                "range": {
-                    "startColumn": 25,
-                    "endColumn": 28,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportExplicitAny",
-                "range": {
                     "startColumn": 39,
                     "endColumn": 42,
                     "lineCount": 1
@@ -15212,22 +15196,6 @@
                 "range": {
                     "startColumn": 64,
                     "endColumn": 67,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportExplicitAny",
-                "range": {
-                    "startColumn": 26,
-                    "endColumn": 29,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportExplicitAny",
-                "range": {
-                    "startColumn": 49,
-                    "endColumn": 52,
                     "lineCount": 1
                 }
             }

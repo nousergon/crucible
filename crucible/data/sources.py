@@ -549,8 +549,11 @@ class ArcticPriceSource(PriceSource):
         """
         from nousergon_lib.arcticdb import _load_arctic_frames, open_arctic
 
+        library = self.library
+        if not library:
+            raise MissingSourceError("a dedicated-library read needs a named library")
         arctic = open_arctic(self.bucket, region=self.region)
-        lib = arctic.get_library(self.library, create_if_missing=True)
+        lib = arctic.get_library(library, create_if_missing=True)
         resolved_symbols = symbols if symbols is not None else sorted(lib.list_symbols())
         return _load_arctic_frames(
             lib,
