@@ -229,7 +229,9 @@ class TestEligibilityAgeIsTheEngines:
         """`alpha-engine-config-I10689` put M on `point` evidence; Brian's
         2026-10-03 ruling (`alpha-engine-config#11849`) ratified that and
         set M to 2 paired weeks against EVERY arm, the same bar U carries.
-        R and S keep the 4-week anytime-valid bar against the incumbent."""
+        S keeps the 4-week anytime-valid bar against the incumbent. R keeps
+        4 weeks against the incumbent on `point` evidence (Brian's 2026-10-23
+        ruling on `alpha-engine-config-I12565`, option (a): IR requires point)."""
         for slot in ("u", "m"):
             spec = get_slot(slot)
             assert (spec.promote_min_weeks, spec.promote_evidence, spec.promote_against) == (
@@ -238,11 +240,11 @@ class TestEligibilityAgeIsTheEngines:
                 "every_arm",
             )
             assert paired_days_required(spec) == 2 * TRADING_DAYS_PER_WEEK == 10
-        for slot in ("r", "s"):
+        for slot, evidence in (("r", "point"), ("s", "anytime_valid")):
             spec = get_slot(slot)
             assert (spec.promote_min_weeks, spec.promote_evidence, spec.promote_against) == (
                 4,
-                "anytime_valid",
+                evidence,
                 "incumbent",
             )
             assert paired_days_required(spec) == 4 * TRADING_DAYS_PER_WEEK == 20

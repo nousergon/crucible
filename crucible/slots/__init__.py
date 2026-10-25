@@ -66,10 +66,11 @@ This module holds the slot *shape* only, which is why it is publishable.
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict, cast
 
 from nousergon_lib.arena import ArmRegister
 from nousergon_lib.arena.engine import (
@@ -77,6 +78,8 @@ from nousergon_lib.arena.engine import (
     EVIDENCE_POINT,
     PROMOTE_AGAINST_EVERY_ARM,
     PROMOTE_AGAINST_INCUMBENT,
+    STATISTIC_INFORMATION_RATIO,
+    STATISTIC_MEAN_DIFF,
     ArenaConfig,
 )
 
@@ -92,6 +95,14 @@ __all__ = [
     "REQUIRED_ARM_FIELDS",
     "REQUIRED_RECIPE_FIELDS",
     "SLOTS",
+    "STATISTIC_INFORMATION_RATIO",
+    "STATISTIC_MEAN_DIFF",
+    "WIDTH_EXPERIMENTAL",
+    "WIDTH_RANKING_ONLY",
+    "WIDTH_SEMANTICS",
+    "WidthContractError",
+    "assert_width_contract",
+    "selection_widths",
     "UNITS_SUFFIXES",
     "ControlArm",
     "EstimatorSpec",
@@ -153,6 +164,22 @@ class ControlArm:
             )
 
 
+#: Width semantics of a selection family (`alpha-engine-config-I12565`, audit
+#: CR-05). ``experimental``: the arms carry different selection widths ON
+#: PURPOSE and the width is part of what is being tested, so the pointer must
+#: rank on the information ratio — a raw mean selects for concentration, not
+#: skill (IR ~= IC x sqrt(breadth)). ``ranking_only``: only the ranking is
+#: under test, so every arm must select the SAME number of names and the
+#: comparison is count-matched by construction.
+WIDTH_EXPERIMENTAL = "experimental"
+WIDTH_RANKING_ONLY = "ranking_only"
+WIDTH_SEMANTICS: tuple[str, ...] = (WIDTH_EXPERIMENTAL, WIDTH_RANKING_ONLY)
+
+
+class WidthContractError(ValueError):
+    """A selection family whose widths and declared statistic disagree."""
+
+
 @dataclass(frozen=True)
 class SlotSpec:
     """One slot's shape and its arena parameters.
@@ -194,6 +221,20 @@ class SlotSpec:
     #: pair on its own longest common window (`every_arm`). Declared here and
     #: decided by the library, same as the two bars above.
     promote_against: str = PROMOTE_AGAINST_INCUMBENT
+    #: WHICH statistic the pointer ranks on, passed to the library's
+    #: `ArenaConfig.promote_statistic` (`alpha-engine-config-I12565`). The
+    #: default is the library's own (`mean_diff`); a family whose widths are
+    #: experimental must declare `information_ratio`, and the library then
+    #: requires `promote_evidence=point`.
+    promote_statistic: str = STATISTIC_MEAN_DIFF
+    #: Whether arm widths (`params.top_n`) are part of the experiment
+    #: (:data:`WIDTH_EXPERIMENTAL`) or held equal (:data:`WIDTH_RANKING_ONLY`).
+    #: ``None`` = undeclared, which is legal ONLY while every arm the slot
+    #: grades selects the same number of names: :func:`assert_width_contract`
+    #: refuses a family whose widths vary under no declaration, because the
+    #: default mean statistic would then promote the narrowest arm for its
+    #: concentration (CR-05).
+    width_semantics: str | None = None
     #: The fraction of a session's panel a STACKED arm's base model must have
     #: expressed an opinion on before that session may be built. Brian's
     #: ruling 2026-09-17 (`alpha-engine-config-I10947`, option (a)): a stacked
@@ -233,7 +274,102 @@ class SlotSpec:
             promote_min_weeks=self.promote_min_weeks,
             promote_evidence=self.promote_evidence,
             promote_against=self.promote_against,
+            promote_statistic=self.promote_statistic,
         )
+
+    def __post_init__(self) -> None:
+        if self.width_semantics is not None and self.width_semantics not in WIDTH_SEMANTICS:
+            raise WidthContractError(
+                f"slot {self.slot!r}: width_semantics is one of {WIDTH_SEMANTICS} or None, "
+                f"not {self.width_semantics!r}"
+            )
+        if (
+            self.width_semantics == WIDTH_EXPERIMENTAL
+            and self.promote_statistic != STATISTIC_INFORMATION_RATIO
+        ):
+            raise WidthContractError(
+                f"slot {self.slot!r} declares width_semantics={WIDTH_EXPERIMENTAL!r} with "
+                f"promote_statistic={self.promote_statistic!r}. When width is part of the "
+                "experiment, a mean paired difference rewards concentration rather than "
+                f"skill; the family must rank on {STATISTIC_INFORMATION_RATIO!r} "
+                "(audit CR-05)."
+            )
+
+
+class WidthContract(TypedDict):
+    """What :func:`assert_width_contract` validated, stamped on the cycle."""
+
+    width_semantics: str | None
+    widths: dict[str, int]
+    promote_statistic: str
+    promote_evidence: str
+
+
+def selection_widths(specs: Iterable[object]) -> dict[str, int]:
+    """Each non-control recipe's declared selection width (``params.top_n``).
+
+    A recipe that declares no ``top_n`` has no selection width (the S slot's
+    book is solved, not cut) and is left out: the contract below governs the
+    width of a SELECTION, and there is none to govern.
+    """
+    widths: dict[str, int] = {}
+    for spec in specs:
+        if getattr(spec, "control", False):
+            continue
+        raw: object = getattr(spec, "params", None) or {}
+        if not isinstance(raw, Mapping):
+            continue
+        params = cast("Mapping[str, object]", raw)
+        top_n = params.get("top_n")
+        if top_n is None:
+            continue
+        if not isinstance(top_n, (int, float, str)):
+            raise TypeError(f"params.top_n must be a number, not {type(top_n).__name__}")
+        name = str(getattr(spec, "arm_id", None) or getattr(spec, "name", spec))
+        widths[name] = int(top_n)
+    return widths
+
+
+def assert_width_contract(slot_spec: SlotSpec, specs: Iterable[object]) -> WidthContract:
+    """Validate a family's declared width semantics; return what was validated.
+
+    The CR-05 carryover gate (`alpha-engine-config-I12565`). Refuses:
+
+    * widths that vary under NO declaration — the omitted contract;
+    * widths that vary under ``ranking_only`` — a ranking-only comparison is
+      count-matched, so unequal widths are a recipe error.
+
+    ``experimental`` with varying widths passes, and ranks on the information
+    ratio (enforced at :class:`SlotSpec` construction). The returned record is
+    stamped on the cycle artifact so the primary statistic, evidence rule and
+    widths travel with the decision they produced.
+    """
+    widths = selection_widths(specs)
+    distinct = sorted(set(widths.values()))
+    if len(distinct) > 1:
+        detail = ", ".join(f"{name}={width}" for name, width in sorted(widths.items()))
+        if slot_spec.width_semantics is None:
+            raise WidthContractError(
+                f"slot {slot_spec.slot!r} grades arms of different widths ({detail}) and "
+                "declares no width_semantics. Under the default "
+                f"{slot_spec.promote_statistic!r} statistic the narrowest arm wins on "
+                "concentration, not skill. Declare the family "
+                f"{WIDTH_EXPERIMENTAL!r} (rank on {STATISTIC_INFORMATION_RATIO!r}, "
+                f"evidence {EVIDENCE_POINT!r}) or {WIDTH_RANKING_ONLY!r} (equal widths) — a "
+                "ruling on the slot's evidence rule, not a default "
+                "(audit CR-05)."
+            )
+        if slot_spec.width_semantics == WIDTH_RANKING_ONLY:
+            raise WidthContractError(
+                f"slot {slot_spec.slot!r} is declared {WIDTH_RANKING_ONLY!r}, so every arm "
+                f"must select the same number of names; got {detail}."
+            )
+    return {
+        "width_semantics": slot_spec.width_semantics,
+        "widths": dict(sorted(widths.items())),
+        "promote_statistic": slot_spec.promote_statistic,
+        "promote_evidence": slot_spec.promote_evidence,
+    }
 
 
 def _controls(slot: str) -> tuple[ControlArm, ...]:
@@ -268,6 +404,17 @@ SLOTS: dict[str, SlotSpec] = {
         slot_kind="selection_producer",
         module="research",
         benchmark="population",
+        # Brian ruling 2026-10-23 (decision card, option (a);
+        # `alpha-engine-config-I12565`, audit CR-05): R's arms select different
+        # numbers of names (`no_agent_quant` 15, the rest 10), and that width is
+        # part of what R tests. So R ranks on the information ratio, not the mean
+        # paired difference, which would hand the pointer to the narrowest arm
+        # for its concentration. The library requires `point` evidence with IR,
+        # which moves R off the 4-week anytime-valid bar. This mirrors v1
+        # research. `promote_min_weeks` and `promote_against` are unchanged.
+        width_semantics=WIDTH_EXPERIMENTAL,
+        promote_statistic=STATISTIC_INFORMATION_RATIO,
+        promote_evidence=EVIDENCE_POINT,
         control_arms=_controls("r"),
     ),
     "m": SlotSpec(

@@ -20,8 +20,18 @@ deflate every real arm's Sharpe for the harness's own self-check.
 
 **JSONL, appended by rewrite.** S3 has no append. The append-only property
 is a property of the CONTENT — nothing here rewrites or drops an existing
-row — and `tests/test_ledger.py` asserts that every write is a strict prefix
-extension of the file it replaces.
+row — and `tests/test_ledger_explain_migrate.py` asserts that every write is a
+strict prefix extension of the file it replaces.
+
+**The rewrite is a conditional write** (`alpha-engine-config-I12562`, audit
+CR-01). A read-modify-write of one object is only append-only if the write
+lands on the version it read; an unconditional PUT gives the ledger to
+whichever writer finished last and silently drops the other's trial. So
+:func:`append_trials` takes the object's version token BEFORE it reads,
+writes with :meth:`Store.compare_and_swap` against that token, and on a lost
+race re-reads and re-decides — a bounded number of times, then it raises.
+`tests/test_ledger_concurrency.py` holds two writers past their final read
+on both backends and asserts both trials survive.
 """
 
 from __future__ import annotations
@@ -34,6 +44,7 @@ from pydantic import ValidationError
 
 from crucible.keys import ledger_key
 from crucible.models import TrialRow
+from crucible.store import PointerConflictError
 
 if TYPE_CHECKING:
     from nousergon_lib.arena.engine import ArenaCycle
@@ -41,7 +52,21 @@ if TYPE_CHECKING:
 
     from crucible.store import Store
 
-__all__ = ["LedgerAppendError", "append_trials", "n_trials", "read_trials", "trial_rows"]
+__all__ = [
+    "APPEND_ATTEMPTS",
+    "LedgerAppendError",
+    "append_trials",
+    "n_trials",
+    "read_trials",
+    "trial_rows",
+]
+
+#: How many times :func:`append_trials` re-reads and retries after losing the
+#: conditional write to a concurrent writer before it raises. Each loss means
+#: another writer's append LANDED, so the ledger is making progress; running
+#: out means contention no grading cadence produces, and that is reported, not
+#: absorbed.
+APPEND_ATTEMPTS = 8
 
 
 class LedgerAppendError(RuntimeError):
@@ -140,38 +165,66 @@ def append_trials(store: Store, rows: list[dict[str, Any]]) -> int:
     Idempotent on (slot, arm_id, as_of): a re-grade of the same cycle adds
     nothing, so replaying a date does not inflate the multiplicity
     correction the replay is meant to leave alone.
+
+    Atomic against concurrent writers (`alpha-engine-config-I12562`): the
+    write is a :meth:`Store.compare_and_swap` against the version token read
+    BEFORE the ledger body, so it lands only if no other writer appended in
+    between. A lost race re-reads, re-deduplicates and tries again, up to
+    :data:`APPEND_ATTEMPTS` times; after that it raises
+    :class:`LedgerAppendError` rather than returning a count for rows that
+    are not in the ledger.
     """
-    existing = read_trials(store)
-    seen = {_identity(row) for row in existing}
-    fresh = [row for row in rows if _identity(row) not in seen]
-    if not fresh:
-        return 0
-    # The guard that matters is NOT `len(combined) < len(existing)` — `combined`
-    # is built by concatenating `existing` with `fresh` two lines below, so
-    # that comparison can never be true for any input; it is a predicate that
-    # tests a property of its own construction, not of the log. The property
-    # that actually matters is append-only in substance: no row `read_trials`
-    # returned above may be dropped, reordered or rewritten by this write. A
-    # concurrent writer that appended between our read and our write is
-    # exactly the case that would violate it — this call would then rewrite
-    # the log from a stale `existing` and silently drop whatever the other
-    # writer just added. Re-reading immediately before the write catches
-    # that race the same way `Store.compare_and_swap` catches it for a
-    # pointer, without needing the store to expose CAS for an append target.
-    current = read_trials(store)
-    if current != existing:
-        raise LedgerAppendError(
-            f"the ledger changed between read and write: {len(current)} row(s) present "
-            f"now, {len(existing)} when this call read it. Writing `existing + fresh` on "
-            "top of that would drop or reorder whatever the concurrent writer just "
-            "appended. Re-read the ledger and retry."
+    key = ledger_key()
+    for _attempt in range(APPEND_ATTEMPTS):
+        # The token is read FIRST. A body read after it is at least as new, so
+        # a write conditioned on this token can only land on the version the
+        # body below was decided from — never on a newer one it did not see.
+        # Reading the body first and the token second would let a writer that
+        # landed in between hand us ITS token, and our write would succeed on
+        # top of a row we never read. The ledger only grows, so a version
+        # token never comes back to an older body (no ABA).
+        token = store.etag(key)
+        existing = read_trials(store)
+        seen = {_identity(row) for row in existing}
+        fresh = [row for row in rows if _identity(row) not in seen]
+        if not fresh:
+            return 0
+        # The guard that matters is NOT `len(combined) < len(existing)` — `combined`
+        # is built by concatenating `existing` with `fresh` two lines below, so
+        # that comparison can never be true for any input; it is a predicate that
+        # tests a property of its own construction, not of the log. The property
+        # that actually matters is append-only in substance: no row `read_trials`
+        # returned above may be dropped, reordered or rewritten by this write. A
+        # concurrent writer that appended between our read and our write is
+        # exactly the case that would violate it. This re-read refuses the case
+        # it can SEE; the conditional write below is what closes the window it
+        # cannot — a writer landing after this re-read (alpha-engine-config-I12562).
+        current = read_trials(store)
+        if current != existing:
+            raise LedgerAppendError(
+                f"the ledger changed between read and write: {len(current)} row(s) present "
+                f"now, {len(existing)} when this call read it. Writing `existing + fresh` on "
+                "top of that would drop or reorder whatever the concurrent writer just "
+                "appended. Re-read the ledger and retry."
+            )
+        combined = existing + fresh
+        payload = ("\n".join(json.dumps(row, sort_keys=True) for row in combined) + "\n").encode(
+            "utf-8"
         )
-    combined = existing + fresh
-    payload = ("\n".join(json.dumps(row, sort_keys=True) for row in combined) + "\n").encode(
-        "utf-8"
+        try:
+            store.compare_and_swap(key, token, payload)
+        except PointerConflictError:
+            # Deliberate retry, not a swallow: a lost conditional write means
+            # another writer's append landed and ours did not. The loop re-reads
+            # that writer's rows and re-decides `fresh` against them; exhausting
+            # it raises below.
+            continue
+        return len(fresh)
+    raise LedgerAppendError(
+        f"lost the conditional write of {key!r} to a concurrent writer {APPEND_ATTEMPTS} "
+        f"times in a row; {len(rows)} row(s) were NOT recorded. Each loss means another "
+        "writer appended, so the ledger itself is intact — re-run this append."
     )
-    store.put_bytes(ledger_key(), payload)
-    return len(fresh)
 
 
 def n_trials(store: Store, *, slot: str | None = None, include_controls: bool = False) -> int:
