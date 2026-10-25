@@ -55,6 +55,7 @@ from crucible.ledger import append_trials, trial_rows
 from crucible.slots import arm_name as name_component
 from crucible.slots import assert_width_contract, get_slot, promotable_arms
 from crucible.slots.arms import (
+    ArmSpec,
     control_specs,
     load_arm_specs,
     read_register,
@@ -996,12 +997,12 @@ def _run_grade(
     settings: Settings,
     horizon_trading_days: int,
     feature_version: str,
-    specs: Sequence[Any] | None,
+    specs: Sequence[ArmSpec] | None,
     preconditions: dict[str, list[ServingPrecondition]] | None,
     series: dict[str, ArmSeries] | None,
     settled_dates: Sequence[str] | None,
     lifecycles: list[AttemptLifecycle],
-) -> dict[str, Any]:
+) -> dict[str, object]:
     """Score every settled shadow, verify the controls, run the cycle, write it.
 
     Four keyword seams, all additive and all defaulting to the U/R behaviour
