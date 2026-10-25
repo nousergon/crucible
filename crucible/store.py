@@ -27,7 +27,7 @@ import os
 import threading
 import urllib.parse
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -468,7 +468,7 @@ def _writer_tag() -> str:
 
 
 @contextlib.contextmanager
-def _exclusive_directory_lock(directory: Path) -> Iterator[None]:
+def _exclusive_directory_lock(directory: Path) -> Generator[None]:
     """An exclusive `flock` on ``directory``, released on exit.
 
     Advisory: it excludes every writer that takes it, which is every

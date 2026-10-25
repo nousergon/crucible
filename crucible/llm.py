@@ -49,6 +49,7 @@ import ast
 import datetime as dt
 import json
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -1603,7 +1604,7 @@ def provider_methods() -> tuple[str, ...]:
     )
 
 
-def _refuse_provider_call(method: str):
+def _refuse_provider_call(method: str) -> Callable[..., Any]:
     """The body every captured provider method gets: record, then raise."""
 
     def _refuse(self: Any, *, system: str = "", user_content: str = "", **kwargs: Any) -> Any:

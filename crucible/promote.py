@@ -950,7 +950,7 @@ def _apply_retirements_to_register(
         already_retired = {e["arm_id"] for e in existing if e.get("kind") == EVENT_RETIRED}
         already_retired |= in_memory_retired
 
-        rows: list[dict[str, Any]] = []
+        rows: list[dict[str, object]] = []
         for verdict in retiring:
             if verdict.arm_id in already_retired:
                 continue
@@ -985,11 +985,11 @@ def _apply_retirements_to_register(
     return key if append_conditionally(store, key, extend) else None
 
 
-def _parse_jsonl(raw: bytes) -> list[dict[str, Any]]:
+def _parse_jsonl(raw: bytes) -> list[dict[str, object]]:
     return [json.loads(line) for line in raw.decode().splitlines() if line.strip()]
 
 
-def _jsonl_lines(rows: list[dict[str, Any]]) -> bytes:
+def _jsonl_lines(rows: list[dict[str, object]]) -> bytes:
     return b"".join(json.dumps(row, sort_keys=True).encode("utf-8") + b"\n" for row in rows)
 
 
@@ -1151,12 +1151,13 @@ def _append_events(store: Store, key: str, rows: list[dict[str, Any]]) -> str:
             recorded = recorded_row.get("event_id")
             if recorded is not None:
                 seen.add(str(recorded))
-        fresh: list[dict[str, Any]] = []
+        fresh: list[dict[str, object]] = []
         for row in rows:
-            stamped = {**row, "event_id": _event_id(key, row)}
-            if stamped["event_id"] in seen:
+            event_id = _event_id(key, row)
+            if event_id in seen:
                 continue
-            seen.add(stamped["event_id"])
+            seen.add(event_id)
+            stamped: dict[str, object] = {**row, "event_id": event_id}
             fresh.append(stamped)
         if not fresh:
             return None

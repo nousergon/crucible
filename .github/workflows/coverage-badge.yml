@@ -55,7 +55,17 @@ jobs:
     # A CI run that FAILED took no trustworthy reading, so there is nothing to
     # publish and the previous badge stays -- correct, because it still
     # describes the last commit that actually passed.
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    #
+    # Only a PUSH run measures anything. ci.yml's `test` job -- the one that
+    # takes the reading and uploads `coverage-pct` -- runs on push and
+    # pull_request only; its post-close `schedule` / `workflow_dispatch` arms
+    # (alpha-engine-config-I12483) skip it, so they complete `success` with no
+    # artifact. Reacting to them made this workflow go red on main every
+    # weekday evening (runs 39875337733, 40042044828) with nothing wrong: the
+    # previous badge already describes that same commit.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
     # Scoped to this job alone. Write access exists here only to push one JSON
     # file to a branch that contains nothing else. `actions: read` is the new
     # grant and is the minimum that reads another workflow run's artifact.
@@ -64,9 +74,11 @@ jobs:
       actions: read
     steps:
       # workflow_dispatch has no triggering run attached, so resolve the most
-      # recent CI run that actually succeeded on main and read ITS artifact. A
-      # manual re-publish must not become the one path that silently measures
-      # something different from the gate.
+      # recent PUSH CI run that actually succeeded on main and read ITS
+      # artifact. A manual re-publish must not become the one path that
+      # silently measures something different from the gate. `event=push` for
+      # the same reason as the job's `if:` -- a scheduled CI run is a success
+      # that carries no reading.
       - name: Resolve the CI run holding the reading
         id: src
         env:
@@ -74,7 +86,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            RID=$(gh api "/repos/${{ github.repository }}/actions/workflows/ci.yml/runs?branch=main&status=success&per_page=1" --jq '.workflow_runs[0].id')
+            RID=$(gh api "/repos/${{ github.repository }}/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=1" --jq '.workflow_runs[0].id')
             if [ -z "$RID" ] || [ "$RID" = "null" ]; then
               echo "::error::no successful CI run on main to read a coverage percentage from -- refusing to publish a badge measured by nothing"
               exit 1

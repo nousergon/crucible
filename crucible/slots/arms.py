@@ -466,7 +466,7 @@ class ArmRegisterConflictError(RuntimeError):
     """The stored register holds events the register being written never saw."""
 
 
-def _serialize_events(events: Sequence[dict[str, Any]]) -> bytes:
+def _serialize_events(events: Sequence[dict[str, object]]) -> bytes:
     return "".join(json.dumps(event, sort_keys=True) + "\n" for event in events).encode("utf-8")
 
 
