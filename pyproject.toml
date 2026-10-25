@@ -140,10 +140,12 @@ Homepage = "https://github.com/nousergon/crucible"
 
 [dependency-groups]
 dev = [
+    "alembic>=1.16",
     "pytest>=8.3",
     "pytest-cov>=6.0",
     "ruff>=0.17.1",
     "basedpyright>=1.40",
+    "sqlalchemy>=2.0.40",
 ]
 
 [build-system]
