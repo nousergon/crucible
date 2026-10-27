@@ -4,10 +4,20 @@ Normative source: plan §4.4; binding source `champion-challenger-policy.md`.
 
 | Slot | Decision | Champion feeds |
 |---|---|---|
-| **U** | which names reach the predictor | `universe/{trading_day}/members.json` |
+| **U** | which predicted names the book may hold | `universe/{trading_day}/members.json` |
 | **R** | how names are scored into signals | `signals/{trading_day}/signals.json` |
 | **M** | which trained recipe emits `predicted_alpha` | `predictions/{trading_day}.json` |
 | **S** | exit / risk rules | `strategies/current` |
+
+**U gates the book, not the predictor** (`alpha-engine-config-I12691`). M
+scores every name the feature layer carries for the session; U's champion cut
+is read by exactly one consumer, S's alpha resolution
+(`crucible.slots.strategy`), as the eligibility mask the book is constructed
+inside. The daily chain serves M before U (`DAILY_CHAIN_SERVE_ORDER`), so M
+cannot read the session's cut even by accident. There is no uncontested width
+literal between U and M, which is the v1 residual (`predictor_universe_cut =
+attractiveness_top_20`) this replaces. `tests/test_u_feed_reach.py` holds the
+wiring and this paragraph to each other.
 
 **This module configures the arena; it never re-implements it.** The ladder,
 the paired windows, the anytime-valid confidence sequence, the Condorcet
