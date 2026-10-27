@@ -1310,7 +1310,11 @@ def gate_prefix(gate: str) -> str:
 
 
 def universe_members_key(trading_day: str) -> str:
-    """The U champion's feed: which names reach the predictor."""
+    """The U champion's feed: the eligibility mask S builds the book inside.
+
+    Read by `crucible.slots.strategy` alone; M never reads it
+    (`alpha-engine-config-I12691`, `tests/test_u_feed_reach.py`).
+    """
     return f"universe/{trading_day}/members.json"
 
 
