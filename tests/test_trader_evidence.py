@@ -30,7 +30,13 @@ from pydantic import ValidationError
 
 import crucible.gate as gate_module
 from crucible.keys import TRADER_EVIDENCE_KEY, TRADER_PIN_KEY
-from crucible.models import SERVED_SESSION_MODES, TraderEvidenceDocument
+from crucible.models import (
+    SERVED_SESSION_MODES,
+    SESSION_ENVIRONMENT_VAR,
+    STAGING_SERVED_SESSION_MODES,
+    TraderEvidenceDocument,
+    served_session_modes,
+)
 
 SCHEMA_PATH = (
     pathlib.Path(__file__).resolve().parents[1] / "crucible" / "schemas" / "trader_evidence.v2.json"
@@ -157,6 +163,44 @@ class TestEveryServedDayRecordsItsSessionMode:
         del document["session_modes"]
         with pytest.raises(ValidationError):
             TraderEvidenceDocument.model_validate(document)
+
+
+class TestASimulatedSessionIsAStagingRecordOnly:
+    """`alpha-engine-config-I12685`, the follow-up to S-19 (`-I12507`): the
+    staging trader's simulated fills are a first-class mode, counted as served
+    in staging only and never beside a routed day."""
+
+    def test_a_simulated_week_validates_and_names_its_simulated_days(self) -> None:
+        modes = {WEEK[0]: "shadow"} | {day: "simulated" for day in WEEK[1:]}
+        document = TraderEvidenceDocument.model_validate(_document(session_modes=modes))
+
+        assert document.simulated_days() == WEEK[1:]
+        assert document.shadow_days() == WEEK[:1]
+
+    def test_live_and_simulated_in_one_record_is_refused(self) -> None:
+        modes = {day: "shadow" for day in WEEK} | {WEEK[0]: "live", WEEK[1]: "simulated"}
+        with pytest.raises(ValidationError, match="both `live` and `simulated`"):
+            TraderEvidenceDocument.model_validate(_document(session_modes=modes))
+
+    def test_production_never_counts_a_simulated_day(self) -> None:
+        for environment in (None, "", "prod", "PROD", "dev", "stagingx"):
+            assert served_session_modes(environment) == SERVED_SESSION_MODES
+            assert "simulated" not in served_session_modes(environment)
+
+    def test_staging_counts_simulated_and_never_live(self) -> None:
+        for environment in ("staging", " Staging\n"):
+            assert served_session_modes(environment) == STAGING_SERVED_SESSION_MODES
+        assert STAGING_SERVED_SESSION_MODES == ("shadow", "simulated")
+        assert "live" not in STAGING_SERVED_SESSION_MODES
+
+    def test_the_selector_is_the_fleet_environment_variable(self) -> None:
+        assert SESSION_ENVIRONMENT_VAR == "NE_ENV"
+
+    def test_the_published_schema_admits_simulated(self) -> None:
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        modes = {day: "simulated" for day in WEEK}
+        Draft202012Validator(schema).validate(_document(session_modes=modes))
+        assert "`live` and `simulated`" in schema["$comment"]
 
 
 class TestTheDocumentRefusesWhatItCannotActOn:

@@ -325,6 +325,20 @@ class TestExecutionShortfallClause:
         assert "no_orders" in clause.detail
         assert "not a producer failure" in clause.detail
 
+    def test_a_simulated_window_is_unmet_and_never_graded(self, store) -> None:
+        """`alpha-engine-config-I12685`: simulated fills are never a measured
+        execution, so a window of them reads UNMET naming why."""
+        for day in SESSIONS:
+            _put(
+                store,
+                execution_shortfall_key(day),
+                {**_computed(day), "fill_source": "simulated_close"},
+            )
+        clause = _shortfall_clause(store)
+        assert not clause.met and not clause.unmeasurable
+        assert "simulated router" in clause.detail
+        assert SESSIONS[0] in clause.detail
+
     def test_a_band_breach_is_unmet(self, store) -> None:
         for day in SESSIONS:
             _put(store, execution_shortfall_key(day), _computed(day, fill=101.0))

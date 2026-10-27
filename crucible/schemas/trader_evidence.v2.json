@@ -1,5 +1,5 @@
 {
-  "$comment": "trading_days MUST equal the number of distinct entries in days_served, days_served MUST be strictly increasing, and session_modes MUST key exactly the days in days_served. JSON Schema cannot state any of the three, so a consumer validating against this file alone must check them itself.",
+  "$comment": "trading_days MUST equal the number of distinct entries in days_served, days_served MUST be strictly increasing, session_modes MUST key exactly the days in days_served, and session_modes MUST NOT carry both `live` and `simulated` (one is prod-only, the other staging-only). JSON Schema cannot state any of the four, so a consumer validating against this file alone must check them itself.",
   "$defs": {
     "TraderEvidenceBench": {
       "additionalProperties": false,
@@ -73,11 +73,12 @@
       "additionalProperties": {
         "enum": [
           "shadow",
-          "live"
+          "live",
+          "simulated"
         ],
         "type": "string"
       },
-      "description": "How each day in `days_served` was served: `shadow` (champion resolved, book built, day recorded, no order sent) or `live` (the same, with orders routed). Keys are exactly `days_served`. Both modes count as served (`crucible.models.SERVED_SESSION_MODES`, Brian's ruling of 2026-09-24 on the trader-runtime decision); the mode is recorded so the gate can report how many counted days were shadow rather than let the count blur the two.",
+      "description": "How each day in `days_served` was served: `shadow` (champion resolved, book built, day recorded, no order sent), `live` (the same, with orders routed) or `simulated` (staging only: the same book filled at the session close by a router that cannot reach a broker). Keys are exactly `days_served`. In production shadow and live count as served (`crucible.models.SERVED_SESSION_MODES`, Brian's ruling of 2026-09-24 on the trader-runtime decision) and simulated never does; in staging shadow and simulated count and live never does (`crucible.models.STAGING_SERVED_SESSION_MODES`). The mode is recorded so the gate can report how the counted days were served rather than let the count blur them.",
       "title": "Session Modes",
       "type": "object"
     },

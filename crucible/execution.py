@@ -70,6 +70,8 @@ __all__ = [
     "EXECUTION_METRIC_NAME",
     "EXECUTION_N_FLOOR",
     "EXECUTION_SHORTFALL_SCHEMA_VERSION",
+    "FILL_SOURCE_BROKER",
+    "FILL_SOURCE_SIMULATED_CLOSE",
     "SHADOW_BOOKS_SCHEMA_VERSION",
     "SHADOW_BOOK_METRIC_NAME",
     "SHADOW_FILL_BASIS",
@@ -103,6 +105,13 @@ DECISION_PRICE_BASIS = "sizing_decision"
 #: with this status and a `non_book_reason`: never dropped, never a failed book,
 #: and never admissible for an arm the register does not mark control.
 CONTROL_NON_BOOK_STATUS = "control_scored_by_grade"
+
+#: `execution_shortfall.v1`'s optional `fill_source` (`alpha-engine-config-I12685`).
+#: Absent reads as `broker`: every document written before the field existed
+#: was a broker's fills or none. `simulated_close` is the staging trader's
+#: simulated router (S-19): a record of the plan, never a measured shortfall.
+FILL_SOURCE_BROKER = "broker"
+FILL_SOURCE_SIMULATED_CLOSE = "simulated_close"
 
 #: Every simulated shadow fill is at the session close (plan §10.6 row 6).
 SHADOW_FILL_BASIS = "close"
@@ -380,6 +389,9 @@ class ExecutionWindow:
     shortfall_usd: float
     band: dict[str, Any] | None
     placeholder_band: bool = field(default=False)
+    #: Sessions whose `computed` document says `fill_source: simulated_close`.
+    #: Named, and never pooled into the orders above (`alpha-engine-config-I12685`).
+    simulated: tuple[str, ...] = field(default=())
 
     @property
     def filed_any(self) -> bool:
@@ -404,11 +416,17 @@ def reduce_execution_window(store: Store, sessions: Sequence[str]) -> ExecutionW
     not read as a session the trader simply did not run. Bands must agree
     across the window: pooling shortfall graded against two different red
     lines produces a status measured against neither.
+
+    A `computed` session whose fills are `simulated_close` (the staging
+    trader's simulated router, `alpha-engine-config-I12685`) is named in
+    ``simulated`` and its orders are NEVER pooled: a fill at the close with
+    declared zero slippage is the plan restated, not an execution measured.
     """
     sources: list[str] = []
     missing: list[str] = []
     no_orders: list[str] = []
     not_computed: list[tuple[str, str]] = []
+    simulated: list[str] = []
     bps: list[float] = []
     notional: list[float] = []
     order_day: list[str] = []
@@ -441,6 +459,9 @@ def reduce_execution_window(store: Store, sessions: Sequence[str]) -> ExecutionW
         if doc["outcome"] == "not_computed":
             not_computed.append((day, str(doc["outcome_reason"])))
             continue
+        if doc.get("fill_source", FILL_SOURCE_BROKER) == FILL_SOURCE_SIMULATED_CLOSE:
+            simulated.append(day)
+            continue
         for order in doc["orders"]:
             if order["filled_quantity"] > 0:
                 bps.append(float(order["shortfall_bps"]))
@@ -463,6 +484,7 @@ def reduce_execution_window(store: Store, sessions: Sequence[str]) -> ExecutionW
         shortfall_usd=total_shortfall,
         band=band,
         placeholder_band=bool(band and band["placeholder"]),
+        simulated=tuple(simulated),
     )
 
 
