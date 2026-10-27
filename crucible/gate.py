@@ -149,6 +149,8 @@ from crucible.metron_consumers import orphaned_by_phase4 as metron_reads_orphane
 from crucible.metron_consumers import paused_rows as metron_reads_paused
 from crucible.models import (
     FIRE_DRILL_SEAL_TOLERANCE_SECONDS,
+    SESSION_ENVIRONMENT_VAR,
+    STAGING_SERVED_SESSION_MODES,
     FaultRecordDocument,
     FireDrillDocument,
     FireDrillScheduleDocument,
@@ -156,6 +158,7 @@ from crucible.models import (
     PhaseLadderDocument,
     TraderEvidenceDocument,
     fire_drill_commitment,
+    served_session_modes,
 )
 from crucible.models import SERVED_SESSION_MODES as _SERVED_SESSION_MODES
 from crucible.portfolio import manifest_records_portfolio_engine
@@ -4584,6 +4587,12 @@ TRADER_EVIDENCE_KEY: str | None = _TRADER_EVIDENCE_KEY
 #: means. Both modes, by Brian's ruling of 2026-09-24 on
 #: `alpha-engine-config-I11545` (ruling 2: "a shadow session counts as a served
 #: day"); the clause still reports how many counted days were shadow.
+#:
+#: This is PRODUCTION's set. The clause resolves the set for the environment it
+#: runs in at call time (`crucible.models.served_session_modes`, read from
+#: `NE_ENV`): in staging it counts shadow and simulated and never live
+#: (`alpha-engine-config-I12685`); anywhere else this set, so a simulated day is
+#: never counted outside staging.
 SERVED_DAY_SESSION_MODES: tuple[str, ...] = _SERVED_SESSION_MODES
 
 #: The `spec.params` key naming which registered LLM call site an arm reaches
@@ -9016,6 +9025,10 @@ def _phase3(
 # ---------------------------------------------------------------------------
 
 
+#: Appended to a staging MET reading (`alpha-engine-config-I12685`).
+_STAGING_SIMULATED_NOTE = "; a simulated session counts only in staging"
+
+
 def _clause_trader_week_on_v2_champion(store: Store, window: list[dt.date]) -> Clause:
     """Plan §6 row 4: the trader ran one week on the v2 champion.
 
@@ -9031,6 +9044,12 @@ def _clause_trader_week_on_v2_champion(store: Store, window: list[dt.date]) -> C
     many of the counted days were shadow sessions, so a MET on a week in which
     no order left the trader cannot be mistaken for a week of routed ones.
 
+    **In staging** (`NE_ENV=staging`) the counted modes are shadow OR simulated
+    and never live (`alpha-engine-config-I12685`): staging's trader fills the
+    plan at the close and cannot route. Outside staging a simulated day is never
+    counted. Days in a mode the environment does not count are named in the
+    reading rather than dropped silently.
+
     **A ruled M bench is part of the identity** (`alpha-engine-config-I12024`).
     When the evidence records the bench its days were served under
     (`alpha_bench`), the reading names it — "on v2 champion X benched at weight
@@ -9041,9 +9060,13 @@ def _clause_trader_week_on_v2_champion(store: Store, window: list[dt.date]) -> C
     never a cleared one: the bench changes what is counted on, never the count.
     """
     name = "trader_one_week_on_v2_champion"
+    environment = os.environ.get(SESSION_ENVIRONMENT_VAR)
+    counted_modes = served_session_modes(environment)
+    staging = counted_modes == STAGING_SERVED_SESSION_MODES
     requirement = (
         f"the trader served {TRADING_DAYS_PER_WEEK} trading days on one v2 champion "
-        f"(a served day is a session in mode {' or '.join(SERVED_DAY_SESSION_MODES)}), "
+        f"(a served day is a session in mode {' or '.join(counted_modes)}"
+        f"{' — staging' if staging else ''}), "
         "read from the consumer-evidence artifact the trader contract declares"
     )
     if TRADER_EVIDENCE_KEY is None:
@@ -9081,13 +9104,17 @@ def _clause_trader_week_on_v2_champion(store: Store, window: list[dt.date]) -> C
             f"({len(exc.errors())} error(s): {exc.errors()[0]['msg']})",
             (key,),
         )
-    served = [
-        day
-        for day in evidence.days_served
-        if evidence.session_modes[day] in SERVED_DAY_SESSION_MODES
-    ]
-    shadow = sum(1 for day in served if evidence.session_modes[day] == "shadow")
-    modes = f"{shadow} shadow, {len(served) - shadow} live"
+    served = [day for day in evidence.days_served if evidence.session_modes[day] in counted_modes]
+    modes = ", ".join(
+        f"{sum(1 for day in served if evidence.session_modes[day] == mode)} {mode}"
+        for mode in counted_modes
+    )
+    uncounted = [day for day in evidence.days_served if day not in served]
+    if uncounted:
+        where = "staging" if staging else "outside staging"
+        modes = f"{modes}; {len(uncounted)} day(s) NOT counted {where}: " + ", ".join(
+            f"{day} {evidence.session_modes[day]}" for day in uncounted
+        )
     on = f"v2 champion {evidence.champion}"
     keys: tuple[str, ...] = (key,)
     if evidence.alpha_bench is not None:
@@ -9127,7 +9154,8 @@ def _clause_trader_week_on_v2_champion(store: Store, window: list[dt.date]) -> C
         requirement,
         True,
         f"{key}: {len(served)} trading day(s) served on {on} "
-        f"({modes}; a shadow session counts as served by Brian's 2026-09-24 ruling)",
+        f"({modes}; a shadow session counts as served by Brian's 2026-09-24 ruling"
+        f"{_STAGING_SIMULATED_NOTE if staging else ''})",
         keys,
     )
 
@@ -9323,6 +9351,9 @@ def _clause_execution_shortfall_row_graded(store: Store, window: list[dt.date]) 
       and not measured);
     * every filed session says `no_orders`, so nothing was executed to grade —
       distinct from "not computed", which is a producer failure;
+    * every filed session is `no_orders` or simulated (`fill_source:
+      simulated_close`, `alpha-engine-config-I12685`): a simulated fill is
+      never a measured execution, in any environment;
     * the row is RED or below its sample floor.
 
     A non-conforming artifact raises `ExecutionArtifactError` out of the
@@ -9385,6 +9416,18 @@ def _clause_execution_shortfall_row_graded(store: Store, window: list[dt.date]) 
             f"every filed session in {window_phrase} says `no_orders` "
             f"({row['sessions_no_orders']}) — nothing was executed, so there is no shortfall "
             "to grade; this is not a producer failure",
+            evidence,
+        )
+    simulated = list(row.get("sessions_simulated") or [])
+    if row["n_orders_filled"] == 0 and simulated:
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"no broker fill in {window_phrase}: session(s) {simulated} were filled by the "
+            "simulated router at the close (fill_source simulated_close), which is never a "
+            "measured shortfall; the rest say `no_orders` "
+            f"({row['sessions_no_orders']}); the row reads {status}: {reason}",
             evidence,
         )
     return Clause(name, requirement, False, f"row reads {status}: {reason}", evidence)

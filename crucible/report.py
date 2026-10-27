@@ -806,6 +806,9 @@ def _execution_row(
     * Any session says ``not_computed`` → ``RED``: orders were placed and
       shortfall was not measured, which is a producer failure and must never
       read as a quiet week.
+    * A session whose fills are ``simulated_close`` (the staging trader's
+      simulated router, `alpha-engine-config-I12685`) is NAMED and never
+      pooled: nothing simulated reads as a measured shortfall.
     * Otherwise the value is the NOTIONAL-WEIGHTED shortfall in bps, with a
       weighted bootstrap CI, graded lower-is-better against the declared band
       (``target`` = baseline, ``red_line`` = upper). The absolute companions —
@@ -826,6 +829,7 @@ def _execution_row(
         "sessions_missing": list(reading.missing),
         "sessions_no_orders": list(reading.no_orders),
         "sessions_not_computed": [d for d, _ in reading.not_computed],
+        "sessions_simulated": list(reading.simulated),
     }
     if not reading.filed_any:
         return _row(
@@ -857,6 +861,11 @@ def _execution_row(
     missing_phrase = (
         f"; no artifact for session(s) {list(reading.missing)}" if reading.missing else ""
     )
+    if reading.simulated:
+        missing_phrase += (
+            f"; fills on session(s) {list(reading.simulated)} were simulated at the close "
+            "(fill_source simulated_close) and are never pooled as measured shortfall"
+        )
     weighted = reading.weighted_bps
     low, high = weighted_shortfall_ci(reading.order_bps, reading.order_notional, reading.order_day)
     if reading.not_computed:

@@ -2814,6 +2814,68 @@ class TestAShadowSessionIsAServedDay:
         assert not clause.met and not clause.unmeasurable
 
 
+class TestASimulatedSessionCountsOnlyInStaging:
+    """`alpha-engine-config-I12685` (follow-up to S-19, `-I12507`): the staging
+    trader fills the plan at the close and files mode `simulated`. The clause
+    counts it in staging (`NE_ENV=staging`) and never outside it, and in
+    staging it never counts `live`, because staging cannot route."""
+
+    @pytest.fixture(autouse=True)
+    def _evidence_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(gate_module, "TRADER_EVIDENCE_KEY", TRADER_EVIDENCE)
+
+    def test_a_simulated_week_is_met_in_staging_and_says_so(
+        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("NE_ENV", "staging")
+        simulated = {day: "simulated" for day in TRADER_WEEK[1:]}
+        _put(store, TRADER_EVIDENCE, _trader_evidence(TRADER_WEEK, simulated))
+        clause = gate_module._clause_trader_week_on_v2_champion(store, _window(2))
+        assert clause.met and not clause.unmeasurable, clause.detail
+        assert "1 shadow, 4 simulated" in clause.detail
+        assert "counts only in staging" in clause.detail
+        assert "shadow or simulated — staging" in clause.requirement
+
+    def test_a_simulated_week_is_not_served_outside_staging(
+        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        simulated = {day: "simulated" for day in TRADER_WEEK[1:]}
+        _put(store, TRADER_EVIDENCE, _trader_evidence(TRADER_WEEK, simulated))
+        for environment in (None, "prod"):
+            if environment is None:
+                monkeypatch.delenv("NE_ENV", raising=False)
+            else:
+                monkeypatch.setenv("NE_ENV", environment)
+            clause = gate_module._clause_trader_week_on_v2_champion(store, _window(2))
+            assert not clause.met and not clause.unmeasurable
+            assert "1 trading day(s) served" in clause.detail
+            assert "4 day(s) NOT counted outside staging" in clause.detail
+            assert f"{TRADER_WEEK[1]} simulated" in clause.detail
+
+    def test_a_live_day_never_counts_in_staging(
+        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("NE_ENV", "staging")
+        live = {day: "live" for day in TRADER_WEEK}
+        _put(store, TRADER_EVIDENCE, _trader_evidence(TRADER_WEEK, live))
+        clause = gate_module._clause_trader_week_on_v2_champion(store, _window(2))
+        assert not clause.met and not clause.unmeasurable
+        assert "0 trading day(s) served" in clause.detail
+        assert "5 day(s) NOT counted staging" in clause.detail
+
+    def test_production_reading_is_unchanged_when_the_selector_is_unset(
+        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("NE_ENV", raising=False)
+        live = {day: "live" for day in TRADER_WEEK[3:]}
+        _put(store, TRADER_EVIDENCE, _trader_evidence(TRADER_WEEK, live))
+        clause = gate_module._clause_trader_week_on_v2_champion(store, _window(2))
+        assert clause.met
+        assert "(3 shadow, 2 live; a shadow session counts as served" in clause.detail
+        assert "NOT counted" not in clause.detail
+        assert "staging" not in clause.requirement
+
+
 def _legacy_week_v2(executions: list[dict]) -> dict:
     """A `legacy-weekly-executions.v2` week — the shape the producer files
     since `alpha-engine-config-I9962`. A `v1` document (one integer) is read as

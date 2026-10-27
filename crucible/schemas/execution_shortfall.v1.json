@@ -62,6 +62,13 @@
       ],
       "description": "Required (non-empty) when outcome is `not_computed` or `no_orders`; null when `computed`."
     },
+    "fill_source": {
+      "enum": [
+        "broker",
+        "simulated_close"
+      ],
+      "description": "WHERE the fills came from (`alpha-engine-config-I12685`). OPTIONAL; absent means `broker`, the only source any document written before this field existed could have had. `broker`: fills reported by the broker the orders were routed to. `simulated_close`: fills made by the staging trader's simulated router at the session close, zero slippage declared, with no broker reached (S-19, `alpha-engine-config-I12507`). A `simulated_close` document is a record of the plan, never a measurement of execution: `crucible.execution.reduce_execution_window` names its session and never pools its orders into the attribution row, so nothing simulated can read as a measured shortfall."
+    },
     "band": {
       "type": "object",
       "additionalProperties": false,

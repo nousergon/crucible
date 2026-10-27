@@ -169,12 +169,16 @@ __all__ = [
     "ReviewDocument",
     "RunManifestV2",
     "SERVED_SESSION_MODES",
+    "SESSION_ENVIRONMENT_VAR",
+    "STAGING_ENVIRONMENT",
+    "STAGING_SERVED_SESSION_MODES",
     "SessionModeLiteral",
     "SignalsRow",
     "TraderEvidenceDocument",
     "TraderPinRequestDocument",
     "TraderReleasePinDocument",
     "TrialRow",
+    "served_session_modes",
 ]
 
 
@@ -4091,8 +4095,12 @@ class DispatchRecordDocument(BaseModel):
 
 #: How the trader served a day. `shadow`: the session resolved the champion,
 #: built the book and recorded the day, and sent no order. `live`: the same,
-#: with the book's orders routed to the (paper) broker.
-SessionModeLiteral = Literal["shadow", "live"]
+#: with the book's orders routed to the (paper) broker. `simulated`: the same
+#: book, planned by the prod planner under the prod caps and filled at the
+#: session close by a router that cannot reach a broker — STAGING ONLY
+#: (`alpha-engine-config-I12685`, the follow-up to S-19 `-I12507`). No order
+#: left the trader on a simulated day, and the plan was filled on paper.
+SessionModeLiteral = Literal["shadow", "live", "simulated"]
 
 #: The session modes that make a trading day a SERVED day — the unit
 #: `trading_days` counts and phase 4's `trader_one_week_on_v2_champion` grades.
@@ -4106,7 +4114,42 @@ SessionModeLiteral = Literal["shadow", "live"]
 #: it counted were shadow — a week of shadow sessions is a different fact from a
 #: week of routed ones, and the reading must not blur the two just because the
 #: count treats them alike.
+#:
+#: These are PRODUCTION's served modes, and the default for every environment
+#: that is not staging. `simulated` is deliberately absent: a simulated fill
+#: is never a production served day (`alpha-engine-config-I12685`).
 SERVED_SESSION_MODES: tuple[str, ...] = ("shadow", "live")
+
+#: The fleet's environment selector (`nousergon_lib.env.ENV_VAR`). Read for ONE
+#: purpose: which session modes count as served. Restated by value because this
+#: package's `nousergon-lib` pin predates `nousergon_lib.env`, the same reason
+#: `crucible_trader.order_router.ENVIRONMENT_VAR` restates it.
+SESSION_ENVIRONMENT_VAR = "NE_ENV"
+#: The environment whose trader may only shadow or simulate (S-19).
+STAGING_ENVIRONMENT = "staging"
+
+#: The session modes that make a day served IN STAGING
+#: (`alpha-engine-config-I12685`). `simulated` counts, because staging's trader
+#: exists to exercise the plan-and-fill path end to end without a broker;
+#: `live` never does, because staging never routes (the trader refuses the
+#: routing switch under `NE_ENV=staging` before any SDK load), so a `live` day
+#: in a staging record is a record staging could not have produced.
+STAGING_SERVED_SESSION_MODES: tuple[str, ...] = ("shadow", "simulated")
+
+
+def served_session_modes(environment: str | None) -> tuple[str, ...]:
+    """The session modes that count as a served day in ``environment``.
+
+    :data:`STAGING_SERVED_SESSION_MODES` when ``environment`` names staging
+    (case and surrounding whitespace ignored, as the trader's own
+    `is_staging` reads it); :data:`SERVED_SESSION_MODES` otherwise — unset,
+    `prod`, or anything unrecognised. The default is production's set, so the
+    failure direction of a missing or misspelled selector is that a simulated
+    day is NOT counted, never that it is.
+    """
+    if environment is not None and environment.strip().lower() == STAGING_ENVIRONMENT:
+        return STAGING_SERVED_SESSION_MODES
+    return SERVED_SESSION_MODES
 
 
 def _trader_evidence_json_schema_extra(schema: dict[str, object]) -> None:
@@ -4126,9 +4169,11 @@ def _trader_evidence_json_schema_extra(schema: dict[str, object]) -> None:
     schema["title"] = "Crucible trader consumer evidence, v2"
     schema["$comment"] = (
         "trading_days MUST equal the number of distinct entries in days_served, "
-        "days_served MUST be strictly increasing, and session_modes MUST key exactly "
-        "the days in days_served. JSON Schema cannot state any of the three, so a "
-        "consumer validating against this file alone must check them itself."
+        "days_served MUST be strictly increasing, session_modes MUST key exactly "
+        "the days in days_served, and session_modes MUST NOT carry both `live` and "
+        "`simulated` (one is prod-only, the other staging-only). JSON Schema cannot "
+        "state any of the four, so a consumer validating against this file alone "
+        "must check them itself."
     )
     schema["description"] = (
         "The trader's rolling account of the trading days it served on the v2 "
@@ -4201,12 +4246,16 @@ class TraderEvidenceDocument(_Strict):
     )
     session_modes: dict[str, SessionModeLiteral] = Field(
         description="How each day in `days_served` was served: `shadow` (champion "
-        "resolved, book built, day recorded, no order sent) or `live` (the same, "
-        "with orders routed). Keys are exactly `days_served`. Both modes count as "
-        "served (`crucible.models.SERVED_SESSION_MODES`, Brian's ruling of "
-        "2026-09-24 on the trader-runtime decision); the mode is recorded so the gate "
-        "can report how many counted days were shadow rather than let the count "
-        "blur the two.",
+        "resolved, book built, day recorded, no order sent), `live` (the same, "
+        "with orders routed) or `simulated` (staging only: the same book filled at "
+        "the session close by a router that cannot reach a broker). Keys are "
+        "exactly `days_served`. In production shadow and live count as served "
+        "(`crucible.models.SERVED_SESSION_MODES`, Brian's ruling of 2026-09-24 on "
+        "the trader-runtime decision) and simulated never does; in staging shadow "
+        "and simulated count and live never does "
+        "(`crucible.models.STAGING_SERVED_SESSION_MODES`). The mode is recorded so "
+        "the gate can report how the counted days were served rather than let the "
+        "count blur them.",
     )
     calendar_date: str = Field(
         pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
@@ -4227,6 +4276,10 @@ class TraderEvidenceDocument(_Strict):
     def shadow_days(self) -> list[str]:
         """The served days that were shadow sessions, in `days_served` order."""
         return [day for day in self.days_served if self.session_modes[day] == "shadow"]
+
+    def simulated_days(self) -> list[str]:
+        """The days filled by the staging simulated router, in `days_served` order."""
+        return [day for day in self.days_served if self.session_modes[day] == "simulated"]
 
     @model_validator(mode="after")
     def _count_is_supported_by_the_days(self) -> TraderEvidenceDocument:
@@ -4270,6 +4323,15 @@ class TraderEvidenceDocument(_Strict):
                 f"session_modes must key exactly days_served: no mode for {unmoded}, a "
                 f"mode for {stray} which was not served. A day with no recorded mode "
                 "cannot say whether an order left the trader on it."
+            )
+        recorded = set(self.session_modes.values())
+        if {"live", "simulated"} <= recorded:
+            raise ValueError(
+                "session_modes carries both `live` and `simulated` days. A live day is "
+                "routed, which only production does; a simulated day is filled by a "
+                "router that cannot reach a broker, which only staging does. One record "
+                "holding both is two environments' evidence merged, and a simulated fill "
+                "must never be read beside a routed one."
             )
         return self
 

@@ -30,6 +30,8 @@ from crucible.execution import (
     EXECUTION_METRIC_NAME,
     EXECUTION_N_FLOOR,
     EXECUTION_SHORTFALL_SCHEMA_VERSION,
+    FILL_SOURCE_BROKER,
+    FILL_SOURCE_SIMULATED_CLOSE,
     SHADOW_BOOK_METRIC_NAME,
     SHADOW_BOOKS_SCHEMA_VERSION,
     SHADOW_FILL_BASIS,
@@ -312,6 +314,29 @@ class TestExecutionShortfallValidator:
         with pytest.raises(ExecutionArtifactError, match="no outcome_reason"):
             validate_execution_shortfall(_shortfall_doc(outcome_reason="why"))
 
+    @pytest.mark.parametrize("source", ["broker", "simulated_close"])
+    def test_a_declared_fill_source_validates(self, source) -> None:
+        validate_execution_shortfall(_shortfall_doc(fill_source=source))
+
+    def test_an_unknown_fill_source_is_refused(self) -> None:
+        with pytest.raises(ExecutionArtifactError):
+            validate_execution_shortfall(_shortfall_doc(fill_source="model"))
+
+    def test_the_fill_source_constants_are_the_schema_enum(self) -> None:
+        schema = json.loads(
+            (
+                Path(__file__).resolve().parents[1]
+                / "crucible"
+                / "schemas"
+                / "execution_shortfall.v1.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert schema["properties"]["fill_source"]["enum"] == [
+            FILL_SOURCE_BROKER,
+            FILL_SOURCE_SIMULATED_CLOSE,
+        ]
+        assert "fill_source" not in schema["required"]
+
     def test_a_non_metric_record_is_refused(self) -> None:
         doc = _shortfall_doc()
         doc["metrics"] = [
@@ -408,6 +433,37 @@ class TestTheFifthRow:
         store = _week_store(tmp_path, {WEEK[0]: _shortfall_doc(WEEK[1])})
         with pytest.raises(ExecutionArtifactError, match="misfiled"):
             _execution_row(store)
+
+    def test_simulated_fills_are_named_and_never_pooled(self, tmp_path) -> None:
+        """`alpha-engine-config-I12685`: a `simulated_close` session is the plan
+        restated, never a measured shortfall, in any environment."""
+        docs = {
+            day: _shortfall_doc(day, orders=_many_orders(5, 101.0), fill_source="simulated_close")
+            for day in WEEK
+        }
+        row = _execution_row(_week_store(tmp_path, docs))
+        assert row["value"] is None
+        assert row["n_orders_filled"] == 0
+        assert row["sessions_simulated"] == WEEK
+        assert "simulated at the close" in row["status_reason"]
+
+    def test_broker_fills_beside_simulated_ones_pool_only_the_broker_fills(self, tmp_path) -> None:
+        docs = {day: _shortfall_doc(day, orders=_many_orders(5, 100.02)) for day in WEEK[:4]}
+        docs[WEEK[4]] = _shortfall_doc(
+            WEEK[4], orders=_many_orders(5, 150.0), fill_source="simulated_close"
+        )
+        row = _execution_row(_week_store(tmp_path, docs))
+        assert row["n_orders_filled"] == 20
+        assert row["sessions_simulated"] == [WEEK[4]]
+        assert row["value"] == pytest.approx(2.0)
+
+    def test_an_explicit_broker_source_reads_as_an_absent_one(self, tmp_path) -> None:
+        plain = {d: _shortfall_doc(d, orders=_many_orders(5, 100.02)) for d in WEEK}
+        tagged = {d: {**doc, "fill_source": "broker"} for d, doc in plain.items()}
+        a = _execution_row(_week_store(tmp_path / "a", plain))
+        b = _execution_row(_week_store(tmp_path / "b", tagged))
+        assert (a["value"], a["n_orders_filled"]) == (b["value"], b["n_orders_filled"])
+        assert b["sessions_simulated"] == []
 
     def test_two_bands_in_one_window_are_refused(self, tmp_path) -> None:
         other = {"baseline_bps": 0.0, "upper_bps": 10.0, "placeholder": False}
