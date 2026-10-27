@@ -427,6 +427,45 @@ class TestTheChainDetectsTamperingAndAcceptsHonestAppends:
         assert broken[0].actual_prev_sha256 in verdict.reason
         assert broken[0].prev_sha256 != broken[0].actual_prev_sha256
 
+    def test_a_forked_index_names_the_claimed_and_positional_predecessors_apart(
+        self, store
+    ) -> None:
+        """Two writers that read the same head both take its next index
+        (alpha-engine-config-I12187, the 2026-10-07 fork). The verdict stays
+        `failed`; the CHAIN BROKEN line must name the run the record was
+        written against and the positional predecessor separately, never one's
+        run id beside the other's key and digest, which reads as corruption."""
+        keys = self._three_record_chain(store)
+        head = json.loads(store.get_bytes(keys[2]))
+        # A sibling that read the same head as record 2, so carries the same
+        # link, and finished a second earlier: it sorts ahead of record 2.
+        sibling = {
+            **_manifest(
+                "01JG0000000000000000000009",
+                job="promote",
+                trading_day="2026-08-27",
+                outputs=[champion_key("s")],
+                finished="2026-08-31T15:00:10Z",
+            ),
+            "money_path_link": {
+                **head["money_path_link"],
+                "money_path_writes": [champion_key("s")],
+            },
+        }
+        validate(sibling)
+        sibling_key = manifest_key("promote", "2026-08-27")
+        store.put_bytes(sibling_key, json.dumps(sibling, indent=2, sort_keys=True).encode())
+
+        verdict = verify_money_path_chain(store)
+        assert verdict.status == "failed"
+        broken = [line for line in verdict.reason.splitlines() if "CHAIN BROKEN" in line]
+        assert len(broken) == 1
+        line = broken[0]
+        claimed = head["money_path_link"]["prev_run_id"]
+        assert f"written against run {claimed!r}" in line
+        assert f"record before it in the chain ({sibling['run_id']}, {sibling_key})" in line
+        assert f"({claimed}, {sibling_key})" not in line
+
     def test_a_removed_link_is_detected(self, store) -> None:
         """A record leaves a hash chain by having its link removed. If that
         read as "not on the chain" the deletion would grade green."""
