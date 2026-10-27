@@ -351,11 +351,18 @@ def verify_money_path_chain(store: Store) -> ChainVerification:
                 "the deletion as health."
             )
         if not record.intact:
+            # The claimed predecessor (`prev_run_id`) and the positional one
+            # (the record before this in the chain) are named SEPARATELY. They
+            # differ exactly when the chain forked, and pairing one's run id
+            # with the other's key and digest made a fork read as byte
+            # corruption (alpha-engine-config-I12187). The check is unchanged.
             findings.append(
                 f"CHAIN BROKEN at record {record.index} (run {record.run_id}, {key}): it "
-                f"claims prev_sha256={record.prev_sha256!r}, and the predecessor it names "
-                f"({link['prev_run_id']}, {previous[0] if previous else None}) actually "
-                f"hashes to {record.actual_prev_sha256!r}. The predecessor's bytes are not "
+                f"claims prev_sha256={record.prev_sha256!r} (written against run "
+                f"{link['prev_run_id']!r}), and the record before it in the chain "
+                f"({previous[1]['run_id'] if previous else None}, "
+                f"{previous[0] if previous else None}) actually hashes to "
+                f"{record.actual_prev_sha256!r}. The predecessor's bytes are not "
                 "the bytes this record was written against."
             )
         if previous is not None and link["prev_run_id"] != previous[1]["run_id"]:
