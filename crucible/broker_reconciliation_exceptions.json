@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "_comment": "Declared exceptions to the phase-4 clause broker_reconciliation_control_arm_passed (crucible/gate.py), alpha-engine-config-I12376. Same declared-record shape as crucible-executor's config/ledger_declared_exceptions.json (alpha-engine-config-I12411). Each entry excuses ONE recorded trader.reconcile run and only that run: it is matched on the session, the manifest's run_id, AND the exact set of discrepancies the stored result recorded (klass, instrument, signed delta, side). A re-run, a different delta or any extra discrepancy on the same session is a new break and fails the clause. The run must still be live, its result must still hash to the manifest's digest, and its control arm must still have passed with void false: an exception excuses a recorded break, never a blind reconciler. An entry needs a ruling; manifests and results are never edited. An entry is inert once its session leaves the clause's five-session window.",
+  "exceptions": [
+    {
+      "session": "2026-10-26",
+      "run_id": "01M5WWTX24SJ1TJ8507ABJT0AA",
+      "discrepancies": [
+        {"klass": "cash_delta", "instrument": "USD", "delta": 0.55, "side": "broker_over"}
+      ],
+      "ruling": "alpha-engine-config-I12376 comment 6445680244",
+      "ruled_by": "Brian 2026-10-27T15:11Z",
+      "reason": "Fill-costing defect: each IB execution was costed at the order's cumulative avgPrice. Fixed in crucible-trader#63. All 18 comparable rows matched; control arm passed."
+    },
+    {
+      "session": "2026-10-27",
+      "run_id": "01M5ZF8Q6DYRQS33T98XQ60026",
+      "discrepancies": [
+        {"klass": "cash_delta", "instrument": "USD", "delta": -0.01, "side": "broker_under"}
+      ],
+      "ruling": "alpha-engine-config-I12376 comment 6455603302",
+      "ruled_by": "Brian 2026-10-27T22:54Z",
+      "reason": "Cent rounding: broker cash is cent-rounded while commissions carry six decimals, so the raw residual held a cent of rounding noise. Fixed in crucible-trader#65 (cent-grid compare). All 16 comparable rows matched; control arm passed."
+    }
+  ]
+}

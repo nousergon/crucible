@@ -9191,7 +9191,114 @@ def _sessions_ending(day: dt.date, count: int) -> list[dt.date]:
     return sorted(days)
 
 
-def _clause_broker_reconciliation_control_arm_passed(store: Store, window: list[dt.date]) -> Clause:
+#: Brian's rulings excusing ONE recorded `trader.reconcile` run each from
+#: :func:`_clause_broker_reconciliation_control_arm_passed`
+#: (`alpha-engine-config-I12376`). The same declared-record shape as
+#: crucible-executor's ledger exceptions (`-I12411`): a ruling per entry,
+#: matched on the exact identity of what it excuses, and the stored artifacts
+#: are never edited. Not a tolerance: every other session is graded exactly
+#: as before, and an entry stops mattering once its session leaves the
+#: five-session window.
+RECONCILIATION_EXCEPTIONS_PATH = Path(__file__).parent / "broker_reconciliation_exceptions.json"
+
+#: The fields one declared discrepancy carries, in the order they are compared.
+_DISCREPANCY_IDENTITY_FIELDS = ("klass", "instrument", "delta", "side")
+
+#: One discrepancy's identity: (klass, instrument, signed delta, side).
+DiscrepancyIdentity = tuple[str, str, float, str]
+
+
+@dataclass(frozen=True)
+class ReconciliationException:
+    """One ruled exception: the run it excuses and the exact break it recorded."""
+
+    session: dt.date
+    run_id: str
+    discrepancies: tuple[DiscrepancyIdentity, ...]
+    ruling: str
+    ruled_by: str
+
+
+def _discrepancy_identities(value: object) -> tuple[DiscrepancyIdentity, ...] | None:
+    """``value`` as sorted discrepancy identities, or None if it is not that shape."""
+    if not isinstance(value, list):
+        return None
+    identities: list[DiscrepancyIdentity] = []
+    for item in cast("list[object]", value):
+        if not isinstance(item, dict):
+            return None
+        row = cast("dict[str, object]", item)
+        klass, instrument, delta, side = (row.get(f) for f in _DISCREPANCY_IDENTITY_FIELDS)
+        if (
+            not isinstance(klass, str)
+            or not isinstance(instrument, str)
+            or not isinstance(side, str)
+            or isinstance(delta, bool)
+            or not isinstance(delta, int | float)
+        ):
+            return None
+        identities.append((klass, instrument, float(delta), side))
+    return tuple(sorted(identities))
+
+
+def load_reconciliation_exceptions(
+    path: Path = RECONCILIATION_EXCEPTIONS_PATH,
+) -> dict[dt.date, ReconciliationException]:
+    """The declared exceptions, keyed by session. Raises on any malformed entry.
+
+    Fail loud, never skip: an entry that cannot be read is a ruling that
+    cannot be applied, and dropping it would grade its session differently
+    from what the record says without anyone seeing why.
+    """
+    document = cast("object", json.loads(path.read_text(encoding="utf-8")))
+    if not isinstance(document, dict):
+        raise ValueError(f"{path.name}: the document is not an object")
+    body = cast("dict[str, object]", document)
+    if body.get("schema_version") != 1:
+        raise ValueError(f"{path.name}: schema_version {body.get('schema_version')!r} is not 1")
+    entries = body.get("exceptions")
+    if not isinstance(entries, list):
+        raise ValueError(f"{path.name}: `exceptions` is not a list")
+    declared: dict[dt.date, ReconciliationException] = {}
+    for index, raw in enumerate(cast("list[object]", entries)):
+        where = f"{path.name} exceptions[{index}]"
+        if not isinstance(raw, dict):
+            raise ValueError(f"{where}: not an object")
+        entry = cast("dict[str, object]", raw)
+        texts: dict[str, str] = {}
+        for field_name in ("session", "run_id", "ruling", "ruled_by", "reason"):
+            text = entry.get(field_name)
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError(f"{where}: `{field_name}` must be a non-empty string")
+            texts[field_name] = text
+        session = dt.date.fromisoformat(texts["session"])
+        if not is_trading_day(session):
+            raise ValueError(f"{where}: {session.isoformat()} is not an NYSE session")
+        if session in declared:
+            raise ValueError(f"{where}: a second exception for {session.isoformat()}")
+        discrepancies = _discrepancy_identities(entry.get("discrepancies"))
+        if not discrepancies:
+            raise ValueError(
+                f"{where}: `discrepancies` must list at least one "
+                f"{{{', '.join(_DISCREPANCY_IDENTITY_FIELDS)}}} object; an exception that "
+                "names no break would excuse any break"
+            )
+        declared[session] = ReconciliationException(
+            session=session,
+            run_id=texts["run_id"],
+            discrepancies=discrepancies,
+            ruling=texts["ruling"],
+            ruled_by=texts["ruled_by"],
+        )
+    return declared
+
+
+def _clause_broker_reconciliation_control_arm_passed(
+    store: Store,
+    window: list[dt.date],
+    *,
+    exceptions: dict[dt.date, ReconciliationException] | None = None,
+) -> Clause:
     """Plan §9.5: broker reconciliation emits `run.json`, and its control arm passed.
 
     `alpha-engine-config-I10651` (items 1-3 of its 2026-09-14 comment) and
@@ -9216,13 +9323,23 @@ def _clause_broker_reconciliation_control_arm_passed(store: Store, window: list[
     reconciliation that did not happen, which is also the §4.6 absence page.
     UNMEASURABLE is kept for a store we could not read (the `Clause`
     docstring: a fact about our reading, never about the system).
+
+    **Declared exceptions** (:data:`RECONCILIATION_EXCEPTIONS_PATH`,
+    `alpha-engine-config-I12376`): a `failed` manifest counts for its session
+    only when a ruled exception names that session, that manifest's `run_id`
+    and exactly the discrepancies its stored result recorded, and every other
+    check above still holds for it (live, intact result, control arm passed,
+    not void). Anything else about that session is a finding, as before.
     """
     name = "broker_reconciliation_control_arm_passed"
+    declared = load_reconciliation_exceptions() if exceptions is None else exceptions
     sessions = _sessions_ending(_last_session(window[-1]), TRADING_DAYS_PER_WEEK)
     first, last = sessions[0].isoformat(), sessions[-1].isoformat()
     requirement = (
         f"each of the {TRADING_DAYS_PER_WEEK} sessions ending at the window's last session "
-        f"has a live `{TRADER_RECONCILE_JOB}` manifest reading `ok`, whose one "
+        f"has a live `{TRADER_RECONCILE_JOB}` manifest reading `ok` (or `failed` with exactly "
+        "the run and discrepancies a ruled exception in "
+        f"`{RECONCILIATION_EXCEPTIONS_PATH.name}` declares), whose one "
         "`trader/reconciliation/{day}.json` output still hashes to the recorded digest and "
         f"records `control_arm.fault` `{RECONCILIATION_FAULT}`, `control_arm.passed: true` "
         "and `void: false`"
@@ -9230,6 +9347,7 @@ def _clause_broker_reconciliation_control_arm_passed(store: Store, window: list[
     missing: list[str] = []
     findings: list[str] = []
     evidence: list[str] = []
+    excused: list[str] = []
     for session in sessions:
         day = session.isoformat()
         key = manifest_key(TRADER_RECONCILE_JOB, day)
@@ -9250,12 +9368,22 @@ def _clause_broker_reconciliation_control_arm_passed(store: Store, window: list[
         except ManifestValidationError as exc:
             findings.append(f"{key} does not conform to the run manifest schema: {exc}")
             continue
+        # A clean run needs no exception; one is consulted only for a failed run.
+        excepted = declared.get(session) if manifest["status"] != "ok" else None
         if manifest["status"] != "ok":
-            findings.append(
+            stated = (
                 f"{key}: status `{manifest['status']}` "
                 f"({manifest.get('reason') or 'the manifest recorded no reason'})"
             )
-            continue
+            if excepted is None:
+                findings.append(stated)
+                continue
+            if manifest.get("run_id") != excepted.run_id:
+                findings.append(
+                    f"{stated}; {excepted.ruling} excepts run {excepted.run_id}, and this "
+                    f"manifest is run {manifest.get('run_id')!r}, so the exception does not apply"
+                )
+                continue
         if manifest["run_mode"] != "live":
             findings.append(
                 f"{key}: run_mode `{manifest['run_mode']}` — a replay reconciles no book a "
@@ -9313,6 +9441,16 @@ def _clause_broker_reconciliation_control_arm_passed(store: Store, window: list[
                 "the two must agree"
             )
             continue
+        if excepted is not None:
+            recorded = _discrepancy_identities(document.get("discrepancies"))
+            if recorded != excepted.discrepancies:
+                findings.append(
+                    f"{result_key}: discrepancies {recorded!r} are not the "
+                    f"{list(excepted.discrepancies)!r} that {excepted.ruling} excepts; a "
+                    "different break is a new finding"
+                )
+                continue
+            excused.append(f"{day} ({excepted.ruling}, {excepted.ruled_by})")
     if missing and len(missing) == len(sessions):
         return Clause(
             name,
@@ -9333,7 +9471,8 @@ def _clause_broker_reconciliation_control_arm_passed(store: Store, window: list[
         requirement,
         True,
         f"{len(sessions)} live reconciliation(s) {first}..{last}, each `ok` with the control "
-        "arm passed and the result intact",
+        "arm passed and the result intact"
+        + (f"; ruled exception(s) applied: {', '.join(excused)}" if excused else ""),
         tuple(evidence),
     )
 
