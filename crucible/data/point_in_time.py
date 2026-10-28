@@ -162,7 +162,7 @@ import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 from crucible.data.sources import MissingSourceError
 from crucible.documents import read_document
@@ -1050,10 +1050,10 @@ class SnapshotPointInTimeSource(PointInTimeSource):
             unmeasured_fields=unmeasured,
         )
 
-    def _thinktank_knowledge_date(self, key: str) -> tuple[dt.date, dict[str, Any]]:
-        import pandas as pd
+    def _thinktank_knowledge_date(self, key: str) -> tuple[dt.date, Mapping[str, object]]:
+        from zoneinfo import ZoneInfo
 
-        document = self._json(key)
+        document: Mapping[str, object] = self._json(key)
         updated = document.get("updated_at")
         if not isinstance(updated, str) or not updated:
             raise MissingSourceError(
@@ -1061,10 +1061,15 @@ class SnapshotPointInTimeSource(PointInTimeSource):
                 "established; a rating of unknown knowledge time cannot be admitted to any "
                 "session"
             )
-        known = pd.Timestamp(updated)
+        try:
+            known = dt.datetime.fromisoformat(updated)
+        except ValueError as exc:
+            raise MissingSourceError(
+                f"{key!r} `updated_at`={updated!r} is not a timestamp"
+            ) from exc
         if known.tzinfo is None:
             raise MissingSourceError(f"{key!r} `updated_at`={updated!r} carries no timezone")
-        return known.tz_convert(_NEW_YORK).date(), document
+        return known.astimezone(ZoneInfo(_NEW_YORK)).date(), document
 
     def _load_thinktank(self, day: dt.date, wanted: list[str], frame: pd.DataFrame) -> GroupReading:
         labels = sorted(
@@ -1074,7 +1079,7 @@ class SnapshotPointInTimeSource(PointInTimeSource):
         # A document labelled T rates session T and is written after it, so
         # only labels before `day` can be admissible; the knowledge date itself
         # is read from each candidate document, newest first.
-        chosen: tuple[str, dt.date, dt.date, dict[str, Any]] | None = None
+        chosen: tuple[str, dt.date, dt.date, Mapping[str, object]] | None = None
         for label in reversed([label for label in labels if label < day]):
             key = thinktank_ratings_key(label)
             knowledge_date, document = self._thinktank_knowledge_date(key)
@@ -1116,19 +1121,15 @@ class SnapshotPointInTimeSource(PointInTimeSource):
                 f"{key!r} declares trading_day {document.get('trading_day')!r}, not its own "
                 f"label {label.isoformat()}"
             )
-        rows = document.get("rows")
-        if not isinstance(rows, dict):
+        raw_rows = document.get("rows")
+        if not isinstance(raw_rows, dict):
             raise MissingSourceError(f"{key!r} carries no `rows` object")
+        rows = cast("dict[object, object]", raw_rows)
         ratings: dict[str, float] = {}
         for ticker, row in rows.items():
-            rating = row.get("rating") if isinstance(row, dict) else None
-            if (
-                isinstance(rating, int | float)
-                and not isinstance(rating, bool)
-                and math.isfinite(rating)
-                and 0 <= rating <= 100
-            ):
-                ratings[str(ticker)] = float(rating)
+            rating = _thinktank_rating(row)
+            if rating is not None:
+                ratings[str(ticker)] = rating
         declared = len(rows)
         covered_names = sorted(set(ratings) & set(wanted))
         if declared == 0 or len(covered_names) / declared < GROUP_COVERAGE_FLOOR_RATIO:
@@ -1173,6 +1174,21 @@ class SnapshotPointInTimeSource(PointInTimeSource):
             ),
             unmeasured_fields=unmeasured,
         )
+
+
+def _thinktank_rating(row: object) -> float | None:
+    """A row's 0-100 rating, or None when the row carries no valid one."""
+    if not isinstance(row, dict):
+        return None
+    rating = cast("dict[object, object]", row).get("rating")
+    if (
+        isinstance(rating, int | float)
+        and not isinstance(rating, bool)
+        and math.isfinite(rating)
+        and 0 <= rating <= 100
+    ):
+        return float(rating)
+    return None
 
 
 class FilingDatePointInTimeSource(SnapshotPointInTimeSource):

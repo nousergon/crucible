@@ -64,6 +64,7 @@ crash).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
@@ -75,7 +76,7 @@ from crucible.keys import coverage_key, features_key, features_prefix
 from crucible.store import Store
 
 if TYPE_CHECKING:
-    import pandas as pd
+    import pandas as pd  # pyright: ignore[reportMissingTypeStubs] - pandas ships no stubs
 
 __all__ = [
     "DECLARED_SOURCE_BOUNDARIES",
@@ -260,17 +261,31 @@ NULL_RATIO_DENOMINATORS: dict[str, str] = {
 }
 
 
+def _null_flags(frame: pd.DataFrame, column: str) -> list[bool]:
+    """Per-row nullness of ``column``, any dtype. pandas ships no stubs, so the
+    two helpers here are the only lines that cross its untyped surface."""
+    return [bool(v) for v in frame[column].isna().tolist()]  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType, reportUnknownArgumentType]
+
+
+def _indicator_flags(frame: pd.DataFrame, column: str) -> list[bool]:
+    """Per-row ``column == 1`` for a 0/1/null indicator column."""
+    return [bool(v) for v in (frame[column] == 1.0).tolist()]  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType, reportUnknownArgumentType]
+
+
 def column_null_ratio(frame: pd.DataFrame, column: str) -> float:
     """The null fraction of ``column`` over the rows it is expected to carry."""
+    nulls = _null_flags(frame, column)
     indicator = NULL_RATIO_DENOMINATORS.get(column)
-    if indicator is None:
-        return float(frame[column].isna().mean())
-    if indicator not in frame.columns:
-        return 1.0
-    expected = frame[indicator] == 1.0
-    if not bool(expected.any()):
-        return 1.0
-    return float(frame.loc[expected, column].isna().mean())
+    if indicator is not None:
+        if indicator not in frame.columns:
+            return 1.0
+        expected = _indicator_flags(frame, indicator)
+        nulls = [null for null, keep in zip(nulls, expected, strict=True) if keep]
+        if not nulls:
+            return 1.0
+    if not nulls:
+        return math.nan
+    return sum(nulls) / len(nulls)
 
 
 #: Sessions sampled across the live version, newest and oldest always among
