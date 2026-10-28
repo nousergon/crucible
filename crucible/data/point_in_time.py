@@ -1,4 +1,5 @@
-"""Point-in-time non-price inputs: fundamentals, sector and 13F accumulation.
+"""Point-in-time non-price inputs: fundamentals, sector, 13F accumulation and the
+Think Tank's per-ticker rating.
 
 Normative source: plan §4.3 (sources behind an adapter), §9.7 (a restatement
 is versioned, never overwritten), and `alpha-engine-config-I10721`.
@@ -47,6 +48,16 @@ the artifact itself records, never assumed from a folder name:
   convention every institutional PIT store uses, and it is written here so it
   is a declared choice rather than an accident.
 
+* **Think Tank rating** (`thinktank/ratings/{trading_day}.json`): the
+  document's own ``updated_at``, converted to the New York calendar date. The
+  label is the session the ratings were written FOR, not when they became
+  known: measured 2026-10-28 over all 74 documents (2026-07-02..2026-10-27),
+  every one was written the next business day at 14:3x-18:1x UTC, i.e. after
+  the next session had opened. So a document labelled ``T`` is admissible
+  from the session after its write, two sessions after ``T``
+  (`alpha-engine-config-I12395`, Brian 2026-10-28: the Think Tank arm competes
+  in R every week until it is shown inferior).
+
 What makes a group unmeasured
 -----------------------------
 
@@ -58,7 +69,15 @@ What makes a group unmeasured
    requested symbols (``below_coverage``) — recorded `FAIL`. A sector map
    covering the S&P 500 but not the 400 (every snapshot before 2026-04-30)
    would otherwise rank half the universe within sector and silently drop the
-   rest.
+   rest. **The Think Tank group is the one exception, and it is declared:** the
+   Think Tank rates only the names it covers (30-176 per session, measured
+   2026-10-28), so its coverage is measured against the names its OWN document
+   declares, never against the universe. A 162-of-900 reading is the design,
+   not an outage; what the floor still catches is a document whose tickers do
+   not resolve against the universe (a symbol-format change). Which names the
+   group covered on a session is a column of its own,
+   :data:`THINKTANK_COVERED_COLUMN`, so a reader can tell "not covered" from
+   "covered and unmeasured".
 4. A FIELD whose non-null cross-section carries fewer distinct values than
    :func:`distinctness_floor` is unmeasured on that session even when its
    group is measured — recorded `FAIL`, per field. Non-null is not the same as
@@ -152,6 +171,7 @@ from crucible.keys import (
     edgar_fundamentals_session_key,
     fundamental_snapshot_key,
     inst_ownership_key,
+    thinktank_ratings_key,
 )
 
 if TYPE_CHECKING:
@@ -172,6 +192,12 @@ __all__ = [
     "POINT_IN_TIME_COLUMNS",
     "POINT_IN_TIME_MODE",
     "SECTOR_COLUMN",
+    "THINKTANK_COLUMNS",
+    "THINKTANK_COVERED_COLUMN",
+    "THINKTANK_DISTINCTNESS_FLOOR",
+    "THINKTANK_RATING_COLUMN",
+    "THINKTANK_RATINGS_SCHEMA_VERSION",
+    "MAX_THINKTANK_STALENESS_SESSIONS",
     "THIRTEEN_F_FILING_LAG_DAYS",
     "FilingDatePointInTimeSource",
     "GicsReclassification",
@@ -187,9 +213,10 @@ __all__ = [
     "fundamental_snapshot_key",
     "inst_ownership_key",
     "quarter_knowledge_date",
+    "thinktank_ratings_key",
 ]
 
-GroupName = Literal["fundamental", "sector", "institutional"]
+GroupName = Literal["fundamental", "sector", "institutional", "thinktank"]
 GroupState = Literal["measured", "predates_source", "stale", "below_coverage", "not_supplied"]
 SourceMode = Literal["point_in_time", "earliest_snapshot_backfill"]
 
@@ -299,10 +326,21 @@ INSTITUTIONAL_COLUMNS: dict[str, str] = {
     "n_funds_decreasing": "n_funds_decreasing_raw",
 }
 
+#: The Think Tank's rating, carried as ``rating / 100`` so the column is the
+#: 0-1 ratio its suffix names (the document's own field is an integer 0-100).
+THINKTANK_RATING_COLUMN = "thinktank_rating_ratio"
+#: 1 where the session's admissible Think Tank document rates the ticker, 0
+#: where the group measured and does not rate it, null where the group
+#: measured nothing. The denominator `crucible.features.depth` grades the
+#: rating's completeness against.
+THINKTANK_COVERED_COLUMN = "thinktank_covered_raw"
+THINKTANK_COLUMNS: tuple[str, ...] = (THINKTANK_RATING_COLUMN, THINKTANK_COVERED_COLUMN)
+
 POINT_IN_TIME_COLUMNS: tuple[str, ...] = (
     SECTOR_COLUMN,
     *FUNDAMENTAL_FIELD_COLUMNS.values(),
     *INSTITUTIONAL_COLUMNS.values(),
+    *THINKTANK_COLUMNS,
 )
 
 #: v1's staleness bound on a fundamentals snapshot
@@ -311,6 +349,23 @@ MAX_FUNDAMENTAL_STALENESS_SESSIONS = 10
 #: The constituents snapshot is written most sessions and at least weekly; the
 #: same bound, so a sector map two weeks old is an outage rather than a value.
 MAX_SECTOR_STALENESS_SESSIONS = 10
+
+#: The Think Tank writes one ratings document per session. Five sessions is a
+#: week of missed runs: past it the ratings describe a market that has moved,
+#: and the 2026-07-17..07-29 freeze (twelve days of a run dying before its
+#: terminal writes, `nousergon-data` thinktank-spot-dispatcher README) is
+#: exactly the outage this must report rather than serve.
+MAX_THINKTANK_STALENESS_SESSIONS = 5
+
+#: The `schema_version` a Think Tank ratings document must declare.
+THINKTANK_RATINGS_SCHEMA_VERSION = 1
+
+#: The distinct-value floor for the Think Tank rating. Lower than
+#: :data:`FUNDAMENTAL_DISTINCTNESS_FLOOR` on purpose: the rating is an INTEGER
+#: on 0-100 that an LLM assigns, so a healthy cross-section clusters (15-51
+#: distinct values over 30-176 names, measured 2026-10-28). Ten still catches
+#: the degenerate case the floor exists for — one value stamped on everything.
+THINKTANK_DISTINCTNESS_FLOOR = 10
 
 #: Form 13F is due 45 calendar days after the quarter ends (17 CFR 240.13f-1).
 THIRTEEN_F_FILING_LAG_DAYS = 45
@@ -339,6 +394,7 @@ _FUNDAMENTAL_KEY_RE = re.compile(rf"^features/{_ISO}/fundamental\.parquet$")
 _EDGAR_SESSION_KEY_RE = re.compile(rf"^fundamentals_pit/edgar/v1/sessions/{_ISO}\.parquet$")
 _CONSTITUENTS_KEY_RE = re.compile(rf"^market_data/weekly/{_ISO}/constituents\.json$")
 _INST_KEY_RE = re.compile(r"^data/inst_ownership/(\d{4})Q([1-4])/latest\.parquet$")
+_THINKTANK_KEY_RE = re.compile(rf"^thinktank/ratings/{_ISO}\.json$")
 
 _NEW_YORK = "America/New_York"
 
@@ -478,6 +534,7 @@ _GROUP_COLUMNS: dict[str, tuple[str, ...]] = {
     "fundamental": tuple(FUNDAMENTAL_FIELD_COLUMNS.values()),
     "sector": (SECTOR_COLUMN,),
     "institutional": tuple(INSTITUTIONAL_COLUMNS.values()),
+    "thinktank": THINKTANK_COLUMNS,
 }
 
 
@@ -486,7 +543,11 @@ def _empty_frame(symbols: Sequence[str]) -> pd.DataFrame:
 
     frame = pd.DataFrame({"ticker": sorted(set(symbols))})
     frame[SECTOR_COLUMN] = pd.Series([None] * len(frame), dtype="object")
-    for column in (*FUNDAMENTAL_FIELD_COLUMNS.values(), *INSTITUTIONAL_COLUMNS.values()):
+    for column in (
+        *FUNDAMENTAL_FIELD_COLUMNS.values(),
+        *INSTITUTIONAL_COLUMNS.values(),
+        *THINKTANK_COLUMNS,
+    ):
         frame[column] = float("nan")
     return frame
 
@@ -534,7 +595,7 @@ class UnavailablePointInTimeSource(PointInTimeSource):
                 expected=expected,
                 detail=f"declared unavailable: {self.reason}",
             )
-            for group in ("fundamental", "sector", "institutional")
+            for group in ("fundamental", "sector", "institutional", "thinktank")
         )
         return PointInTimeInputs(
             trading_day=trading_day,
@@ -622,6 +683,7 @@ class SnapshotPointInTimeSource(PointInTimeSource):
             self._load_fundamentals(trading_day, wanted, frame),
             self._load_sector(trading_day, wanted, frame),
             self._load_institutional(trading_day, wanted, frame),
+            self._load_thinktank(trading_day, wanted, frame),
         )
         return PointInTimeInputs(
             trading_day=trading_day,
@@ -985,6 +1047,130 @@ class SnapshotPointInTimeSource(PointInTimeSource):
             covered=len(covered_names),
             expected=len(wanted),
             detail=f"{key} (public from {known}): {len(covered_names)} of {len(wanted)} names",
+            unmeasured_fields=unmeasured,
+        )
+
+    def _thinktank_knowledge_date(self, key: str) -> tuple[dt.date, dict[str, Any]]:
+        import pandas as pd
+
+        document = self._json(key)
+        updated = document.get("updated_at")
+        if not isinstance(updated, str) or not updated:
+            raise MissingSourceError(
+                f"{key!r} records no `updated_at`, so when it became known cannot be "
+                "established; a rating of unknown knowledge time cannot be admitted to any "
+                "session"
+            )
+        known = pd.Timestamp(updated)
+        if known.tzinfo is None:
+            raise MissingSourceError(f"{key!r} `updated_at`={updated!r} carries no timezone")
+        return known.tz_convert(_NEW_YORK).date(), document
+
+    def _load_thinktank(self, day: dt.date, wanted: list[str], frame: pd.DataFrame) -> GroupReading:
+        labels = sorted(
+            dt.date.fromisoformat(m.group(1))
+            for m in self._require_listing("thinktank/ratings/", _THINKTANK_KEY_RE)
+        )
+        # A document labelled T rates session T and is written after it, so
+        # only labels before `day` can be admissible; the knowledge date itself
+        # is read from each candidate document, newest first.
+        chosen: tuple[str, dt.date, dt.date, dict[str, Any]] | None = None
+        for label in reversed([label for label in labels if label < day]):
+            key = thinktank_ratings_key(label)
+            knowledge_date, document = self._thinktank_knowledge_date(key)
+            if knowledge_date < day:
+                chosen = (key, label, knowledge_date, document)
+                break
+        if chosen is None:
+            return GroupReading(
+                group="thinktank",
+                state="predates_source",
+                snapshot=None,
+                knowledge_date=None,
+                covered=0,
+                expected=0,
+                detail=f"no Think Tank ratings document was written before {day}",
+            )
+        key, label, knowledge_date, document = chosen
+        age = _sessions_between(knowledge_date, day)
+        if age > MAX_THINKTANK_STALENESS_SESSIONS:
+            return GroupReading(
+                group="thinktank",
+                state="stale",
+                snapshot=key,
+                knowledge_date=knowledge_date.isoformat(),
+                covered=0,
+                expected=0,
+                detail=(
+                    f"newest admissible Think Tank ratings {key} were written {age} sessions "
+                    f"before {day}, beyond the {MAX_THINKTANK_STALENESS_SESSIONS}-session bound"
+                ),
+            )
+        if document.get("schema_version") != THINKTANK_RATINGS_SCHEMA_VERSION:
+            raise MissingSourceError(
+                f"{key!r} declares schema_version {document.get('schema_version')!r}, not "
+                f"{THINKTANK_RATINGS_SCHEMA_VERSION}"
+            )
+        if document.get("trading_day") != label.isoformat():
+            raise MissingSourceError(
+                f"{key!r} declares trading_day {document.get('trading_day')!r}, not its own "
+                f"label {label.isoformat()}"
+            )
+        rows = document.get("rows")
+        if not isinstance(rows, dict):
+            raise MissingSourceError(f"{key!r} carries no `rows` object")
+        ratings: dict[str, float] = {}
+        for ticker, row in rows.items():
+            rating = row.get("rating") if isinstance(row, dict) else None
+            if (
+                isinstance(rating, int | float)
+                and not isinstance(rating, bool)
+                and math.isfinite(rating)
+                and 0 <= rating <= 100
+            ):
+                ratings[str(ticker)] = float(rating)
+        declared = len(rows)
+        covered_names = sorted(set(ratings) & set(wanted))
+        if declared == 0 or len(covered_names) / declared < GROUP_COVERAGE_FLOOR_RATIO:
+            return GroupReading(
+                group="thinktank",
+                state="below_coverage",
+                snapshot=key,
+                knowledge_date=knowledge_date.isoformat(),
+                covered=len(covered_names),
+                expected=declared,
+                detail=(
+                    f"{key} rates {declared} names and {len(covered_names)} of them carry a "
+                    f"valid rating and resolve against the universe, below the "
+                    f"{GROUP_COVERAGE_FLOOR_RATIO:.2f} floor of the document's OWN coverage; "
+                    "none of its values are used on this session"
+                ),
+            )
+        frame.loc[wanted, THINKTANK_COVERED_COLUMN] = 0.0
+        frame.loc[covered_names, THINKTANK_COVERED_COLUMN] = 1.0
+        unmeasured: dict[str, str] = {}
+        floor = max(2, min(THINKTANK_DISTINCTNESS_FLOOR, math.ceil(len(covered_names) / 2)))
+        distinct = len({ratings[t] for t in covered_names})
+        if distinct < floor:
+            unmeasured[THINKTANK_RATING_COLUMN] = (
+                f"`rating` carries {distinct} distinct value(s) over {len(covered_names)} names "
+                f"in {key}, below the floor of {floor}: non-null, and not informative"
+            )
+        else:
+            frame.loc[covered_names, THINKTANK_RATING_COLUMN] = [
+                ratings[t] / 100.0 for t in covered_names
+            ]
+        return GroupReading(
+            group="thinktank",
+            state="measured",
+            snapshot=key,
+            knowledge_date=knowledge_date.isoformat(),
+            covered=len(covered_names),
+            expected=declared,
+            detail=(
+                f"{key} (written {document['updated_at']}): {len(covered_names)} of the "
+                f"{declared} names it rates"
+            ),
             unmeasured_fields=unmeasured,
         )
 

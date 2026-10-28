@@ -153,6 +153,7 @@ __all__ = [
     "strategy_holdout_key",
     "strategy_slot_key",
     "strategy_slots_prefix",
+    "thinktank_ratings_key",
     "trader_broker_statement_key",
     "trader_fire_drill_key",
     "trader_fire_drill_schedule_key",
@@ -2142,6 +2143,7 @@ DATA_BUCKET_KEY_HELPERS: tuple[str, ...] = (
     "constituents_key",
     "inst_ownership_key",
     "edgar_fundamentals_session_key",
+    "thinktank_ratings_key",
 )
 
 
@@ -2155,6 +2157,15 @@ def constituents_key(label: dt.date) -> str:
 
 def inst_ownership_key(year: int, quarter: int) -> str:
     return f"data/inst_ownership/{year}Q{quarter}/latest.parquet"
+
+
+def thinktank_ratings_key(label: dt.date) -> str:
+    """The Think Tank's per-ticker ratings for the session ``label`` rates,
+    written by `crucible-research`'s daily Think Tank run the next business day.
+    Admissible by its own ``updated_at``, never by this label
+    (`crucible.data.point_in_time`, `alpha-engine-config-I12395`).
+    """
+    return f"thinktank/ratings/{label.isoformat()}.json"
 
 
 def edgar_fundamentals_session_key(label: dt.date) -> str:
