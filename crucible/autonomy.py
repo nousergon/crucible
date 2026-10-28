@@ -464,6 +464,12 @@ class DayCache(Protocol):
     def put(self, scope: str, day: dt.date, document: dict[str, Any]) -> None: ...
 
 
+#: The two bytes every gzip member starts with (RFC 1952). A JSON document
+#: cannot begin with them, so :meth:`S3DayCache.get` reads both the gzipped
+#: documents :meth:`S3DayCache.put` writes and the plain ones written before.
+_GZIP_MAGIC = b"\x1f\x8b"
+
+
 def _scope_digest(scope: str) -> str:
     return hashlib.sha256(scope.encode("utf-8")).hexdigest()[:24]
 
@@ -495,15 +501,28 @@ class S3DayCache:
             if _is_missing_key(exc):
                 return None
             raise
-        document = json.loads(body.read().decode("utf-8"))
+        raw = body.read()
+        if raw[:2] == _GZIP_MAGIC:
+            raw = gzip.decompress(raw)
+        document = json.loads(raw.decode("utf-8"))
         return document if isinstance(document, dict) else None
 
     def put(self, scope: str, day: dt.date, document: dict[str, Any]) -> None:
+        # Gzipped (`alpha-engine-config-I12793`): the board role reads every
+        # closed day of the month back on every render, from a GitHub-hosted
+        # runner, so each stored byte is billed internet egress twice a day.
+        # A cached day is hundreds to thousands of near-identical CloudTrail
+        # records; measured 2026-10-28 on the 2026-10-25 document, 2,454,132
+        # bytes of JSON gzip to 201,608. `mtime=0` keeps the body a pure
+        # function of the document. The key keeps its `.json` name so the
+        # plain documents already stored stay readable: `get` tells the two
+        # apart by the gzip magic, which no JSON text can begin with.
+        payload = json.dumps(document, separators=(",", ":"), sort_keys=True).encode("utf-8")
         self.client.put_object(
             Bucket=self.bucket,
             Key=self.key(scope, day),
-            Body=json.dumps(document, separators=(",", ":"), sort_keys=True).encode("utf-8"),
-            ContentType="application/json",
+            Body=gzip.compress(payload, mtime=0),
+            ContentType="application/gzip",
         )
 
 
