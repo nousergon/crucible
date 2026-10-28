@@ -1539,6 +1539,33 @@ class TestS3DayCache:
         assert key.endswith("/2026/09/01.json")
         assert "scope" not in key, "the scope is hashed, never spelled, in the key"
 
+    def test_a_document_is_stored_gzipped_and_reads_back_identical(self) -> None:
+        """alpha-engine-config-I12793: every stored byte is read back from a
+        GitHub-hosted runner on every render, so the body is gzipped — and it
+        must read back as exactly the document that was put."""
+        client = _FakeS3WithPut()
+        cache = autonomy.S3DayCache(client, "cache-bucket", "crucible/board/ct-cache")
+        document = {
+            "schema": 1,
+            "records": [{"eventName": "PutObject", "eventTime": "2026-09-01T00:00:00Z"}] * 50,
+        }
+        cache.put("scope/v1", CACHE_START, document)
+        (body,) = client.stored.values()
+        assert body[:2] == b"\x1f\x8b"
+        plain = json.dumps(document, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        assert gzip.decompress(body) == plain
+        assert len(body) < len(plain)
+        assert cache.get("scope/v1", CACHE_START) == document
+        cache.put("scope/v1", CACHE_START, document)
+        assert client.stored[next(iter(client.stored))] == body, "the body is deterministic"
+
+    def test_a_plain_json_document_written_before_gzip_still_reads(self) -> None:
+        client = _FakeS3WithPut()
+        cache = autonomy.S3DayCache(client, "cache-bucket", "crucible/board/ct-cache")
+        document = {"schema": 1, "records": [{"eventName": "PutObject"}]}
+        client.stored[cache.key("scope/v1", CACHE_START)] = json.dumps(document).encode("utf-8")
+        assert cache.get("scope/v1", CACHE_START) == document
+
     def test_a_denied_read_is_raised_not_read_as_a_miss(self) -> None:
         class _Denied(_FakeS3WithPut):
             def get_object(self, *, Bucket: str, Key: str):  # noqa: N803
