@@ -344,6 +344,33 @@ components:
     dispatch: null
     deadline: null
 
+  experiment.retire:
+    description: >-
+      Retire one arm on a named operator ruling (alpha-engine-config-I12765).
+      Appends a retired event to the slot's arm register and a row naming the
+      ruling to its retirement log. Refuses a retirement with no ruling, the
+      slot's current champion, and a control arm.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd,llm_calls
+      resource: run.json:resource
+      lineage: run.json:inputs,outputs,rows_in,rows_out,rows_rejected
+      # A retirement produces no graded outcome of its own; the weekly cycle
+      # simply stops counting the arm. Declared null rather than omitted.
+      outcome: null
+    log_location: cloudwatch:/crucible/experiment.retire
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/arms
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    # On-demand, like experiment.backfill: there is no cadence to grade, so
+    # its absence is graded from the dispatcher's own record.
+    schedule: null
+    dispatch: null
+    deadline: null
+
   serve.daily:
     description: >-
       One slot's daily output for one trading day, so the weekly arc is not the

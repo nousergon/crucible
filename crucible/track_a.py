@@ -1373,6 +1373,57 @@ def _verify_chain_or_refuse(lineage: Any) -> None:
         chain.raise_if_broken()
 
 
+def handle_experiment_retire(args: argparse.Namespace) -> int:
+    """`experiment.retire`: retire one arm on a named operator ruling.
+
+    The whole body is :func:`crucible.retire.retire_arm`. Every refusal (no
+    ruling, the champion, a control, an unknown arm) raises before anything
+    is written, and the manifest carries the cause. The manifest is
+    discriminated by `{slot}.{arm}`, so two retirements on one day are two
+    manifests.
+    """
+    from crucible.retire import retire_arm  # noqa: PLC0415 - one call site
+
+    config = _settings(args)
+    store = config.store()
+    dry_run = bool(getattr(args, "dry_run", False))
+    retired_date = (args.trading_day or resolve_trading_day()).isoformat()
+    result: dict[str, Any] = {}
+
+    def job(ctx: Any) -> None:
+        outcome = retire_arm(
+            store,
+            slot=args.slot,
+            arm=args.arm,
+            ruling=args.ruling,
+            reason=" ".join(args.reason),
+            retired_date=retired_date,
+            write=not dry_run,
+        )
+        result.update(outcome.to_dict())
+        if not dry_run:
+            if outcome.register_written:
+                ctx.record_output(
+                    arm_register_key(args.slot),
+                    store.get_bytes(arm_register_key(args.slot)),
+                    schema_version="arm_register.v1",
+                )
+            ctx.record_output(outcome.log_key, store.get_bytes(outcome.log_key))
+        ctx.record_rows(rows_in=1, rows_out=1)
+
+    ctx = run_job(
+        "experiment.retire",
+        job,
+        store=store,
+        trading_day=args.trading_day,
+        run_mode=getattr(args, "run_mode", None),
+        dry_run=dry_run,
+        discriminator=f"{args.slot}.{name_component(args.arm)}",
+    )
+    print(json.dumps({"run_id": ctx.run_id, "dry_run": dry_run, **result}, indent=2))
+    return 0
+
+
 HANDLERS = {
     "data.daily": handle_data_daily,
     "data.weekly": handle_data_weekly,
@@ -1381,6 +1432,7 @@ HANDLERS = {
     "experiment.register": handle_experiment_register,
     "experiment.run": handle_experiment_run,
     "experiment.backfill": handle_experiment_backfill,
+    "experiment.retire": handle_experiment_retire,
     "experiment.grade": handle_experiment_grade,
     "serve.daily": handle_serve_daily,
     "explain": handle_explain,
@@ -1389,6 +1441,21 @@ HANDLERS = {
 
 def add_track_a_arguments(name: str, sub: argparse.ArgumentParser) -> None:
     """Track-A-only flags for one subcommand."""
+    if name == "experiment.retire":
+        sub.add_argument(
+            "--ruling",
+            required=True,
+            help=(
+                "Where the retirement was decided: the tracker issue or decision that ruled it. "
+                "Required: a retirement nobody can trace to a decision is refused."
+            ),
+        )
+        sub.add_argument(
+            "--reason",
+            nargs="+",
+            required=True,
+            help="Why the arm leaves the arena. Several words are joined with spaces.",
+        )
     if name in ("data.daily", "serve.daily"):
         # alpha-engine-config-I12020. Opt-in, and declared in the dispatch's
         # own argv (nous-ergon-ops `crucible-v2.yaml`), because a day now has

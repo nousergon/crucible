@@ -60,6 +60,7 @@ def _minimal_argv(job: str) -> list[str]:
         "experiment.run",
         "experiment.grade",
         "experiment.backfill",
+        "experiment.retire",
         "promote",
         "experiment.new",
         "experiment.register",
@@ -69,8 +70,11 @@ def _minimal_argv(job: str) -> list[str]:
         # alpha-engine-config-I12047 / -I12021: M, U and S have a daily serving
         # entry point (`crucible.slots.daily_servers`); `--slot r` is refused.
         argv += ["--slot", "m"]
-    if job in ("experiment.run", "experiment.new", "experiment.backfill"):
+    if job in ("experiment.run", "experiment.new", "experiment.backfill", "experiment.retire"):
         argv += ["--arm", "arm_abc"]
+    if job == "experiment.retire":
+        # Both required: a retirement with no ruling is refused at the parser.
+        argv += ["--ruling", "a-ruling", "--reason", "why"]
     if job == "experiment.backfill":
         # alpha-engine-config-I10696: a range job, like data.heal. Both bounds
         # are required — a backfill that defaulted one end would produce a
@@ -205,6 +209,8 @@ class TestJobSurface:
             # history, and a stacked arm's training window is unreachable
             # from the weekly cadence alone.
             "experiment.backfill",
+            # On-demand: one operator retirement of one arm on a named ruling.
+            "experiment.retire",
             "experiment.grade",
             # alpha-engine-config-I12047 (Brian's ruling: a daily M job): the
             # champion's feed for every session, from its fit of record,
@@ -712,6 +718,9 @@ class TestDryRunNeverWrites:
             # raises `MissingArtifactError` for the absent price panel, which
             # is precisely the rehearsal fidelity this move buys.
             "experiment.grade",
+            # Needs a seeded register and champion pointer; its dry run is
+            # asserted to write nothing in `tests/test_experiment_retire.py`.
+            "experiment.retire",
             "promote",
             "report.morning",
         }
