@@ -764,6 +764,13 @@ JOBS: dict[str, JobSpec] = {
         "Produce one arm's history over a session range, point-in-time",
         False,
     ),
+    # alpha-engine-config-I12765. On-demand: an operator retirement of one arm
+    # on a named ruling. The weekly cycle's own retirements stay with `promote`.
+    "experiment.retire": JobSpec(
+        "experiment.retire",
+        "Retire one arm on a named operator ruling",
+        False,
+    ),
     # alpha-engine-config-I12047 (Brian's ruling: a daily M job). SCHEDULED,
     # after `data.daily`, every trading day: it publishes the champion's feed
     # for the session from the champion's fit of record, so the trader has a
@@ -1105,6 +1112,7 @@ def build_parser() -> argparse.ArgumentParser:
             "experiment.run",
             "experiment.grade",
             "experiment.backfill",
+            "experiment.retire",
             "promote",
             "experiment.new",
             "experiment.register",
@@ -1134,7 +1142,12 @@ def build_parser() -> argparse.ArgumentParser:
                 help="Why. Mandatory with --revert-to: an unexplained operator "
                 "override is the one pointer movement nobody can reconstruct later.",
             )
-        if spec.name in ("experiment.run", "experiment.new", "experiment.backfill"):
+        if spec.name in (
+            "experiment.run",
+            "experiment.new",
+            "experiment.backfill",
+            "experiment.retire",
+        ):
             # track-A: NOT required for `experiment.run`. Policy §3 scores every
             # registered arm every cycle, so the default is "all of them"; naming
             # one narrows the run to it, which is a debugging affordance rather
@@ -1147,7 +1160,8 @@ def build_parser() -> argparse.ArgumentParser:
             sub.add_argument(
                 "--arm",
                 metavar="NAME|ARM_ID",
-                required=spec.name in ("experiment.new", "experiment.backfill"),
+                required=spec.name
+                in ("experiment.new", "experiment.backfill", "experiment.retire"),
                 help=(
                     "Restrict to one arm, by bare name or by registered "
                     "`{slot}:{name}:{spec_hash}` id — `experiment.new` prints ids, so "
