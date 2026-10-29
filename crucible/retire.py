@@ -23,19 +23,20 @@ It stays narrow on purpose:
 
 Re-running is safe. An arm already retired with the same reason gets no
 second register event, which the fold would refuse anyway, and
-`crucible.promote._append_events` skips a log row that is already there. So a
+`crucible.promote.append_events` skips a log row that is already there. So a
 run the runner retried after the register write still finishes the log.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+
+from nousergon_lib.arena.arms import ArmRegister
 
 from crucible.documents import load_store_document
 from crucible.keys import champion_key, retirement_log_key
 from crucible.models import RetirementLogRow
-from crucible.promote import _append_events
+from crucible.promote import append_events
 from crucible.slots import arm_name
 from crucible.slots.arms import read_register, write_register
 from crucible.store import Store
@@ -58,7 +59,7 @@ class RetirementResult:
     register_written: bool
     log_key: str
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "slot": self.slot,
             "arm_id": self.arm_id,
@@ -83,7 +84,7 @@ def _champion_arm_id(store: Store, slot: str) -> str | None:
     return str(arm_id) if arm_id else None
 
 
-def resolve_arm(register: Any, *, slot: str, arm: str) -> str:
+def resolve_arm(register: ArmRegister, *, slot: str, arm: str) -> str:
     """The one registered id ``arm`` names, by bare name or by full id."""
     if ":" in arm:
         if arm not in register:
@@ -166,7 +167,7 @@ def retire_arm(
     if write:
         if needs_register_event:
             write_register(store, slot, register.retire(arm_id, when, text))
-        _append_events(store, retirement_log_key(slot), [row])
+        append_events(store, retirement_log_key(slot), [row])
 
     return RetirementResult(
         slot=slot,

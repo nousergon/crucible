@@ -41,6 +41,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -90,6 +91,7 @@ __all__ = [
     "PromotionResult",
     "SlotInputs",
     "age_held_leaders",
+    "append_events",
     # Re-exported from `crucible.keys`, which is the single producer of every
     # key shape (plan §4.12). They appear here because a promote consumer
     # imports them from this module, NOT because promote.py also declares
@@ -1116,6 +1118,15 @@ def _event_id(key: str, row: dict[str, Any]) -> str:
     """
     canonical = json.dumps(row, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(f"{key}\x00{canonical}".encode()).hexdigest()[:16]
+
+
+def append_events(store: Store, key: str, rows: Sequence[Mapping[str, object]]) -> str:
+    """Public entry to :func:`_append_events` for writers outside this module.
+
+    `crucible.retire` writes the same retirement log this module does, and must
+    keep the same once-each guarantee, so it calls this rather than a copy.
+    """
+    return _append_events(store, key, [dict(row) for row in rows])
 
 
 def _append_events(store: Store, key: str, rows: list[dict[str, Any]]) -> str:

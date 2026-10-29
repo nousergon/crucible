@@ -45,7 +45,7 @@ from crucible.gate import PHASES
 from crucible.keys import arm_register_key, calendar_day_discriminator
 from crucible.manifest import manifest_key
 from crucible.registration import load_registrable_recipes
-from crucible.runner import invocation_discriminator, run_job
+from crucible.runner import RunContext, invocation_discriminator, run_job
 from crucible.slots import arm_name as name_component
 from crucible.slots import daily_servers, dispatchable_slots, history_producer
 from crucible.slots.arms import (
@@ -1388,9 +1388,9 @@ def handle_experiment_retire(args: argparse.Namespace) -> int:
     store = config.store()
     dry_run = bool(getattr(args, "dry_run", False))
     retired_date = (args.trading_day or resolve_trading_day()).isoformat()
-    result: dict[str, Any] = {}
+    result: dict[str, object] = {}
 
-    def job(ctx: Any) -> None:
+    def job(ctx: RunContext) -> None:
         outcome = retire_arm(
             store,
             slot=args.slot,
