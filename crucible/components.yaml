@@ -1574,8 +1574,10 @@ components:
     # alpha-engine-config-I10969. The component that moves `releases/current`
     # - the single most consequential mutation in the v2 system, and the one
     # thing that decides which code every spot box and the trader actually
-    # run. It writes a real `run_manifest.v2` document at
-    # `runs/deploy/{trading_day}/run.json` on both paths and had NO row here
+    # run. It writes a real `run_manifest.v2` document under
+    # `runs/deploy/{trading_day}/` on both paths (one key per deploy since
+    # alpha-engine-config-I11033, `{calendar_date}-{run_id}/run.json`; it is
+    # on-demand, so several deploys on one day are normal) and had NO row here
     # until I10969: the manifest schema's `job` enum carried it, this file did
     # not, and the difference was asserted as a bare literal in
     # `tests/test_components_registry.py`. That literal is now
