@@ -9217,6 +9217,14 @@ class ReconciliationException:
     discrepancies: tuple[DiscrepancyIdentity, ...]
     ruling: str
     ruled_by: str
+    #: The planted classes a ruled CONTROL-ARM HARNESS DEFECT missed, sorted,
+    #: or None. Empty means this entry excuses a recorded break only and the
+    #: control arm must have passed. When set, the stored result must carry
+    #: `void: true` and exactly these `missed` classes, and `fixed_by` names
+    #: the change that repaired the harness: a ruling excuses a defect that
+    #: was found and fixed, never a reconciler that is still blind.
+    excused_missed: tuple[str, ...] = ()
+    fixed_by: str = ""
 
 
 def _discrepancy_identities(value: object) -> tuple[DiscrepancyIdentity, ...] | None:
@@ -9283,12 +9291,39 @@ def load_reconciliation_exceptions(
                 f"{{{', '.join(_DISCREPANCY_IDENTITY_FIELDS)}}} object; an exception that "
                 "names no break would excuse any break"
             )
+        excused_missed: tuple[str, ...] = ()
+        fixed_by = ""
+        if "control_arm_defect" in entry:
+            defect = entry["control_arm_defect"]
+            if not isinstance(defect, dict):
+                raise ValueError(f"{where}: `control_arm_defect` is not an object")
+            fields = cast("dict[str, object]", defect)
+            missed = fields.get("missed")
+            fix = fields.get("fixed_by")
+            if (
+                not isinstance(missed, list)
+                or not missed
+                or not all(isinstance(m, str) and m for m in cast("list[object]", missed))
+            ):
+                raise ValueError(
+                    f"{where}: `control_arm_defect.missed` must list the missed plant classes; "
+                    "a defect that names none would excuse any blind control arm"
+                )
+            if not isinstance(fix, str) or not fix.strip():
+                raise ValueError(
+                    f"{where}: `control_arm_defect.fixed_by` must name the harness fix; an "
+                    "unfixed defect is a blind reconciler, which no ruling excuses"
+                )
+            excused_missed = tuple(sorted(cast("list[str]", missed)))
+            fixed_by = fix
         declared[session] = ReconciliationException(
             session=session,
             run_id=texts["run_id"],
             discrepancies=discrepancies,
             ruling=texts["ruling"],
             ruled_by=texts["ruled_by"],
+            excused_missed=excused_missed,
+            fixed_by=fixed_by,
         )
     return declared
 
@@ -9429,13 +9464,35 @@ def _clause_broker_reconciliation_control_arm_passed(
                 f"{RECONCILIATION_FAULT!r} required"
             )
             continue
-        if control.get("passed") is not True:
+        defect_excused = False
+        arm = cast("dict[str, object]", control)
+        if arm.get("passed") is not True:
+            missed_raw = arm.get("missed")
+            missed = (
+                tuple(sorted(str(m) for m in cast("list[object]", missed_raw)))
+                if isinstance(missed_raw, list)
+                else None
+            )
+            if (
+                excepted is None
+                or not excepted.excused_missed
+                or missed != excepted.excused_missed
+                or document.get("void") is not True
+            ):
+                findings.append(
+                    f"{result_key}: control_arm.passed is {arm.get('passed')!r} "
+                    f"(missed {arm.get('missed')!r}) — the cycle is VOID"
+                )
+                continue
+            defect_excused = True
+        elif excepted is not None and excepted.excused_missed:
             findings.append(
-                f"{result_key}: control_arm.passed is {control.get('passed')!r} "
-                f"(missed {control.get('missed')!r}) — the cycle is VOID"
+                f"{result_key}: control_arm.passed is True, and {excepted.ruling} excuses a "
+                f"control-arm defect (missed {list(excepted.excused_missed)!r}) on this run; "
+                "the record and the ruling disagree"
             )
             continue
-        if document.get("void") is not False:
+        if not defect_excused and document.get("void") is not False:
             findings.append(
                 f"{result_key}: void is {document.get('void')!r} beside a passing control arm; "
                 "the two must agree"
@@ -9450,7 +9507,16 @@ def _clause_broker_reconciliation_control_arm_passed(
                     "different break is a new finding"
                 )
                 continue
-            excused.append(f"{day} ({excepted.ruling}, {excepted.ruled_by})")
+            excused.append(
+                f"{day} ({excepted.ruling}, {excepted.ruled_by}"
+                + (
+                    f"; control-arm defect missed {list(excepted.excused_missed)!r}, "
+                    f"fixed by {excepted.fixed_by}"
+                    if defect_excused
+                    else ""
+                )
+                + ")"
+            )
     if missing and len(missing) == len(sessions):
         return Clause(
             name,
