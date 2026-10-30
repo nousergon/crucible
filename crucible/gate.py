@@ -9204,8 +9204,11 @@ RECONCILIATION_EXCEPTIONS_PATH = Path(__file__).parent / "broker_reconciliation_
 #: The fields one declared discrepancy carries, in the order they are compared.
 _DISCREPANCY_IDENTITY_FIELDS = ("klass", "instrument", "delta", "side")
 
-#: One discrepancy's identity: (klass, instrument, signed delta, side).
-DiscrepancyIdentity = tuple[str, str, float, str]
+#: One discrepancy's identity: (klass, instrument, signed delta, side). The
+#: delta is None only for a finding the reconciler records with an explicit
+#: null delta (`corporate_action_check_incomplete`: there is nothing to
+#: subtract); the key must still be present, so a missing delta never matches.
+DiscrepancyIdentity = tuple[str, str, float | None, str]
 
 
 @dataclass(frozen=True)
@@ -9241,12 +9244,19 @@ def _discrepancy_identities(value: object) -> tuple[DiscrepancyIdentity, ...] | 
             not isinstance(klass, str)
             or not isinstance(instrument, str)
             or not isinstance(side, str)
+            or "delta" not in row
             or isinstance(delta, bool)
-            or not isinstance(delta, int | float)
+            or not (delta is None or isinstance(delta, int | float))
         ):
             return None
-        identities.append((klass, instrument, float(delta), side))
-    return tuple(sorted(identities))
+        identities.append((klass, instrument, None if delta is None else float(delta), side))
+    return tuple(sorted(identities, key=_identity_order))
+
+
+def _identity_order(identity: DiscrepancyIdentity) -> tuple[str, str, bool, float, str]:
+    """A total order over identities: a null delta sorts before any number."""
+    klass, instrument, delta, side = identity
+    return (klass, instrument, delta is not None, delta or 0.0, side)
 
 
 def load_reconciliation_exceptions(
