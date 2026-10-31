@@ -741,11 +741,44 @@ class TestRecord:
         )
         from crucible.calendar import resolve_trading_day
 
-        manifest = json.loads(
-            store.get_bytes(manifest_key("deploy", resolve_trading_day().isoformat()))
-        )
+        _key, manifest = only_manifest(store, "deploy", resolve_trading_day().isoformat())
         validate(manifest)
         assert manifest["status"] == "ok"
+
+    def test_two_deploys_on_one_trading_day_file_two_manifests(self, tmp_path) -> None:
+        """`alpha-engine-config-I11033`: `deploy` is on-demand (every push to
+        main), so a second deploy on the same trading day must not overwrite
+        the first. The bare `runs/deploy/{day}/run.json` kept only the last;
+        the 2026-10-30 `alerts.sweep` named five such days. Re-recording the
+        SAME deploy (same run_id) still lands on its own one key."""
+        from crucible.release import write_deploy_manifest
+
+        store = LocalStore(tmp_path)
+        deploy_main(
+            [
+                "record",
+                "--sha",
+                SHA,
+                "--store",
+                str(tmp_path),
+                "--outcome",
+                "success",
+                "--run-url",
+                "https://x",
+            ]
+        )
+        from crucible.calendar import resolve_trading_day
+
+        day = resolve_trading_day().isoformat()
+        first_key, first = only_manifest(store, "deploy", day)
+        assert first_key == manifest_key("deploy", day, discriminator=first["discriminator"])
+        assert first["discriminator"] == f"{first['calendar_date']}-{first['run_id']}"
+        assert write_deploy_manifest(store, dict(first)) == first_key
+        last = "A" if first["run_id"][-1] != "A" else "B"
+        second = dict(first, run_id=first["run_id"][:-1] + last)
+        second_key = write_deploy_manifest(store, second)
+        assert second_key != first_key
+        assert manifests_filed(store, "deploy", day) == sorted([first_key, second_key])
 
     def test_a_successful_job_whose_pointer_did_not_move_records_failed(self, tmp_path) -> None:
         """Derived, never declared. A deploy reporting ok while the pointer
@@ -766,9 +799,7 @@ class TestRecord:
         )
         from crucible.calendar import resolve_trading_day
 
-        manifest = json.loads(
-            store.get_bytes(manifest_key("deploy", resolve_trading_day().isoformat()))
-        )
+        _key, manifest = only_manifest(store, "deploy", resolve_trading_day().isoformat())
         validate(manifest)
         assert manifest["status"] == "failed"
         assert "expected" in manifest["reason"]
@@ -820,9 +851,7 @@ class TestRecord:
         )
         from crucible.calendar import resolve_trading_day
 
-        manifest = json.loads(
-            store.get_bytes(manifest_key("deploy", resolve_trading_day().isoformat()))
-        )
+        _key, manifest = only_manifest(store, "deploy", resolve_trading_day().isoformat())
         validate(manifest)
         assert manifest["status"] == "failed"
         assert "releases/current" in manifest["reason"]
@@ -861,7 +890,7 @@ class TestRecord:
             )
             == 0
         )
-        manifest = json.loads(store.get_bytes(manifest_key("deploy", day)))
+        _key, manifest = only_manifest(store, "deploy", day)
         validate(manifest)
         assert manifest["status"] == "failed"
         assert manifest_key("smoke", day) in manifest["reason"]
@@ -891,9 +920,7 @@ class TestRecord:
         )
         from crucible.calendar import resolve_trading_day
 
-        manifest = json.loads(
-            store.get_bytes(manifest_key("deploy", resolve_trading_day().isoformat()))
-        )
+        _key, manifest = only_manifest(store, "deploy", resolve_trading_day().isoformat())
         validate(manifest)
         assert manifest["status"] == "failed"
         assert "outcome='failure'" in manifest["reason"]
