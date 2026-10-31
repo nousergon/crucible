@@ -34,6 +34,7 @@ import datetime as dt
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -65,6 +66,7 @@ from crucible.runmode import RUN_MODE_LIVE
 from crucible.runner import RunContext, run_job
 from crucible.store import ETAG_ABSENT, Store, open_store, read_only, resolve_store_uri
 from crucible.weekly import arc_stages, run_arc
+from crucible.weekly_notice import send_notice
 
 __all__ = [
     "CLOSE_OUTCOMES",
@@ -266,7 +268,10 @@ def weekly_handler(args: argparse.Namespace) -> int:
     dry_run = bool(getattr(args, "dry_run", False))
     store = open_store(store_uri, dry_run=dry_run)
 
+    resolved: list[dt.date] = []
+
     def body(ctx: RunContext) -> None:
+        resolved.append(ctx.trading_day)
         planned = arc_stages(ctx.trading_day)
         # `dry_run` is passed to `run_arc` so every stage's own argv carries
         # `--dry-run` too (alpha-engine-config-I9922 N1) — each stage is a
@@ -304,16 +309,36 @@ def weekly_handler(args: argparse.Namespace) -> int:
     # `console` met a 5xx — twelve jobs repeated for one, each rewriting its
     # own manifest, and the store's answer to "did this week work" decided by
     # write ordering.
-    run_job(
-        "weekly",
-        body,
-        store=store,
-        trading_day=args.trading_day,
-        transient_retry=False,
-        dry_run=dry_run,
-        run_mode=getattr(args, "run_mode", None),
-    )
+    try:
+        run_job(
+            "weekly",
+            body,
+            store=store,
+            trading_day=args.trading_day,
+            transient_retry=False,
+            dry_run=dry_run,
+            run_mode=getattr(args, "run_mode", None),
+        )
+    finally:
+        if resolved and not dry_run:
+            _send_weekly_notice(store, resolved[-1])
     return 0
+
+
+def _send_weekly_notice(store: Store, trading_day: dt.date) -> None:
+    """The arc's completion message (`crucible.weekly_notice`), sent whether
+    the arc passed or failed.
+
+    A delivery failure is printed and swallowed HERE, deliberately: the arc's
+    outcome is its manifest and its exit code, and a Telegram outage must not
+    turn a week that ran into a failed process (or mask the stage error a
+    failed arc is already propagating). The undelivered notice is visible in
+    the arc's log.
+    """
+    try:
+        send_notice(store, trading_day.isoformat(), len(arc_stages(trading_day)))
+    except Exception as exc:  # noqa: BLE001 - see docstring
+        print(f"weekly notice NOT delivered: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
 def gate_handler(args: argparse.Namespace) -> int:
