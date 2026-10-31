@@ -170,7 +170,8 @@ def _partition_ranked(slot: str, specs: list[Any]) -> RecipeLoad:
 
     * **it waits on a declared producer.** Every column it lacks is listed in
       `crucible.features.PENDING_COLUMNS` and not yet in the catalogue:
-      `predicted_alpha_ratio` (track B), `thinktank_rating_ratio` (phase 5).
+      `predicted_alpha_ratio` (track B). (`thinktank_rating_ratio` left
+      this set when the catalogue began producing it, `alpha-engine-config-I12395`.)
       The recipe REGISTERS, which is what its ranker says ("Registered now,
       servable when ...") and what the 2026-09-24 ruling keeps. The run still
       refuses it by name. `every_registered_arm_produces` names it as waiting

@@ -118,7 +118,10 @@ class TestRegistrationAppliesTheRunsPartition:
         waits = {w.arm: w.waits_on() for w in load.waiting}
         assert "predicted_alpha_ratio" in waits["scanner_predictor_direct"]
         assert "track B" in waits["scanner_predictor_direct"]
-        assert "phase 5" in waits["thinktank_coverage"]
+        # The catalogue produces `thinktank_rating_ratio` since
+        # `alpha-engine-config-I12395` (Brian 2026-10-28: the Think Tank arm
+        # competes in R every week), so that arm waits on nothing.
+        assert "thinktank_coverage" not in waits
 
     def test_the_run_still_refuses_a_waiting_arm_and_says_what_it_waits_on(self, store) -> None:
         from crucible.features import CATALOG
@@ -224,7 +227,8 @@ class TestTheDetector:
     def test_an_arm_waiting_on_a_declared_producer_is_named_not_mute(
         self, store, monkeypatch
     ) -> None:
-        """The live state on 2026-09-24: three R arms parked on purpose."""
+        """The live state on 2026-09-24 had three R arms parked on purpose; the
+        Think Tank arm left the pending set when its column landed."""
         _seed(store, PRODUCIBLE, PENDING, THINKTANK)
         quant, scanner, thinktank = _register(
             store,
@@ -232,15 +236,15 @@ class TestTheDetector:
             names=("no_agent_quant", "scanner_predictor_direct", "thinktank_coverage"),
         )
         _produce(store, quant)
+        _produce(store, thinktank)
         clause = _clause(store, monkeypatch)
         assert clause.met, clause.detail
         assert "0 mute" in clause.detail and "MUTE" not in clause.detail
-        assert "2 registered arm(s) WAITING" in clause.detail
+        assert "1 registered arm(s) WAITING" in clause.detail
         assert f"{scanner} waits on predicted_alpha_ratio" in clause.detail
         assert "track B" in clause.detail
-        assert f"{thinktank} waits on thinktank_rating_ratio" in clause.detail
-        assert "phase 5" in clause.detail
-        assert "all 1 active non-control" in clause.detail
+        assert "thinktank_rating_ratio" not in clause.detail
+        assert "all 2 active non-control" in clause.detail
 
     def test_a_waiting_arm_is_still_named_when_another_is_mute(self, store, monkeypatch) -> None:
         _seed(store, PRODUCIBLE, PENDING)

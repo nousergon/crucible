@@ -36,6 +36,7 @@ from crucible.features.boundaries import (
 from crucible.features.compute import PILLAR_COMPONENTS
 from crucible.features.depth import (
     FEATURES_PREFIX,
+    NULL_RATIO_DENOMINATORS,
     check_feature_layer_completeness,
 )
 from crucible.features.registry import feature_names
@@ -77,7 +78,12 @@ def _session_frame(day: str, null_columns: tuple[str, ...]) -> pd.DataFrame:
         "ticker": list(tickers),
     }
     for i, col in enumerate(feature_names()):
-        data[col] = [None] * len(tickers) if col in null_columns else [float(i + 1)] * len(tickers)
+        if col in null_columns:
+            data[col] = [None] * len(tickers)
+        elif col in frozenset(NULL_RATIO_DENOMINATORS.values()):
+            data[col] = [1.0] * len(tickers)
+        else:
+            data[col] = [float(i + 1)] * len(tickers)
     return pd.DataFrame(data)
 
 

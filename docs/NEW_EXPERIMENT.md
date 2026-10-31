@@ -205,8 +205,7 @@ manifest as a rejection with its reason and does not fail the stage; its
 siblings still register.
 
 A U/R ranker may read a column the feature catalogue does not produce yet,
-on purpose (`predicted_alpha_ratio` waits on track B, `thinktank_rating_ratio`
-on phase 5). When that column is declared in
+on purpose (`predicted_alpha_ratio` waits on track B). When that column is declared in
 `crucible.features.PENDING_COLUMNS`, the recipe registers and waits:
 `experiment.run` refuses it by name, and the phase-3 clause
 `every_registered_arm_produces` names it as waiting instead of mute. A column

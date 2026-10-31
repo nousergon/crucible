@@ -8524,30 +8524,6 @@
         ],
         "./crucible/features/depth.py": [
             {
-                "code": "reportUnknownMemberType",
-                "range": {
-                    "startColumn": 29,
-                    "endColumn": 44,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportUnknownMemberType",
-                "range": {
-                    "startColumn": 29,
-                    "endColumn": 51,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportUnknownArgumentType",
-                "range": {
-                    "startColumn": 29,
-                    "endColumn": 53,
-                    "lineCount": 1
-                }
-            },
-            {
                 "code": "reportUnknownVariableType",
                 "range": {
                     "startColumn": 8,

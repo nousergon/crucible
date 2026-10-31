@@ -191,8 +191,11 @@ def _thinktank_rating_direct(features: pd.DataFrame, params: Mapping[str, Any]) 
     v1's `thinktank_coverage`. Registered so the arm exists in the register
     with its lineage intact (policy §3: an arm producing output without a
     register row is the defect this arm's own name commemorates). Its input
-    is an LLM-derived column, which phase 1 does not produce — LLM arms are
-    phase 5 (§9.1) — so it refuses by name rather than inventing an ordering.
+    is the Think Tank's own rating, read point-in-time from
+    `thinktank/ratings/` (`crucible.data.point_in_time`) since
+    `alpha-engine-config-I12395`: Brian ruled 2026-10-28 that the arm competes
+    in R every week until it is shown inferior. Only names the Think Tank
+    covered carry a value, so the arm ranks that subset and nothing else.
     """
     block = _liquid(features)
     return block["thinktank_rating_ratio"].dropna()
@@ -435,8 +438,8 @@ RANKERS: dict[str, RankerSpec] = {
             reads=("liquidity_pass_raw", "thinktank_rating_ratio"),
             params=("top_n",),
             description=(
-                "Think Tank per-ticker rating. Servable when an LLM arm exists to "
-                "produce it — phase 5 (§9.1), not phase 1."
+                "Think Tank per-ticker rating, read point-in-time from the Think "
+                "Tank's own daily ratings documents; covered names only."
             ),
         ),
         RankerSpec(

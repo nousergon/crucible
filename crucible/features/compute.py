@@ -215,6 +215,8 @@ _POINT_IN_TIME_FEATURE_COLUMNS: tuple[str, ...] = (
     "payout_ratio",
     "sustainable_growth_rate_ratio",
     "institutional_accumulation_raw",
+    "thinktank_rating_ratio",
+    "thinktank_covered_raw",
 )
 
 #: v1's gate on a net 13F accumulation: fewer funds moving than this is noise.
