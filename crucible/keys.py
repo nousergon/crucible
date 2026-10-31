@@ -1239,6 +1239,17 @@ def attribution_key(trading_day: str) -> str:
     return f"report/{trading_day}/attribution.json"
 
 
+def weekly_summary_key(trading_day: str) -> str:
+    """One document per weekly arc (`crucible.weekly_summary`): the console's
+    weekly-run page reads this, not the ~3,400 artifacts it summarises.
+
+    Under `report/`, beside the week's report card, because the box's write
+    grant already covers that prefix: a new top-level prefix would need an
+    IAM widening (nous-ergon-ops `test_crucible_store_prefix_grants.py`)."""
+    assert_trading_day(trading_day, context="weekly summary key")
+    return f"report/{trading_day}/weekly_summary.json"
+
+
 def gate_key(gate: str, trading_day: str) -> str:
     """Where a gate reading is filed. Keyed by trading day like everything else."""
     return f"gates/{gate}/{trading_day}/gate.json"
