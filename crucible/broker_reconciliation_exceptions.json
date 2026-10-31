@@ -52,6 +52,21 @@
       "ruling": "Director decision card cmsg_01N3B1WSaV2QaHy37cD37vyx3cmu77zEwk9nxN2neSh39r, option A (Excuse 10-29)",
       "ruled_by": "Brian 2026-10-30T14:36Z",
       "reason": "Control-arm harness defect: the cash plant was detected at the exact delta (1222.70), but it displaced the baseline's real unpaid-MU-dividend row, which the arm counted as a dropped finding and voided the session. Fixed in crucible-trader#67. All 13 comparable rows matched. The MU row itself is a correct finding."
+    },
+    {
+      "session": "2026-10-30",
+      "run_id": "01M676EVWXC2N6E3QS45CVR7YR",
+      "discrepancies": [
+        {
+          "klass": "corporate_action_check_incomplete",
+          "instrument": "SPY",
+          "delta": null,
+          "side": "trader"
+        }
+      ],
+      "ruling": "SPY entitlement card, Brian's reply 'can't you just back into it?' (Director relay): derive the entitlement",
+      "ruled_by": "Brian 2026-10-30T23:26Z",
+      "reason": "Data gap, not a break: SPY's 10-30 dividend has record session 2026-09-17, before the trader's first stored statement (2026-10-09), so its entitlement could not be read and the reconciler correctly reported it incomplete. Cash matched exactly and all 12 comparable rows matched; control arm passed. The entitlement is now declared (10 shares from the v1 IB-recorded holding, estimated) in crucible-trader#70, and the late credit must match it to the cent."
     }
   ]
 }

@@ -134,6 +134,41 @@ class TestNothingThatResemblesTheRuledRunCounts:
         assert SESSIONS[-1] in clause.detail
 
 
+class TestNullDeltaIdentity:
+    """The 2026-10-30 form: an incomplete row the reconciler records with a null delta."""
+
+    INCOMPLETE = {
+        "klass": "corporate_action_check_incomplete",
+        "instrument": "SPY",
+        "delta": None,
+        "side": "trader",
+    }
+
+    def _null(self) -> dict[dt.date, ReconciliationException]:
+        return _exceptions(
+            discrepancies=(("corporate_action_check_incomplete", "SPY", None, "trader"),)
+        )
+
+    def test_the_ruled_null_delta_row_counts(self, store) -> None:
+        _week_with_break(store, document=_broken(EXCEPTED, discrepancies=[dict(self.INCOMPLETE)]))
+        clause = _clause(store, self._null())
+        assert clause.met, clause.detail
+
+    def test_a_null_delta_does_not_match_a_numeric_one(self, store) -> None:
+        numeric = dict(self.INCOMPLETE, delta=0.0)
+        _week_with_break(store, document=_broken(EXCEPTED, discrepancies=[numeric]))
+        clause = _clause(store, self._null())
+        assert not clause.met
+        assert "a different break is a new finding" in clause.detail
+
+    def test_a_null_and_a_numeric_row_on_one_instrument_still_order(self, store) -> None:
+        rows = [dict(self.INCOMPLETE, delta=1.0), dict(self.INCOMPLETE)]
+        _week_with_break(store, document=_broken(EXCEPTED, discrepancies=rows))
+        clause = _clause(store, self._null())
+        assert not clause.met
+        assert "a different break is a new finding" in clause.detail
+
+
 class TestControlArmDefectExcusal:
     """The 2026-10-29 form: a ruled harness defect in the control arm itself."""
 
@@ -216,13 +251,17 @@ def _entry(**overrides: Any) -> dict[str, Any]:
 
 
 class TestTheDeclaredRecord:
-    def test_the_shipped_record_carries_exactly_the_three_rulings(self) -> None:
+    def test_the_shipped_record_carries_exactly_the_four_rulings(self) -> None:
         declared = load_reconciliation_exceptions()
         assert {d.isoformat(): e.run_id for d, e in declared.items()} == {
             "2026-10-26": "01M5WWTX24SJ1TJ8507ABJT0AA",
             "2026-10-27": "01M5ZF8Q6DYRQS33T98XQ60026",
             "2026-10-29": "01M64M1VK9ZRRKJPPHY97XWSRK",
+            "2026-10-30": "01M676EVWXC2N6E3QS45CVR7YR",
         }
+        assert declared[dt.date(2026, 10, 30)].discrepancies == (
+            ("corporate_action_check_incomplete", "SPY", None, "trader"),
+        )
         defect = declared[dt.date(2026, 10, 29)]
         assert defect.excused_missed == ("cash_delta",)
         assert defect.fixed_by == "crucible-trader#67"
@@ -247,6 +286,11 @@ class TestTheDeclaredRecord:
             (_entry(session="2026-10-25"), "not an NYSE session"),
             (_entry(ruling=""), "`ruling` must be a non-empty string"),
             (_entry(discrepancies=[dict(BREAK, delta=True)]), "names no break"),
+            (
+                _entry(discrepancies=[{k: v for k, v in BREAK.items() if k != "delta"}]),
+                "names no break",
+            ),
+            (_entry(discrepancies=[dict(BREAK, delta="0.55")]), "names no break"),
         ],
     )
     def test_a_malformed_entry_raises(self, tmp_path, entry, message) -> None:
