@@ -44,7 +44,13 @@ dependencies = [
     # alpha-engine-config#11849): M and U promote only an arm that beats the
     # champion AND every other eligible challenger, each pair on its own
     # common window.
-    "nousergon-lib[github-app,gates]==0.124.165",
+    #
+    # 0.124.190 carries `environments.staging.trader.routing_allowed`
+    # (nousergon-lib-PR499, alpha-engine-config-I12685): the registry field
+    # that keeps `ib_paper` out of staging, read by `crucible#445`'s
+    # staging-only `simulated` session mode. Ruled 2026-10-28: this pin moves
+    # after the Sat 10-31 weekly, ahead of the trader's crucible pin on 11-03.
+    "nousergon-lib[github-app,gates]==0.124.190",
     # Trading calendar, dual-date resolution, structured logging, alerts.
     #
     # `[openai]` is NOT optional here (alpha-engine-config-I10473). krepis
@@ -130,7 +136,7 @@ dependencies = [
 # path it never exercises. `crucible data.daily --source arctic` states the
 # missing extra by name when it is absent — it never falls back to a
 # different source, which would silently change what the run measured.
-arcticdb = ["nousergon-lib[arcticdb]==0.124.165"]
+arcticdb = ["nousergon-lib[arcticdb]==0.124.190"]
 
 [project.scripts]
 crucible = "crucible.cli:main"
