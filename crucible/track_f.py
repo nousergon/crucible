@@ -340,7 +340,7 @@ def weekly_handler(args: argparse.Namespace) -> int:
 def _record_weekly_summary(
     ctx: RunContext, store: Store, stage_docs: list[tuple[str, dict[str, object]]]
 ) -> None:
-    """File `weekly/{day}/summary.json` and the estimated compute cost metric."""
+    """File `report/{day}/weekly_summary.json` and the estimated compute cost metric."""
     day = ctx.trading_day.isoformat()
     now = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     started = ctx.started.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")

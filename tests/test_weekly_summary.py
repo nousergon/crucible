@@ -1,4 +1,4 @@
-"""`weekly/{day}/summary.json` (Director 2026-10-31, the console weekly-run
+"""`report/{day}/weekly_summary.json` (Director 2026-10-31, the console weekly-run
 page). Negative cases: an unknown instance type gives a null cost with a
 reason (never a guessed price), an absent arena cycle is marked absent, an arm
 with no shared dates compares to nothing, and a corrupt jsonl line raises."""
@@ -157,6 +157,6 @@ class TestJsonl:
 
 
 def test_the_key():
-    assert weekly_summary_key(DAY) == "weekly/2026-10-30/summary.json"
+    assert weekly_summary_key(DAY) == "report/2026-10-30/weekly_summary.json"
     with pytest.raises(ValueError):
         weekly_summary_key("2026-10-31")
