@@ -121,17 +121,30 @@ class TestConfiguredValues:
         assert arena_config_for("m").promote_evidence == "point"
         assert arena_config_for("m").promote_against == "every_arm"
 
-    @pytest.mark.parametrize("slot", ["u", "m"])
+    @pytest.mark.parametrize("slot", ["u", "r", "m"])
     def test_every_point_slot_promotes_against_every_arm(self, slot: str) -> None:
-        """The 2026-10-03 rule is applied to every `point` slot."""
+        """The 2026-10-03 rule is applied to every `point` slot. R joined
+        when it moved to `point` evidence (alpha-engine-config-I12565 option
+        (a); alpha-engine-config-I11897)."""
         assert arena_config_for(slot).promote_evidence == "point"
         assert arena_config_for(slot).promote_against == "every_arm"
 
-    @pytest.mark.parametrize("slot", ["r", "s"])
+    def test_no_point_slot_is_left_on_the_incumbent(self) -> None:
+        """Derived, not listed: a slot that moves to `point` evidence without
+        `every_arm` fails here, which is how R slipped through when it moved."""
+        stragglers = [
+            slot
+            for slot in SLOTS
+            if arena_config_for(slot).promote_evidence == "point"
+            and arena_config_for(slot).promote_against != "every_arm"
+        ]
+        assert stragglers == []
+
+    @pytest.mark.parametrize("slot", ["s"])
     def test_the_anytime_valid_slots_still_promote_against_the_incumbent(self, slot: str) -> None:
-        """R and S are NOT changed by the 2026-10-03 ruling: whether they
-        should follow is Brian's question, and the library refuses
-        `every_arm` with `anytime_valid` until it is answered."""
+        """S is NOT changed by the 2026-10-03 ruling: whether an
+        anytime-valid slot should follow is Brian's question, and the library
+        refuses `every_arm` with `anytime_valid` until it is answered."""
         assert arena_config_for(slot).promote_against == "incumbent"
 
     @pytest.mark.parametrize("slot", ["u", "r", "m", "s"])
