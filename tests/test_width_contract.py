@@ -27,6 +27,7 @@ from nousergon_lib.arena.window import ArmSeries, pair_on_common_window
 from crucible.slots import (
     EVIDENCE_ANYTIME_VALID,
     EVIDENCE_POINT,
+    PROMOTE_AGAINST_INCUMBENT,
     SLOTS,
     STATISTIC_INFORMATION_RATIO,
     STATISTIC_MEAN_DIFF,
@@ -158,11 +159,12 @@ class TestTenVersusFifteen:
     def test_the_default_mean_statistic_would_have_picked_concentration(self) -> None:
         """The CR-05 defect, kept as the reason the gate exists."""
         # R's pre-ruling declaration: no width semantics, the library default
-        # statistic and the default evidence rule.
+        # statistic, the default evidence rule and the default comparison set.
         undeclared = _slot(
             width_semantics=None,
             promote_statistic=STATISTIC_MEAN_DIFF,
             promote_evidence=EVIDENCE_ANYTIME_VALID,
+            promote_against=PROMOTE_AGAINST_INCUMBENT,
         )
         assert not self._challenger_leads(undeclared)
 

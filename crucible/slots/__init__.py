@@ -421,10 +421,16 @@ SLOTS: dict[str, SlotSpec] = {
         # paired difference, which would hand the pointer to the narrowest arm
         # for its concentration. The library requires `point` evidence with IR,
         # which moves R off the 4-week anytime-valid bar. This mirrors v1
-        # research. `promote_min_weeks` and `promote_against` are unchanged.
+        # research. `promote_min_weeks` is unchanged (4).
         width_semantics=WIDTH_EXPERIMENTAL,
         promote_statistic=STATISTIC_INFORMATION_RATIO,
         promote_evidence=EVIDENCE_POINT,
+        # Point evidence makes R a `point` slot, and evaluation-policy rule 5
+        # binds every `point` slot to `every_arm` (Brian's 2026-10-03 ruling,
+        # `alpha-engine-config#11849`), as v1 research declares. Keeping
+        # `incumbent` was a carry-over from R's anytime-valid days, when the
+        # library refused `every_arm` (`alpha-engine-config-I11897`).
+        promote_against=PROMOTE_AGAINST_EVERY_ARM,
         control_arms=_controls("r"),
     ),
     "m": SlotSpec(
