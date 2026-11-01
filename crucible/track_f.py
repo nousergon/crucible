@@ -34,13 +34,20 @@ import datetime as dt
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from krepis.metrics import derive_status
 
 from crucible import gate as gate_module
-from crucible.documents import UnreadableDocumentError, read_store_document
+from crucible.documents import (
+    UnreadableDocumentError,
+    load_document_bytes,
+    load_store_document,
+    load_store_jsonl,
+    read_store_document,
+)
 from crucible.gate import (
     CLOSING_READING_SCHEMA_VERSION,
     GATES,
@@ -60,11 +67,14 @@ from crucible.gate import (
     render_closing_comment,
     tracker_adapter,
 )
-from crucible.keys import closing_record_key, manifest_key
+from crucible.keys import closing_record_key, manifest_key, weekly_summary_key
 from crucible.runmode import RUN_MODE_LIVE
 from crucible.runner import RunContext, run_job
 from crucible.store import ETAG_ABSENT, Store, open_store, read_only, resolve_store_uri
 from crucible.weekly import arc_stages, run_arc
+from crucible.weekly_notice import send_notice
+from crucible.weekly_summary import WEEKLY_SUMMARY_SCHEMA, build_summary
+from crucible.weekly_summary import encode as encode_summary
 
 __all__ = [
     "CLOSE_OUTCOMES",
@@ -266,7 +276,10 @@ def weekly_handler(args: argparse.Namespace) -> int:
     dry_run = bool(getattr(args, "dry_run", False))
     store = open_store(store_uri, dry_run=dry_run)
 
+    resolved: list[dt.date] = []
+
     def body(ctx: RunContext) -> None:
+        resolved.append(ctx.trading_day)
         planned = arc_stages(ctx.trading_day)
         # `dry_run` is passed to `run_arc` so every stage's own argv carries
         # `--dry-run` too (alpha-engine-config-I9922 N1) — each stage is a
@@ -279,9 +292,13 @@ def weekly_handler(args: argparse.Namespace) -> int:
         # re-resolve would let the arc manifest and its stage manifests
         # disagree about the same week.
         ran = run_arc(ctx.trading_day, store=store_uri, dry_run=dry_run, run_mode=ctx.run_mode)
+        stage_docs: list[tuple[str, dict[str, object]]] = []
         for stage in ran:
             key = manifest_key(stage.job, ctx.trading_day.isoformat(), discriminator=stage.slot)
-            ctx.record_input(key, store.get_bytes(key))
+            payload = store.get_bytes(key)
+            ctx.record_input(key, payload)
+            stage_docs.append((key, load_document_bytes(key, payload)))
+        _record_weekly_summary(ctx, store, stage_docs)
         ctx.record_rows(rows_in=len(planned), rows_out=len(ran))
         ctx.record_metric(
             {
@@ -304,16 +321,79 @@ def weekly_handler(args: argparse.Namespace) -> int:
     # `console` met a 5xx — twelve jobs repeated for one, each rewriting its
     # own manifest, and the store's answer to "did this week work" decided by
     # write ordering.
-    run_job(
-        "weekly",
-        body,
-        store=store,
-        trading_day=args.trading_day,
-        transient_retry=False,
-        dry_run=dry_run,
-        run_mode=getattr(args, "run_mode", None),
-    )
+    try:
+        run_job(
+            "weekly",
+            body,
+            store=store,
+            trading_day=args.trading_day,
+            transient_retry=False,
+            dry_run=dry_run,
+            run_mode=getattr(args, "run_mode", None),
+        )
+    finally:
+        if resolved and not dry_run:
+            _send_weekly_notice(store, resolved[-1])
     return 0
+
+
+def _record_weekly_summary(
+    ctx: RunContext, store: Store, stage_docs: list[tuple[str, dict[str, object]]]
+) -> None:
+    """File `report/{day}/weekly_summary.json` and the estimated compute cost metric."""
+    day = ctx.trading_day.isoformat()
+    now = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    started = ctx.started.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    summary = build_summary(
+        trading_day=day,
+        run_id=ctx.run_id,
+        arc_started=started,
+        arc_finished=now,
+        stages=stage_docs,
+        read=lambda key: load_store_document(store, key) if store.exists(key) else None,
+        read_events=lambda key: list(load_store_jsonl(store, key)),
+        generated_utc=now,
+    )
+    key = weekly_summary_key(day)
+    ctx.record_output(key, encode_summary(summary), WEEKLY_SUMMARY_SCHEMA)
+    compute = cast("dict[str, object]", summary["compute"])
+    cost = compute.get("cost_usd")
+    ctx.record_metric(
+        {
+            "name": "compute_cost_usd_estimated",
+            "module": "crucible.weekly_summary",
+            "metric_type": "gauge",
+            "value": cost,
+            "unit": "usd" if cost is not None else None,
+            "n_floor": 1,
+            "status": "OK" if cost is not None else "N/A-MISSING-INPUT",
+            "status_reason": (
+                f"estimated: {compute.get('instance_hours')} h of "
+                f"{compute.get('instance_type')} at {compute.get('price_usd_per_hour')} USD/h "
+                f"({compute.get('price_source')}); LLM cost is cost_usd"
+                if cost is not None
+                else str(compute.get("reason"))
+            ),
+            "source_path": key,
+            "last_updated_utc": now,
+        }
+    )
+
+
+def _send_weekly_notice(store: Store, trading_day: dt.date) -> None:
+    """The arc's completion message (`crucible.weekly_notice`), sent whether
+    the arc passed or failed.
+
+    A delivery failure is printed and swallowed HERE, deliberately: the arc's
+    outcome is its manifest and its exit code, and a Telegram outage must not
+    turn a week that ran into a failed process (or mask the stage error a
+    failed arc is already propagating). The undelivered notice is visible in
+    the arc's log.
+    """
+    try:
+        send_notice(store, trading_day.isoformat(), len(arc_stages(trading_day)))
+    except Exception as exc:  # noqa: BLE001 - see docstring
+        print(f"weekly notice NOT delivered: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
 def gate_handler(args: argparse.Namespace) -> int:
