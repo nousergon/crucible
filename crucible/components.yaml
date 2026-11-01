@@ -1388,14 +1388,23 @@ components:
     # discrepancy or a missed planted discrepancy makes the run `failed`,
     # which is the page (section 4.6), naming instrument, delta and side.
     #
-    # `schedule`/`dispatch`/`deadline` are null ON PURPOSE, today: nothing
-    # starts this job yet (I10651's 2026-09-14 comment - no box entry point, no
-    # fills source, no genesis run). A daily `close_plus` deadline declared
-    # before anything dispatches the job would page ABSENCE every trading day
-    # for a job nobody started, which is how a channel gets muted. The change
-    # that schedules it sets `schedule: daily`, its `dispatch`, and the
-    # deadline in the same edit; `test_a_scheduled_job_declares_a_deadline`
-    # refuses the schedule without the deadline.
+    # SCHEDULED since alpha-engine-config-I12353 (2026-10-30). These fields
+    # were null until the timing settled; trader.session got its deadline in
+    # crucible-PR412 and this row waited. Two starters exist: crucible-executor
+    # `infrastructure/systemd/alpha-engine-trader-reconcile.timer`
+    # (`Mon..Fri 16:45 America/New_York`) and the post-close SF drain step
+    # (#12292). The deadline counts the manifest, not the starter. Measured
+    # write times of `runs/trader.reconcile/{d}/run.json`: 19:05-20:45 ET on
+    # 2026-10-07..21 (10-14 and 10-15 never landed, and nothing paged: the
+    # defect), then 16:02 ET on every session 10-22..29.
+    #
+    # `next_open_plus 0` = 09:30 ET on the next session. A same-evening
+    # `close_plus` would have to sit before the 21:00 ET `alerts.sweep` and so
+    # within 15 minutes of the 20:45 ET worst case measured on the timer path,
+    # which pages on slow days and gets a channel muted. This bound catches a
+    # miss at the next session's sweep instead of never. The release-history
+    # gate keeps the already-known 10-14/10-15 misses quiet. A run that STARTS
+    # and fails still pages FAILURE from its own manifest.
     description: >-
       Reconcile the trader's positions and cash against the broker, with a
       planted-discrepancy control arm (fault 5); any discrepancy is a page.
@@ -1412,9 +1421,13 @@ components:
     console_surface: crucible/runs
     artifact_retention: forever
     absence_watched_by: alerts.sweep
-    schedule: null
-    dispatch: null
-    deadline: null
+    schedule: weekdays after close, 16:45 ET timer or the post-close SF drain
+    dispatch: box-timer
+    dispatch_unit: alpha-engine-trader-reconcile.timer
+    deadline:
+      anchor: next_open_plus
+      cadence: daily
+      offset_hours: 0
 
   trader.smoke:
     # alpha-engine-config-I10649. The trader's own IB-paper smoke (install the
@@ -1541,10 +1554,8 @@ components:
     # The 21:00 ET `alerts.sweep` grades it the same evening. A run that
     # STARTS and fails still pages FAILURE from its own manifest.
     #
-    # `trader.reconcile` stays null in this edit. Its timer fires 16:45 ET,
-    # but its manifests landed 19:05-20:45 ET (2026-10-07..16), and the SF
-    # drain step also starts it (#12292). Its deadline needs that timing
-    # settled first.
+    # `trader.reconcile` was left null in that edit and was scheduled on
+    # 2026-10-30 once its timing settled (see its row).
     description: >-
       Serve one trading session on the M champion (shadow until an order
       router exists) and record the served day, with its session mode, in the
