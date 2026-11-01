@@ -134,6 +134,103 @@ class TestNothingThatResemblesTheRuledRunCounts:
         assert SESSIONS[-1] in clause.detail
 
 
+class TestNullDeltaIdentity:
+    """The 2026-10-30 form: an incomplete row the reconciler records with a null delta."""
+
+    INCOMPLETE = {
+        "klass": "corporate_action_check_incomplete",
+        "instrument": "SPY",
+        "delta": None,
+        "side": "trader",
+    }
+
+    def _null(self) -> dict[dt.date, ReconciliationException]:
+        return _exceptions(
+            discrepancies=(("corporate_action_check_incomplete", "SPY", None, "trader"),)
+        )
+
+    def test_the_ruled_null_delta_row_counts(self, store) -> None:
+        _week_with_break(store, document=_broken(EXCEPTED, discrepancies=[dict(self.INCOMPLETE)]))
+        clause = _clause(store, self._null())
+        assert clause.met, clause.detail
+
+    def test_a_null_delta_does_not_match_a_numeric_one(self, store) -> None:
+        numeric = dict(self.INCOMPLETE, delta=0.0)
+        _week_with_break(store, document=_broken(EXCEPTED, discrepancies=[numeric]))
+        clause = _clause(store, self._null())
+        assert not clause.met
+        assert "a different break is a new finding" in clause.detail
+
+    def test_a_null_and_a_numeric_row_on_one_instrument_still_order(self, store) -> None:
+        rows = [dict(self.INCOMPLETE, delta=1.0), dict(self.INCOMPLETE)]
+        _week_with_break(store, document=_broken(EXCEPTED, discrepancies=rows))
+        clause = _clause(store, self._null())
+        assert not clause.met
+        assert "a different break is a new finding" in clause.detail
+
+
+class TestControlArmDefectExcusal:
+    """The 2026-10-29 form: a ruled harness defect in the control arm itself."""
+
+    def _defect(self, **overrides: Any) -> dict[dt.date, ReconciliationException]:
+        fields: dict[str, Any] = {"excused_missed": ("cash_delta",), "fixed_by": "fix#1"}
+        fields.update(overrides)
+        return _exceptions(**fields)
+
+    def test_the_ruled_void_run_counts_and_names_the_fix(self, store) -> None:
+        _week_with_break(store, document=_broken(EXCEPTED, passed=False))
+        clause = _clause(store, self._defect())
+        assert clause.met, clause.detail
+        assert "fixed by fix#1" in clause.detail
+
+    def test_a_break_only_exception_still_never_excuses_a_void_run(self, store) -> None:
+        _week_with_break(store, document=_broken(EXCEPTED, passed=False))
+        clause = _clause(store, _exceptions())
+        assert not clause.met
+        assert "the cycle is VOID" in clause.detail
+
+    def test_a_different_missed_class_is_not_excused(self, store) -> None:
+        _week_with_break(store, document=_broken(EXCEPTED, passed=False))
+        clause = _clause(store, self._defect(excused_missed=("share_delta",)))
+        assert not clause.met
+        assert "the cycle is VOID" in clause.detail
+
+    def test_a_failed_control_that_is_not_marked_void_is_not_excused(self, store) -> None:
+        _week_with_break(store, document=_broken(EXCEPTED, passed=False, void=False))
+        clause = _clause(store, self._defect())
+        assert not clause.met
+
+    def test_the_discrepancies_must_still_match(self, store) -> None:
+        moved = dict(BREAK, delta=0.56)
+        document = _broken(EXCEPTED, discrepancies=[moved], passed=False)
+        _week_with_break(store, document=document)
+        clause = _clause(store, self._defect())
+        assert not clause.met
+        assert "a different break is a new finding" in clause.detail
+
+    def test_a_defect_ruling_on_a_run_whose_control_passed_disagrees(self, store) -> None:
+        _week_with_break(store)
+        clause = _clause(store, self._defect())
+        assert not clause.met
+        assert "the record and the ruling disagree" in clause.detail
+
+    @pytest.mark.parametrize(
+        ("defect", "message"),
+        [
+            ({"missed": [], "fixed_by": "x#1"}, "must list the missed plant classes"),
+            ({"missed": ["cash_delta"], "fixed_by": ""}, "must name the harness fix"),
+            ({"missed": ["cash_delta"]}, "must name the harness fix"),
+            ("cash_delta", "is not an object"),
+        ],
+    )
+    def test_a_malformed_defect_raises(self, tmp_path, defect, message) -> None:
+        path = _write(
+            tmp_path, {"schema_version": 1, "exceptions": [_entry(control_arm_defect=defect)]}
+        )
+        with pytest.raises(ValueError, match=message):
+            load_reconciliation_exceptions(path)
+
+
 def _write(tmp_path: Path, document: object) -> Path:
     path = tmp_path / "exceptions.json"
     path.write_text(json.dumps(document), encoding="utf-8")
@@ -154,12 +251,22 @@ def _entry(**overrides: Any) -> dict[str, Any]:
 
 
 class TestTheDeclaredRecord:
-    def test_the_shipped_record_carries_exactly_the_two_rulings(self) -> None:
+    def test_the_shipped_record_carries_exactly_the_four_rulings(self) -> None:
         declared = load_reconciliation_exceptions()
         assert {d.isoformat(): e.run_id for d, e in declared.items()} == {
             "2026-10-26": "01M5WWTX24SJ1TJ8507ABJT0AA",
             "2026-10-27": "01M5ZF8Q6DYRQS33T98XQ60026",
+            "2026-10-29": "01M64M1VK9ZRRKJPPHY97XWSRK",
+            "2026-10-30": "01M676EVWXC2N6E3QS45CVR7YR",
         }
+        assert declared[dt.date(2026, 10, 30)].discrepancies == (
+            ("corporate_action_check_incomplete", "SPY", None, "trader"),
+        )
+        defect = declared[dt.date(2026, 10, 29)]
+        assert defect.excused_missed == ("cash_delta",)
+        assert defect.fixed_by == "crucible-trader#67"
+        assert defect.discrepancies == (("corporate_action", "MU", -11.86, "broker"),)
+        assert not declared[dt.date(2026, 10, 26)].excused_missed
         assert declared[dt.date(2026, 10, 26)].discrepancies == (
             ("cash_delta", "USD", 0.55, "broker_over"),
         )
@@ -179,6 +286,11 @@ class TestTheDeclaredRecord:
             (_entry(session="2026-10-25"), "not an NYSE session"),
             (_entry(ruling=""), "`ruling` must be a non-empty string"),
             (_entry(discrepancies=[dict(BREAK, delta=True)]), "names no break"),
+            (
+                _entry(discrepancies=[{k: v for k, v in BREAK.items() if k != "delta"}]),
+                "names no break",
+            ),
+            (_entry(discrepancies=[dict(BREAK, delta="0.55")]), "names no break"),
         ],
     )
     def test_a_malformed_entry_raises(self, tmp_path, entry, message) -> None:
