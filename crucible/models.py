@@ -523,8 +523,9 @@ TRADER_JOB_VALUES: tuple[str, ...] = (
 #: a `crucible.cli.JOBS` entry. `deploy` is the whole set and the reason is in
 #: `crucible/deploy.py`'s module docstring: putting it behind `crucible <job>`
 #: would give every runtime identity a subcommand it must never be able to
-#: execute. It still writes a real `run_manifest.v2` document at
-#: `runs/deploy/{trading_day}/run.json` on both paths, it still carries a
+#: execute. It still writes a real `run_manifest.v2` document under
+#: `runs/deploy/{trading_day}/` on both paths (one key per deploy,
+#: `alpha-engine-config-I11033`), it still carries a
 #: `crucible/components.yaml` row, and `tests/test_components_registry.py`
 #: derives registry coverage from `JOBS` plus this tuple plus
 #: :data:`TRADER_JOB_VALUES` — in BOTH directions, exactly as the trader half

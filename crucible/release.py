@@ -51,6 +51,7 @@ from crucible.keys import (
     POINTER_KEY,
     TRADER_PIN_KEY,
     TRADER_PIN_REQUEST_KEY,
+    calendar_day_discriminator,
     manifest_key,
     runs_prefix,
 )
@@ -1561,14 +1562,33 @@ def write_deploy_manifest(
 
     §4.11: "the deploy writes its own `deploy.json` in the run-manifest
     schema, so §4.5's page shows deploys beside runs". It goes to
-    `runs/deploy/{trading_day}/run.json` — the same key shape as every job —
-    because a deploy that reported itself in a bespoke place is a deploy the
-    console has to be taught about separately, and would not be.
+    `runs/deploy/{trading_day}/{calendar_date}-{run_id}/run.json` — the same
+    key shape as every on-demand job — because a deploy that reported itself
+    in a bespoke place is a deploy the console has to be taught about
+    separately, and would not be.
+
+    One key per deploy (`alpha-engine-config-I11033`). `deploy` has no
+    `dispatch` in `components.yaml`: every push to main runs it, so several
+    deploys on one trading day are normal, and the bare
+    `runs/deploy/{trading_day}/run.json` kept only the LAST of them —
+    `crucible.alerts.indistinguishable_invocation_findings` reported five such
+    days (10-22 to 10-28) on the 2026-10-30 `alerts.sweep`, and
+    `crucible.migrate`'s code-sha derivation reads every successful deploy, so
+    an overwritten one is a lost event there too. The discriminator is the
+    shape :func:`crucible.runner.invocation_discriminator` gives the other on-
+    demand jobs, built from the manifest's own `calendar_date` and `run_id`
+    (the deploy does not run through `run_job`, so it has no `RunContext`).
+    `run_id` is derived from the sha and the instant, so a re-record of the
+    same deploy lands on the same key. Readers list
+    :func:`crucible.keys.manifest_prefix`; none builds the bare key.
     """
     from crucible.manifest import validate  # noqa: PLC0415 - cycle
 
+    manifest["discriminator"] = calendar_day_discriminator(
+        dt.date.fromisoformat(manifest["calendar_date"]), suffix=manifest["run_id"]
+    )
     validate(manifest)
-    key = manifest_key("deploy", manifest["trading_day"])
+    key = manifest_key("deploy", manifest["trading_day"], discriminator=manifest["discriminator"])
     store.put_bytes(key, json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8"))
     return key
 

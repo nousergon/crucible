@@ -977,7 +977,8 @@ def _map_promotion_source(v1_promotion_source: str) -> str:
 #    value from the durable record of what `releases/current` pointed at when
 #    the manifest's own `started` instant was reached: the most recent
 #    successful `deploy` manifest at or before that instant
-#    (`runs/deploy/{trading_day}/run.json`, `status: ok`, written directly by
+#    (`runs/deploy/{trading_day}/[{calendar_date}-{run_id}/]run.json`,
+#    `status: ok`, written directly by
 #    `crucible.deploy._record` — see its own `code_sha`/`release_sha` fields).
 #    Cross-checked against every OTHER manifest sharing the same `trading_day`:
 #    they all read `releases/current` at close to the same time, so a
