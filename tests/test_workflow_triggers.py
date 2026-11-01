@@ -97,6 +97,24 @@ def _exclusions_for(events: frozenset[str]) -> set[str]:
 #: `<workflow>:<job>` pairs that may run on a PR because their subject is the
 #: tree, or the pull request itself. Every entry names why.
 PR_REACHABLE_JOBS: dict[str, str] = {
+    # alpha-engine-config-I7777 (provider-linkage roster rollout).
+    "provider-linkage-guard.yml:guard": (
+        "a job-level `uses:` of nousergon-lib's provider-linkage-guard.yml, "
+        "pinned by SHA. That workflow checks out this tree and nousergon-lib, "
+        "installs pyyaml and greps the checkout for direct provider linkage; "
+        "it holds no cloud credential and receives no secret. Its subject is "
+        "the diff itself. Target, pin and no-secrets are asserted by "
+        "`test_the_provider_linkage_guard_job_calls_the_pinned_lib_guard_with_no_secrets`."
+    ),
+    # alpha-engine-config-I8049 (agent-instruction guard roster rollout).
+    "claude-md-guard.yml:claude-md-untracked": (
+        "a job-level `uses:` of nousergon-lib's claude-md-guard.yml, pinned by "
+        "SHA. That workflow checks out this tree and runs `git ls-files` and "
+        "`git check-ignore` for AGENTS.md and CLAUDE.md; it holds no cloud "
+        "credential and receives no secret. Its subject is the diff itself. "
+        "Target, pin and no-secrets are asserted by "
+        "`test_the_claude_md_guard_job_calls_the_pinned_lib_guard_with_no_secrets`."
+    ),
     # The tree-only acceptance reading: alpha-engine-config-I10735.
     "ci.yml:test": (
         "lint, format, the foundation suite, `--collect-only` over "
@@ -176,6 +194,15 @@ PR_REACHABLE_JOBS: dict[str, str] = {
 #: exist — `test_every_reusable_workflow_exemption_has_a_property_test`
 #: enforces it, and a second member cannot be added by editing this set alone.
 REUSABLE_WORKFLOW_JOBS: dict[str, str] = {
+    # Tree-only lib guards on the PR path (alpha-engine-config-I7777, -I8049):
+    # each is pinned by SHA to a nousergon-lib workflow that reads the checkout
+    # and nothing else, and receives no secrets.
+    "provider-linkage-guard.yml:guard": (
+        "test_the_provider_linkage_guard_job_calls_the_pinned_lib_guard_with_no_secrets"
+    ),
+    "claude-md-guard.yml:claude-md-untracked": (
+        "test_the_claude_md_guard_job_calls_the_pinned_lib_guard_with_no_secrets"
+    ),
     # Pinned by SHA to a nousergon-lib workflow that posts a notification and
     # nothing else, and unreachable on a PR because it needs the excluded
     # `acceptance` job.
@@ -488,6 +515,37 @@ def test_no_live_state_job_runs_on_the_pull_request_path(path: pathlib.Path) -> 
             f"or, if its subject genuinely is the diff, add `{key}` to "
             "PR_REACHABLE_JOBS in this file with the reason."
         )
+
+
+def _assert_tree_only_lib_guard(workflow_file: str, job_name: str, target: str) -> None:
+    """A PR-path job that delegates to a nousergon-lib guard: pinned target,
+    no secrets, read-only token. The called workflow is out of this guard's
+    reach, so these three properties are what its PR_REACHABLE_JOBS entry
+    rests on."""
+    workflow = yaml.safe_load((WORKFLOW_DIR / workflow_file).read_text())
+    assert workflow.get("permissions") == {"contents": "read"}, (
+        f"{workflow_file} must grant the token `contents: read` and nothing else."
+    )
+    job = Workflow.load(WORKFLOW_DIR / workflow_file).jobs[job_name]
+    assert re.fullmatch(
+        rf"nousergon/nousergon-lib/\.github/workflows/{re.escape(target)}@[0-9a-f]{{40}}",
+        job.uses,
+    ), (
+        f"{workflow_file}:{job_name} must call nousergon-lib's {target} pinned to a "
+        f"40-character SHA; it calls {job.uses!r}. Repointing it is exactly the "
+        "repurposing its allowlist entry exists to prevent."
+    )
+    raw = workflow["jobs"][job_name]
+    assert "secrets" not in raw, f"{workflow_file}:{job_name} must pass no secrets"
+    assert not raw.get("permissions"), f"{workflow_file}:{job_name} must not widen permissions"
+
+
+def test_the_provider_linkage_guard_job_calls_the_pinned_lib_guard_with_no_secrets() -> None:
+    _assert_tree_only_lib_guard("provider-linkage-guard.yml", "guard", "provider-linkage-guard.yml")
+
+
+def test_the_claude_md_guard_job_calls_the_pinned_lib_guard_with_no_secrets() -> None:
+    _assert_tree_only_lib_guard("claude-md-guard.yml", "claude-md-untracked", "claude-md-guard.yml")
 
 
 def test_the_job_model_accepts_both_legal_needs_forms() -> None:
