@@ -45,6 +45,7 @@ __all__ = [
     "UnreadableDocumentError",
     "load_document_bytes",
     "load_store_document",
+    "load_store_jsonl",
     "read_document",
     "read_listed_document",
     "read_manifests_under",
@@ -250,6 +251,19 @@ def load_store_document(store: Store, key: str) -> dict[str, Any]:
     outside this module).
     """
     return load_document_bytes(key, store.get_bytes(key))
+
+
+def load_store_jsonl(store: Store, key: str) -> list[dict[str, object]]:
+    """The STRICT face for a JSON-lines document: one object per non-blank
+    line, ``[]`` when the key is absent. A line that is not an object raises
+    :class:`UnreadableDocumentError` naming the key and line."""
+    if not store.exists(key):
+        return []
+    rows: list[dict[str, object]] = []
+    for n, line in enumerate(store.get_bytes(key).decode("utf-8").splitlines(), start=1):
+        if line.strip():
+            rows.append(load_document_bytes(f"{key} line {n}", line))
+    return rows
 
 
 def load_document_bytes(source: str, raw: bytes | str) -> dict[str, Any]:
