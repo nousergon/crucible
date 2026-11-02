@@ -41,6 +41,22 @@ Two document shapes are accepted, and nothing else:
 A local path is accepted for the same shapes, so a laptop replay and a test
 exercise the identical code path as a box (the ``s3://`` branch differs only
 in how bytes are fetched).
+
+**The pointer has one writer, and it is not this repo.**
+``market_data/latest_weekly.json`` is written only by `nousergon-data`'s
+weekly Phase 1 (``weekly_collector._write_manifest``, run by the
+``ne-data-collection-weekly`` schedule at 09:00Z on Saturdays). Nothing in
+this package names the key, so nothing here can be a second writer;
+``tests/test_weekly_universe_pointer.py`` fails the day something does. What
+this repo was missing is ORDERING: the v2 weekly's ``data.weekly`` starts on
+its own schedule (11:00Z) and used to follow whatever the pointer named. On
+2026-10-24 and 2026-10-31 the collector rewrote it 334 s and ~10 min before
+the weekly started (nous-ergon-ops-I2018); had it run late or failed, the
+weekly would have graded last week's universe silently. So a caller that
+knows which week it is grading passes ``expected_date``, and a pointer whose
+``date`` disagrees is refused by name (`StaleUniversePointerError`) rather
+than followed. `data.daily` passes nothing: between Saturdays it
+legitimately reads last Friday's pointer.
 """
 
 from __future__ import annotations
@@ -61,6 +77,7 @@ __all__ = [
     "DanglingUniversePointerError",
     "DeclaredUniverse",
     "MalformedUniverseError",
+    "StaleUniversePointerError",
     "load_declared_universe",
     "universe_from_argv",
 ]
@@ -74,6 +91,9 @@ DECLARED_UNIVERSE_SCHEMA_VERSION = "declared_universe.v1"
 #: contract, restated here once.
 _TICKERS_FIELD = "tickers"
 _POINTER_FIELD = "s3_prefix"
+#: The pointer's own week label, written by its sole writer beside
+#: ``s3_prefix`` (`nousergon-data` ``weekly_collector._write_manifest``).
+_POINTER_DATE_FIELD = "date"
 _POINTER_TARGET = "constituents.json"
 
 
@@ -108,6 +128,32 @@ class DanglingUniversePointerError(FileNotFoundError):
             f"universe pointer {pointer_uri} names {target_uri}, which does not exist: "
             "the pointer's writer advanced it to a prefix without a membership "
             "document (a data-pointer fault upstream, not a fault in this run)"
+        )
+
+
+class StaleUniversePointerError(MalformedUniverseError):
+    """A pointer was read and names a different week than the caller is grading.
+
+    nous-ergon-ops-I2018 / alpha-engine-config-I13065. The weekly pointer is
+    written by `nousergon-data`'s weekly Phase 1 on its own schedule, and the
+    v2 ``data.weekly`` reads it on another, with nothing ordering the two. A
+    pointer still dated last week means the collector has not advanced it
+    (late, failed, or refused its own advance); following it would grade this
+    week against last week's membership and report nothing wrong. Carries
+    both dates and the pointer URI so the message alone says which writer to
+    look at. A `MalformedUniverseError` because the run must fail on it the
+    same way, never fall back.
+    """
+
+    def __init__(self, pointer_uri: str, pointer_date: object, expected_date: str) -> None:
+        self.pointer_uri = pointer_uri
+        self.pointer_date = pointer_date
+        self.expected_date = expected_date
+        super().__init__(
+            f"universe pointer {pointer_uri} is dated {pointer_date!r} but this run grades "
+            f"the week ending {expected_date}: its writer (nousergon-data weekly Phase 1) "
+            "has not advanced it for this week, so following it would grade last week's "
+            "universe. Refused rather than followed."
         )
 
 
@@ -229,6 +275,7 @@ def load_declared_universe(
     *,
     origin: str,
     read: Callable[[str], bytes] | None = None,
+    expected_date: str | None = None,
 ) -> DeclaredUniverse:
     """Resolve ``uri`` to a universe, following a pointer at most once.
 
@@ -236,6 +283,13 @@ def load_declared_universe(
     local path by scheme. Every failure raises — a universe that could not
     be read is a run that cannot grade coverage, and `run_daily` must see it
     as such rather than as ``None``.
+
+    ``expected_date`` (ISO ``YYYY-MM-DD``) is the week the caller grades. When
+    given and ``uri`` is a POINTER, the pointer's ``date`` must equal it, or
+    `StaleUniversePointerError` is raised before the target is fetched; a
+    pointer with no ``date`` is refused the same way, since it cannot show it
+    is this week's. A membership document (no pointer) carries no week to
+    compare and is unaffected. ``None`` keeps the undated behaviour.
     """
     fetch = read or _read
     if not uri:
@@ -249,6 +303,10 @@ def load_declared_universe(
                 f"{uri}: neither a membership document (`{_TICKERS_FIELD}`) nor a pointer "
                 f"(`{_POINTER_FIELD}`)"
             )
+        if expected_date is not None:
+            pointer_date = document.get(_POINTER_DATE_FIELD)
+            if pointer_date != expected_date:
+                raise StaleUniversePointerError(uri, pointer_date, expected_date)
         target = _sibling(uri, prefix)
         try:
             payload = fetch(target)

@@ -21042,14 +21042,6 @@
             {
                 "code": "reportExplicitAny",
                 "range": {
-                    "startColumn": 57,
-                    "endColumn": 60,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportExplicitAny",
-                "range": {
                     "startColumn": 62,
                     "endColumn": 65,
                     "lineCount": 1

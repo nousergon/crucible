@@ -26,6 +26,7 @@ from typing import Any
 from crucible.backfill import run_backfill
 from crucible.calendar import is_trading_day, resolve_trading_day
 from crucible.components import NYSE_TZ
+from crucible.config import Settings
 from crucible.config import settings as resolve_settings
 from crucible.daily_chain import already_ok, daily_chain_lock, run_serve_chain
 from crucible.data import (
@@ -170,7 +171,9 @@ def _point_in_time_source(config: Any) -> PointInTimeSource:
     return source_class(reader, label=config.arctic_bucket)
 
 
-def _declared_universe(args: argparse.Namespace, config: Any) -> DeclaredUniverse | None:
+def _declared_universe(
+    args: argparse.Namespace, config: Settings, *, expected_date: str | None = None
+) -> DeclaredUniverse | None:
     """The denominator of the coverage ratio, with its provenance.
 
     Resolution order is the one every other setting uses: the explicit
@@ -180,12 +183,21 @@ def _declared_universe(args: argparse.Namespace, config: Any) -> DeclaredUnivers
     `UndeclaredUniverseError`, which names the fix. A document that exists
     and is malformed raises here, before the source is touched, and never
     degrades to "whatever the source has" (`crucible.data.universe`).
+
+    ``expected_date`` is passed only by `data.weekly`: a pointer from the
+    environment must then be dated the week being graded, or the run refuses
+    (`StaleUniversePointerError`, nous-ergon-ops-I2018). An explicit
+    `--symbols` is the operator's own declaration and carries no week.
     """
     raw = getattr(args, "symbols", None)
     if raw:
         return universe_from_argv(raw)
     if config.universe_uri:
-        return load_declared_universe(config.universe_uri, origin=config.origins["universe_uri"])
+        return load_declared_universe(
+            config.universe_uri,
+            origin=config.origins["universe_uri"],
+            expected_date=expected_date,
+        )
     return None
 
 
@@ -409,10 +421,15 @@ def _data_daily_body(args: argparse.Namespace, config: Any, store: Any, today: d
 
 def handle_data_weekly(args: argparse.Namespace) -> int:
     config = _settings(args)
+    # FIRST, before the store, the price source or the point-in-time source
+    # is opened (nous-ergon-ops-I2018, alpha-engine-config-I13065): the
+    # pointer is written by `nousergon-data`'s weekly Phase 1 on its own
+    # schedule, and this job used to follow it whatever week it named. A
+    # pointer not dated this run's trading day is refused here, by name.
+    declared = _declared_universe(args, config, expected_date=args.trading_day.isoformat())
     store = config.store()
     source = _source(args, config)
     point_in_time = _point_in_time_source(config)
-    declared = _declared_universe(args, config)
     # NO `--dry-run` branch (alpha-engine-config-I11079), for `data.daily`'s
     # reason: the weekly job IS the daily compile of the week's last session
     # plus a gap check over the week, so its rehearsal costs what
