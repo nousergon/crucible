@@ -42,10 +42,17 @@ from pydantic import ValidationError
 from crucible.calendar import (
     TRADING_DAYS_PER_WEEK,
     assert_trading_day,
+    next_trading_day,
     previous_trading_day,
     resolve_trading_day,
 )
-from crucible.components import NYSE_TZ, Component, load_registry, scheduled_components
+from crucible.components import (
+    NYSE_TZ,
+    Component,
+    Deadline,
+    load_registry,
+    scheduled_components,
+)
 from crucible.dispatch_argv import dispatch_target_trading_day, flag_value
 from crucible.documents import (
     load_store_document,
@@ -58,6 +65,7 @@ from crucible.keys import (
     DISPATCH_ROOT,
     MIGRATIONS_ROOT,
     RUNS_ROOT,
+    TRADER_SHADOW_BOOKS_PREFIX,
     arena_cycle_key,
     dispatch_exit_key,
     dispatch_key,
@@ -68,6 +76,7 @@ from crucible.keys import (
     parse_dispatch_key,
     parse_manifest_key,
     parse_migration_key,
+    shadow_books_key,
 )
 from crucible.manifest import manifest_prefix
 from crucible.models import (
@@ -112,6 +121,8 @@ __all__ = [
     "PENDING_CONFIRMATION",
     "SUBSCRIBERS_METRIC",
     "SESSION_SERVED_METRIC",
+    "SHADOW_BOOKS_DEADLINE",
+    "SHADOW_BOOKS_JOB",
     "SWEEP_JOB",
     "TRADER_SESSION_JOB",
     "Page",
@@ -132,7 +143,9 @@ __all__ = [
     "evaluate_failure",
     "evaluate_held_session",
     "evaluate_min_active_arms",
+    "evaluate_shadow_books_absence",
     "group_pages",
+    "shadow_books_due_at",
     "heartbeat",
     "incident_id",
     "incident_key",
@@ -2212,6 +2225,129 @@ def evaluate_held_session(
     return pages
 
 
+#: `alpha-engine-config-I12353` gap 2: the subject an absent shadow book pages
+#: under. NOT a runner job and never a `components.yaml` row:
+#: `crucible_trader.shadow_books_daily` writes no manifest, which is exactly
+#: why nothing watched it (`crucible.models.TRADER_JOB_VALUES` says so of this
+#: producer). The name only labels the page member.
+SHADOW_BOOKS_JOB = "trader.shadow_books"
+
+#: When `trader/shadow_books/{d}.json` must exist, as a :class:`Deadline`
+#: resolved against the session AFTER ``d`` — so the instant is "2.5h after the
+#: open of the SECOND session after d" (:func:`shadow_books_due_at`). Stated
+#: in the deadline vocabulary `components.yaml` uses rather than as a bare
+#: clock, so a weekend or an NYSE holiday moves it instead of paging.
+#:
+#: Why the second session: the producer binds to the LAST CLOSED session ``T``
+#: and advances the session before it (fills at close, held through the
+#: successor), and the executor box runs it at 11:00 New York time
+#: (crucible-executor `alpha-engine-trader-shadow-books.timer`,
+#: `TimeoutStartSec=30min`). Measured read-only 2026-11-02 over every
+#: `trader/shadow_books/*.json` in the v2 store: 18 of 18 books for d landed
+#: at 15:00-15:01Z on the second session after d (2026-10-01 -> 10-05,
+#: 2026-10-28 -> 10-30). 12:00 ET is the timer plus its 30-minute start
+#: timeout plus 30 minutes; the 21:00 ET sweep grades it the same evening.
+SHADOW_BOOKS_DEADLINE = Deadline(anchor="next_open_plus", cadence="daily", offset_hours=2.5)
+
+
+def shadow_books_due_at(trading_day: dt.date) -> dt.datetime:
+    """The UTC instant by which ``trading_day``'s shadow book must be filed."""
+    assert_trading_day(trading_day, context="shadow books deadline")
+    return SHADOW_BOOKS_DEADLINE.due_at(next_trading_day(trading_day))
+
+
+def evaluate_shadow_books_absence(
+    store: Store,
+    *,
+    now: dt.datetime | None = None,
+    registry: dict[str, Component] | None = None,
+    access_faults: list[str] | None = None,
+) -> list[Page]:
+    """`alpha-engine-config-I12353` gap 2: page ABSENCE for a missing shadow book.
+
+    `crucible_trader.shadow_books_daily` is not a runner job, so it has no
+    manifest and no `components.yaml` row, and :func:`evaluate_absence` cannot
+    see it. A unit that died before writing `trader/shadow_books/{d}.json`
+    (the 2026-10-15 shadow-books unit failed in the venv build) paged nobody,
+    and the phase-4 clause that reads the books only notices days later.
+
+    Reuses the ABSENCE condition (§4.6 admits exactly two): an artifact owed by
+    a deadline does not exist. The fleet freshness registry was the other
+    route, and it is not taken: its Lambda has no read on the v2 bucket, so
+    that route needs an IAM widening.
+
+    **Which days.** Every day :func:`days_to_evaluate` yields whose deadline
+    (:func:`shadow_books_due_at`) has passed. A day still before it is not
+    due. Weekends and NYSE holidays are never trading days, so they owe no
+    book, and the deadline walks the trading calendar past them.
+
+    **Bounded below by the producer's first observed book**, the rule
+    :func:`days_to_evaluate` applies to the sweep: a day before any book was
+    ever filed is a producer that had not started, not one that missed. A
+    store with no book at all is the phase-4 clause
+    `shadow_books_cover_every_active_arm`'s finding, not a page per day.
+
+    Only while `trader.session` is ACTIVE: the books are the trader's, and a
+    retired trader owes none. A listing that raises is an access fault,
+    carried out the way :func:`evaluate_absence` carries one.
+    """
+    moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
+    reg = registry if registry is not None else load_registry()
+    component = reg.get(TRADER_SESSION_JOB)
+    if component is None or component.lifecycle != "ACTIVE":
+        return []
+    due_days = [d for d in days_to_evaluate(store, moment) if moment >= shadow_books_due_at(d)]
+    if not due_days:
+        return []
+    read = _list_manifest_keys(store, TRADER_SHADOW_BOOKS_PREFIX)
+    if read.problem is not None:
+        if access_faults is None:
+            raise StoreAccessError(read.problem)
+        access_faults.append(read.problem)
+        return []
+    filed: set[dt.date] = set()
+    for key in read.keys or ():
+        stem = key.removeprefix(TRADER_SHADOW_BOOKS_PREFIX)
+        if stem == key or not stem.endswith(".json"):
+            continue
+        try:
+            filed.add(dt.date.fromisoformat(stem[: -len(".json")]))
+        except ValueError:
+            continue
+    if not filed:
+        return []
+    first_filed = min(filed)
+    pages: list[Page] = []
+    for trading_day in due_days:
+        if trading_day < first_filed or trading_day in filed:
+            continue
+        due = shadow_books_due_at(trading_day)
+        written_on = next_trading_day(next_trading_day(trading_day))
+        pages.append(
+            Page(
+                condition="absence",
+                job=SHADOW_BOOKS_JOB,
+                trading_day=trading_day,
+                reason=(
+                    f"no {shadow_books_key(trading_day.isoformat())}; the trader files it at "
+                    f"11:00 ET on {written_on.isoformat()} (the second session after "
+                    f"{trading_day.isoformat()}), due "
+                    f"{SHADOW_BOOKS_DEADLINE.describe(next_trading_day(trading_day))} "
+                    f"({due.strftime('%Y-%m-%dT%H:%M:%SZ')}), now "
+                    f"{moment.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+                    "    Auto-fix: none. The next morning's run binds to the next closed "
+                    "session only, and it reads an absent previous document as a first "
+                    "session, so every arm's book RE-INCEPTS there instead of advancing.\n"
+                    "    Resolution: read the box journal for "
+                    "alpha-engine-trader-shadow-books.service on "
+                    f"{written_on.isoformat()}, fix the cause before the next 11:00 ET run, "
+                    "and record the break against shadow_books_cover_every_active_arm."
+                ),
+            )
+        )
+    return pages
+
+
 # ── The bus, the transport, and the ceiling ───────────────────────────────
 
 
@@ -3367,6 +3503,9 @@ def sweep(
         + evaluate_failure(store, now=moment, registry=registry, access_faults=access_faults)
         + evaluate_min_active_arms(store, now=moment, access_faults=access_faults)
         + evaluate_held_session(store, now=moment, registry=registry, access_faults=access_faults)
+        + evaluate_shadow_books_absence(
+            store, now=moment, registry=registry, access_faults=access_faults
+        )
     )
     groups = group_pages(pages)
     if dry_run:
