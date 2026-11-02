@@ -124,13 +124,13 @@ def test_scope_and_account_never_share_cached_results():
     "mutation,match",
     [
         ("missing", "allocation"),
-        ("inventory", "value_error"),
-        ("components", "value_error"),
+        ("inventory", r"cost_allocation: value_error \(resource inventory is incomplete\)"),
+        ("components", r"value_error \(covered components must name harness, trader and shared"),
         ("unallocated", "unallocated"),
-        ("reconciliation", "value_error"),
+        ("reconciliation", r"value_error \(allocation members do not reconcile to account\)"),
         ("account", "account"),
         ("date", "date"),
-        ("duplicate", "value_error"),
+        ("duplicate", r"value_error \(duplicate allocation member\)"),
         ("evidence", "evidence"),
         ("nan", "finite"),
     ],
@@ -289,3 +289,50 @@ def test_malformed_account_numeric_input_is_not_a_diagnostic():
     with pytest.raises(CostUnreadableError) as caught:
         read(client(doc).for_scope(SCOPE))
     assert sentinel not in str(caught.value)
+
+
+def test_validator_refusals_are_exactly_the_validators_own_literals():
+    """`VALIDATOR_REFUSALS` is what the diagnostic may print verbatim, so it must
+    name every refusal the two model validators raise and nothing else — a new
+    refusal added without a name here would read `: value_error` again, and a
+    name with no raise behind it would be an allowlist entry for nothing."""
+    import ast
+    import inspect
+    import textwrap
+
+    from crucible import cost_allocation
+
+    raised: set[str] = set()
+    for owner in (
+        cost_allocation.AllocationDay.reconciled,
+        cost_allocation.CostAllocation.complete,
+    ):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(owner)))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Raise)
+                and isinstance(node.exc, ast.Call)
+                and getattr(node.exc.func, "id", None) == "ValueError"
+            ):
+                (arg,) = node.exc.args
+                assert isinstance(arg, ast.Constant), "a validator refusal must be a static literal"
+                raised.add(arg.value)
+    assert raised == cost_allocation.VALIDATOR_REFUSALS
+
+
+@pytest.mark.parametrize(
+    "error,expected",
+    [
+        (
+            {"type": "value_error", "msg": "Value error, resource inventory is incomplete"},
+            " (resource inventory is incomplete)",
+        ),
+        ({"type": "value_error", "msg": "Value error, arn:aws:s3:::private/ownership.json"}, ""),
+        ({"type": "missing", "msg": "Field required"}, ""),
+        ({"type": "value_error"}, ""),
+    ],
+)
+def test_only_a_declared_refusal_reaches_the_diagnostic(error, expected):
+    from crucible.cost import _validator_refusal
+
+    assert _validator_refusal(error) == expected
