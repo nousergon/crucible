@@ -82,7 +82,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from crucible.calendar import resolve_trading_day
+from crucible.calendar import is_trading_day, resolve_trading_day
 from crucible.console.render import STATUS_COLORS, _read_ladder, _state_class
 from crucible.documents import read_store_document
 from crucible.gate import LADDER_KEY
@@ -216,6 +216,17 @@ _BASENAME_PROBE_DAY = "2026-01-02"
 #: What `report.morning` calls the delivered message, derived not restated.
 _MESSAGE_BASENAME = morning_report_key(_BASENAME_PROBE_DAY, _BASENAME_PROBE_DAY).rsplit("/", 1)[-1]
 
+#: How many sessions BEFORE the page's trading day `_read_headline` looks back
+#: for the latest delivered headline (alpha-engine-config-I13017). The page is
+#: rendered by the weekly arc's `console` stage on Saturday morning UTC, and
+#: `report.morning` delivers the Friday session's report about twenty minutes
+#: LATER (measured: `console@2026-10-30` written 2026-10-31T11:58:37Z, the
+#: Friday report filed 12:18:58Z), so the page's own trading day has, by
+#: construction, nothing delivered yet. Five sessions is one trading week:
+#: further back than that a headline is no longer "the latest report" in any
+#: sense a reader would accept, and the fault says so instead.
+HEADLINE_LOOKBACK_SESSIONS = 5
+
 #: Refused outright rather than dropped line-by-line: any character sequence
 #: that still looks like a URL after the drop filter and tag strip has run.
 #: Belt and braces on the one field of this page that carries producer prose.
@@ -240,6 +251,11 @@ class PublicPage:
     #: ``headline_fault`` then says why.
     headline: list[str] = field(default_factory=list)
     headline_fault: str | None = None
+    #: The trading day the rendered headline reports on. Equal to
+    #: ``trading_day`` when that day's report was already delivered; an
+    #: EARLIER session when it was not (see :data:`HEADLINE_LOOKBACK_SESSIONS`),
+    #: and the page says so in words. ``None`` when there is no headline.
+    headline_trading_day: str | None = None
     #: One row per plan §6 phase, from `gates/ladder.json`: number, title,
     #: state, clauses met of total. No `detail`, no `tracker_url`.
     phases: list[dict[str, Any]] = field(default_factory=list)
@@ -300,8 +316,21 @@ def _read_text(store: Store, key: str) -> tuple[str | None, str | None]:
         return None, f"{key} could not be read: {type(exc).__name__}: {exc}"
 
 
-def _read_headline(store: Store, trading_day: str) -> tuple[list[str], str | None]:
-    """The delivered morning headline, filtered, or why there is none.
+def _sessions_back_from(trading_day: str, count: int) -> list[str]:
+    """``trading_day`` then the ``count`` sessions before it, newest first."""
+    day = dt.date.fromisoformat(trading_day)
+    days = [trading_day]
+    while len(days) <= count:
+        day -= dt.timedelta(days=1)
+        if is_trading_day(day):
+            days.append(day.isoformat())
+    return days
+
+
+def _read_headline(store: Store, trading_day: str) -> tuple[list[str], str | None, str | None]:
+    """The latest delivered morning headline, filtered, or why there is none.
+
+    Returns ``(lines, fault, reported_trading_day)``.
 
     The delivered artifact is Telegram HTML written for Brian: it carries a
     permalink to the PRIVATE tracker comment, a link to the rolling issue, and
@@ -319,42 +348,70 @@ def _read_headline(store: Store, trading_day: str) -> tuple[list[str], str | Non
     prefix rather than by guessing today's calendar date: the report is
     delivered on a CALENDAR morning against a TRADING day (§4.12), and on a
     Monday those differ by three days.
+
+    When the page's own trading day has nothing delivered yet, the latest
+    EARLIER session's delivery is used and its trading day is returned, so the
+    page states which report it is showing (alpha-engine-config-I13017: the
+    weekly render runs before that morning's delivery, every week). A listing
+    that FAILS on any prefix stops the walk and is the fault: an unreadable
+    prefix is not an empty one, and walking past it would show an older
+    report as if the newer one did not exist.
     """
-    prefix = manifest_prefix(HEADLINE_JOB, trading_day)
-    try:
-        candidates = sorted(
-            k for k in store.list_keys(prefix) if k.rsplit("/", 1)[-1] == _MESSAGE_BASENAME
-        )
-    except Exception as exc:  # noqa: BLE001 - reported, never swallowed; see below
-        # Not a swallow: the failure mode is "we could not LIST the morning
-        # job's prefix", the primary deliverable (the rest of the page)
-        # survives because a headline is one section, and the recording
-        # surface is `headline_fault` plus the published `faults` list, both
-        # of which name the prefix and the cause.
-        return [], f"{prefix} could not be listed: {type(exc).__name__}: {exc}"
-    if not candidates:
-        return [], (
-            f"no morning headline under {prefix} — `crucible report.morning` "
-            "has delivered nothing for this trading day."
+    sessions = _sessions_back_from(trading_day, HEADLINE_LOOKBACK_SESSIONS)
+    candidates: list[str] = []
+    reported: str | None = None
+    for session in sessions:
+        prefix = manifest_prefix(HEADLINE_JOB, session)
+        try:
+            candidates = sorted(
+                k for k in store.list_keys(prefix) if k.rsplit("/", 1)[-1] == _MESSAGE_BASENAME
+            )
+        except Exception as exc:  # noqa: BLE001 - reported, never swallowed; see below
+            # Not a swallow: the failure mode is "we could not LIST the morning
+            # job's prefix", the primary deliverable (the rest of the page)
+            # survives because a headline is one section, and the recording
+            # surface is `headline_fault` plus the published `faults` list, both
+            # of which name the prefix and the cause.
+            return [], f"{prefix} could not be listed: {type(exc).__name__}: {exc}", None
+        if candidates:
+            reported = session
+            break
+    if not candidates or reported is None:
+        return (
+            [],
+            (
+                f"no morning headline under {manifest_prefix(HEADLINE_JOB, trading_day)} or "
+                f"the {HEADLINE_LOOKBACK_SESSIONS} sessions before it — `crucible report.morning` "
+                "has delivered nothing for this trading week."
+            ),
+            None,
         )
     key = candidates[-1]
     raw, fault = _read_text(store, key)
     if raw is None:
-        return [], fault or f"{key} could not be read"
+        return [], fault or f"{key} could not be read", None
     kept: list[str] = []
     for line in raw.splitlines():
         if not line.strip() or _HEADLINE_DROP.search(line):
             continue
         kept.append(html.unescape(_TAG.sub("", line)).strip())
     if any(_URL.search(line) for line in kept):
-        return [], (
-            f"{key} still carries a URL after the public filter ran. The headline is "
-            "withheld rather than partially published — a link on this page would reach "
-            "the private tracker."
+        return (
+            [],
+            (
+                f"{key} still carries a URL after the public filter ran. The headline is "
+                "withheld rather than partially published — a link on this page would reach "
+                "the private tracker."
+            ),
+            None,
         )
     if not kept:
-        return [], f"{key} carries no publishable line once links and operator actions are dropped."
-    return kept, None
+        return (
+            [],
+            f"{key} carries no publishable line once links and operator actions are dropped.",
+            None,
+        )
+    return kept, None, reported
 
 
 def _phase_rows(ladder: dict[str, Any]) -> list[dict[str, Any]]:
@@ -556,7 +613,7 @@ def build_public_page(store: Store, *, now: dt.datetime | None = None) -> Public
     ladder, ladder_fault = _read_ladder(store, trading_day)
     if ladder_fault is not None:
         _record(faults, LADDER_KEY, ladder_fault)
-    headline, headline_fault = _read_headline(store, day)
+    headline, headline_fault, headline_day = _read_headline(store, day)
     if headline_fault is not None:
         _record(faults, manifest_prefix(HEADLINE_JOB, day), headline_fault)
     slo, slo_fault = _slo_rows(store, faults)
@@ -567,6 +624,7 @@ def build_public_page(store: Store, *, now: dt.datetime | None = None) -> Public
         generated_utc=moment.strftime("%Y-%m-%dT%H:%M:%SZ"),
         headline=headline,
         headline_fault=headline_fault,
+        headline_trading_day=headline_day,
         phases=_phase_rows(ladder),
         phase_ladder_fault=ladder_fault,
         slots=_slot_rows(store, day, faults),
@@ -652,6 +710,13 @@ def render_public_html(page: PublicPage) -> str:
         "<h2>Morning report</h2>",
     ]
     if page.headline:
+        if page.headline_trading_day and page.headline_trading_day != page.trading_day:
+            parts.append(
+                f'<p class="note">The latest delivered report, for trading day '
+                f"<code>{_e(page.headline_trading_day)}</code>. The report for "
+                f"<code>{_e(page.trading_day)}</code> had not been delivered when this "
+                "page was rendered.</p>"
+            )
         parts.append(f'<pre class="headline">{_e(chr(10).join(page.headline))}</pre>')
     else:
         parts.append(_fault_note(page.headline_fault))

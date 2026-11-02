@@ -20,6 +20,7 @@ import pytest
 
 from crucible.console.public import (
     FORBIDDEN_SOURCE_FIELDS,
+    HEADLINE_LOOKBACK_SESSIONS,
     PUBLIC_JSON_KEY,
     PUBLIC_KEY,
     VERDICT_LEGEND,
@@ -386,6 +387,79 @@ class TestAbsenceIsRendered:
         page = _page(store)
         keys = [entry["key"] for entry in page.faults]
         assert keys.count(champion_key("r")) == 1
+
+
+class TestTheHeadlineIsTheLatestDelivered:
+    """alpha-engine-config-I13017. The weekly `console` stage renders on
+    Saturday morning UTC, and `report.morning` delivers the Friday session's
+    report about twenty minutes LATER (`console@2026-10-30` written
+    2026-10-31T11:58:37Z, the report filed 12:18:58Z). Reading only the page's
+    own trading day therefore found nothing every week and published "has
+    delivered nothing" about a job that had delivered every morning."""
+
+    #: Thursday 2026-08-27, delivered Friday morning — the report that exists
+    #: when the Saturday render runs.
+    THURSDAY = "2026-08-27"
+
+    def _store_with_only_the_previous_delivery(self, tmp_path) -> LocalStore:
+        s = LocalStore(tmp_path)
+        s.put_bytes(morning_report_key(self.THURSDAY, DAY), _HEADLINE.encode())
+        return s
+
+    def test_the_previous_sessions_delivery_is_shown_and_named(self, tmp_path) -> None:
+        page = build_public_page(
+            self._store_with_only_the_previous_delivery(tmp_path), now=SATURDAY_NIGHT
+        )
+        assert page.headline, page.headline_fault
+        assert page.headline_fault is None
+        assert page.headline_trading_day == self.THURSDAY
+        assert page.trading_day == DAY
+
+    def test_html_and_json_agree_on_which_report_is_shown(self, tmp_path) -> None:
+        page = build_public_page(
+            self._store_with_only_the_previous_delivery(tmp_path), now=SATURDAY_NIGHT
+        )
+        rendered = render_public_html(page)
+        assert json.loads(page.to_json())["headline_trading_day"] == self.THURSDAY
+        assert f"for trading day <code>{self.THURSDAY}</code>" in rendered
+        assert f"<code>{DAY}</code> had not been delivered" in rendered
+
+    def test_the_pages_own_day_wins_when_it_was_delivered(self, store) -> None:
+        store.put_bytes(morning_report_key(self.THURSDAY, DAY), b"an older report\n")
+        page = _page(store)
+        assert page.headline_trading_day == DAY
+        assert "an older report" not in page.headline
+        assert "had not been delivered" not in render_public_html(page)
+
+    def test_nothing_within_a_trading_week_is_a_named_fault(self, tmp_path) -> None:
+        s = LocalStore(tmp_path)
+        # One session past the lookback: present, and still not shown.
+        too_old = dt.date.fromisoformat(DAY) - dt.timedelta(days=14)
+        s.put_bytes(morning_report_key(too_old.isoformat(), "2026-08-15"), _HEADLINE.encode())
+        page = build_public_page(s, now=SATURDAY_NIGHT)
+        assert page.headline == []
+        assert page.headline_trading_day is None
+        fault = page.headline_fault or ""
+        assert "no morning headline" in fault
+        assert f"{HEADLINE_LOOKBACK_SESSIONS} sessions" in fault
+        assert any("no morning headline" in entry["fault"] for entry in page.faults)
+
+    def test_an_unlistable_earlier_prefix_stops_the_walk(self, tmp_path) -> None:
+        """An unreadable prefix is not an empty one: walking past it would show
+        an older report as if a newer one did not exist."""
+        thursday = self.THURSDAY
+
+        class _ThursdayDenied(LocalStore):
+            def list_keys(self, prefix: str = ""):
+                if f"/{thursday}/" in prefix:
+                    raise PermissionError(f"AccessDenied listing {prefix}")
+                return super().list_keys(prefix)
+
+        s = _ThursdayDenied(tmp_path)
+        s.put_bytes(morning_report_key("2026-08-26", "2026-08-27"), _HEADLINE.encode())
+        page = build_public_page(s, now=SATURDAY_NIGHT)
+        assert page.headline == []
+        assert "could not be listed" in (page.headline_fault or "")
 
 
 class TestVerdictVocabularyIsClosed:
