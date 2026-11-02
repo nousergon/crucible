@@ -8,6 +8,33 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 
+#: Every reason the two model validators below refuse a document with. Each is a
+#: static string that never carries an input value, so a consumer may print it
+#: verbatim where it prints only the path and type of any other validation error
+#: (`crucible.cost.CollectorSpendClient`). Without it a refused allocation reads
+#: `: value_error` and says nothing about why — the phase-4 cost clause read
+#: exactly that from 2026-10-25 on, while the producer was declaring
+#: `inventory_complete: false` on purpose (`alpha-engine-config-I12026`).
+#: `tests/test_cost_allocation.py` asserts this set equals the validators' own
+#: literals, so a new refusal cannot be added without being named here.
+VALIDATOR_REFUSALS: frozenset[str] = frozenset(
+    {
+        "duplicate allocation member",
+        "allocation members do not reconcile to account",
+        "resource inventory is incomplete",
+        "covered components must name harness, trader and shared exactly once",
+        "duplicate declared scope",
+        "canonical scope is not declared",
+        "member scope is not declared",
+        "dedicated component must use canonical direct scope",
+        "shared component must use shared kind",
+        "unallocated component and kind must agree",
+        "other component cannot use canonical scope",
+        "daily canonical component coverage is incomplete",
+        "duplicate allocation date",
+    }
+)
+
 
 class AllocationMember(BaseModel):
     """One accountable part of the provider ledger, including shared services."""

@@ -67,7 +67,7 @@ import datetime as dt
 import os
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -362,6 +362,27 @@ class ClosedMonthReading:
         }
 
 
+def _validator_refusal(error: Mapping[str, object]) -> str:
+    """`` (<reason>)`` when a validation error is one of the allocation
+    validators' declared static refusals, else ``""``.
+
+    The diagnostic around this prints paths and types only, because an input
+    may hold a private resource id. A model-level refusal has an EMPTY path and
+    the bare type ``value_error``, so on its own it says nothing about why —
+    which is how the phase-4 cost clause came to read ``: value_error`` for a
+    producer that was declaring an incomplete inventory on purpose. The reason
+    is printed only when it is a member of
+    :data:`crucible.cost_allocation.VALIDATOR_REFUSALS`, a set of literals that
+    carry no input, so nothing the producer wrote can reach the reading.
+    """
+    if error.get("type") != "value_error":
+        return ""
+    from crucible.cost_allocation import VALIDATOR_REFUSALS  # noqa: PLC0415 - scoped only
+
+    reason = str(error.get("msg", "")).removeprefix("Value error, ")
+    return f" ({reason})" if reason in VALIDATOR_REFUSALS else ""
+
+
 #: Environment variable naming the expense collector's rollup, an
 #: `s3://bucket/key` URI. The workflows build it from repository variables, so
 #: no bucket name lives in this tree.
@@ -501,32 +522,36 @@ class CollectorSpendClient:
                             include_url=False, include_context=False, include_input=False
                         )
                         diagnostic = "; ".join(
-                            ".".join(
-                                str(part)
-                                if isinstance(part, int)
-                                or part
-                                in {
-                                    "schema_version",
-                                    "inventory_complete",
-                                    "inventory_evidence",
-                                    "covered_components",
-                                    "declared_scopes",
-                                    "days",
-                                    "date",
-                                    "account_usd",
-                                    "members",
-                                    "id",
-                                    "scope",
-                                    "component",
-                                    "kind",
-                                    "usd",
-                                    "evidence",
-                                }
-                                else "unknown_field"
-                                for part in error["loc"]
+                            (
+                                ".".join(
+                                    str(part)
+                                    if isinstance(part, int)
+                                    or part
+                                    in {
+                                        "schema_version",
+                                        "inventory_complete",
+                                        "inventory_evidence",
+                                        "covered_components",
+                                        "declared_scopes",
+                                        "days",
+                                        "date",
+                                        "account_usd",
+                                        "members",
+                                        "id",
+                                        "scope",
+                                        "component",
+                                        "kind",
+                                        "usd",
+                                        "evidence",
+                                    }
+                                    else "unknown_field"
+                                    for part in error["loc"]
+                                )
+                                or "cost_allocation"
                             )
                             + ": "
                             + error["type"]
+                            + _validator_refusal(error)
                             for error in errors[:5]
                         )
                     else:
