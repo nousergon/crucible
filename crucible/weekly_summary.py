@@ -17,6 +17,15 @@ the arc started, and a spot box is billed below list, so the figure is an
 upper bound on the arc's own compute, not an invoice. LLM cost stays its own
 field.
 
+**A failed arc files one too, and it cannot read as a success**
+(`alpha-engine-config-I13055`). The arc's failure path passes
+``arc_status="failed"`` with the reason, the stage that failed and the declared
+stages it never reached, so the console names the failed stage instead of
+showing the previous week going stale. The failed stage's row reads
+``failed`` and each unreached stage's row reads ``not-run``; ``arc_status`` has
+no default, and a ``succeeded`` arc that names a failed or unreached stage
+raises.
+
 **Pure over its reads.** :func:`build_summary` takes a ``read`` callable, so
 the arc (reading the store) and a backfill (reading the same keys later) build
 byte-comparable documents, and tests need no store.
@@ -39,9 +48,13 @@ from crucible.keys import (
 )
 
 __all__ = [
+    "ARC_FAILED",
+    "ARC_SUCCEEDED",
     "COMPARISON_DATES",
     "COMPUTE_PRICES",
     "SLOTS",
+    "STAGE_FAILED",
+    "STAGE_NOT_RUN",
     "WEEKLY_SUMMARY_SCHEMA",
     "build_summary",
     "compute_estimate",
@@ -62,6 +75,12 @@ COMPUTE_PRICES: Mapping[str, float] = {
     "r5a.2xlarge": 0.452,
 }
 COMPUTE_PRICE_SOURCE = "AWS EC2 on-demand list price, us-east-1 Linux (declared in crucible)"
+
+#: ``arc.status`` vocabulary. Stage rows add ``not-run`` beside the manifest's own statuses.
+ARC_SUCCEEDED = "succeeded"
+ARC_FAILED = "failed"
+STAGE_FAILED = "failed"
+STAGE_NOT_RUN = "not-run"
 
 Doc = Mapping[str, object]
 Reader = Callable[[str], "Doc | None"]
@@ -128,6 +147,19 @@ def _stage_row(key: str, manifest: Doc) -> dict[str, object]:
         "attempts": len(cast("list[object]", attempts)) if isinstance(attempts, list) else None,
         "llm_cost_usd": manifest.get("cost_usd"),
     }
+
+
+def _failed_row(key: str, manifest: Doc | None) -> dict[str, object]:
+    """The failed stage's row: its own manifest when that manifest says it
+    failed, otherwise the key alone marked failed. A manifest that reads
+    anything else at this key is an earlier run's, never this failure's."""
+    if manifest is not None and manifest.get("status") == STAGE_FAILED:
+        return _stage_row(key, manifest)
+    return {**_stage_row(key, {}), "status": STAGE_FAILED}
+
+
+def _not_run_row(key: str) -> dict[str, object]:
+    return {**_stage_row(key, {}), "status": STAGE_NOT_RUN}
 
 
 def _scores(series: Doc | None) -> dict[str, float]:
@@ -203,10 +235,37 @@ def build_summary(
     read: Reader,
     read_events: EventsReader,
     generated_utc: str,
+    arc_status: str,
+    arc_reason: str | None = None,
+    failed_stage: tuple[str, Doc | None] | None = None,
+    not_run: Sequence[str] = (),
     backfilled: bool = False,
 ) -> dict[str, object]:
-    """The `weekly_summary.v1` document for one arc."""
+    """The `weekly_summary.v1` document for one arc.
+
+    ``stages`` are the stages that completed, as ``(manifest_key, manifest)``.
+    A failed arc also passes ``failed_stage`` as ``(manifest_key, manifest or
+    None)`` when a stage failed (``None`` for a refusal before stage 1) and
+    ``not_run``, the manifest keys of the declared stages it never reached.
+    """
+    if arc_status not in (ARC_SUCCEEDED, ARC_FAILED):
+        raise ValueError(f"arc_status must be {ARC_SUCCEEDED!r} or {ARC_FAILED!r}: {arc_status!r}")
+    if arc_status == ARC_SUCCEEDED and (failed_stage is not None or not_run):
+        raise ValueError("a succeeded arc names no failed or not-run stage")
+    if arc_status == ARC_FAILED and not arc_reason:
+        raise ValueError("a failed arc carries its reason")
     stage_list = list(stages)
+    rows = [_stage_row(k, m) for k, m in stage_list]
+    failed_label: str | None = None
+    if failed_stage is not None:
+        failed_key, failed_doc = failed_stage
+        failed_row = _failed_row(failed_key, failed_doc)
+        rows.append(failed_row)
+        slot = failed_row["slot"]
+        failed_label = f"{failed_row['job']}[{slot}]" if slot else str(failed_row["job"])
+        if failed_doc is not None and failed_doc.get("status") == STAGE_FAILED:
+            stage_list.append((failed_key, failed_doc))
+    rows.extend(_not_run_row(k) for k in not_run)
     first: Doc = stage_list[0][1] if stage_list else {}
     resource = _dict(first.get("resource"))
     coverage: Doc = read(coverage_key(trading_day)) or {}
@@ -223,7 +282,16 @@ def build_summary(
         "run_id": run_id,
         "generated_utc": generated_utc,
         "backfilled": backfilled,
-        "arc": {"started": arc_started, "finished": arc_finished, "wall_seconds": wall},
+        "arc": {
+            "started": arc_started,
+            "finished": arc_finished,
+            "wall_seconds": wall,
+            "status": arc_status,
+            "reason": arc_reason,
+            "failed_stage": failed_label,
+            "stages_declared": len(rows),
+            "stages_completed": len(rows) - (failed_stage is not None) - len(not_run),
+        },
         "release": {
             "release_sha": first.get("release_sha"),
             "code_sha": first.get("code_sha"),
@@ -235,7 +303,7 @@ def build_summary(
             "feature_version": coverage.get("feature_version"),
             "coverage_ratio": coverage.get("coverage_ratio"),
         },
-        "stages": [_stage_row(k, m) for k, m in stage_list],
+        "stages": rows,
         "compute": compute_estimate(
             cast("str | None", resource.get("instance_type")), wall, resource.get("spot")
         ),

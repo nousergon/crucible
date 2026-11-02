@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from crucible.components import Component, load_registry
@@ -312,7 +313,21 @@ def preflight(
 
 class ArcStageFailed(RuntimeError):
     """A stage exited non-zero. Carries which one, so the arc's own manifest
-    `reason` names a job rather than a traceback in a module nobody opens."""
+    `reason` names a job rather than a traceback in a module nobody opens.
+
+    ``stage`` is the stage that failed and ``completed`` the stages that ran
+    before it, in order (`alpha-engine-config-I13055`): the arc's failure path
+    files `weekly_summary.json` from them, marking the failed stage and every
+    declared stage after it as not run, so a failed week is a row on the
+    console rather than the previous week going stale.
+    """
+
+    def __init__(
+        self, message: str, *, stage: Stage | None = None, completed: Sequence[Stage] = ()
+    ) -> None:
+        super().__init__(message)
+        self.stage = stage
+        self.completed: tuple[Stage, ...] = tuple(completed)
 
 
 #: The one shape both `ArcStageFailed` messages in :func:`run_arc` start with,
@@ -414,13 +429,17 @@ def run_arc(
             # the full cause.
             raise ArcStageFailed(
                 f"weekly arc stage {stage.label} raised for {trading_day.isoformat()}: "
-                f"{type(exc).__name__}: {exc}"
+                f"{type(exc).__name__}: {exc}",
+                stage=stage,
+                completed=ran,
             ) from exc
         if code != 0:
             raise ArcStageFailed(
                 f"weekly arc stage {stage.label} exited {code} for {trading_day.isoformat()}; "
                 "the stages after it read what it was to write, so the arc stops here "
-                "rather than producing a report card over an absent input."
+                "rather than producing a report card over an absent input.",
+                stage=stage,
+                completed=ran,
             )
         ran.append(stage)
     return ran
