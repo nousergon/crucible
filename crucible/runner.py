@@ -132,6 +132,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import re
 import resource as posix_resource
 import shutil
 import signal
@@ -166,6 +167,8 @@ __all__ = [
     "DISPATCH_ATTEMPTS_ENV",
     "DispatchAttemptsError",
     "EXPECTED_MANIFEST_KEY_FILE",
+    "RELEASE_MANIFEST_ENV",
+    "ReleaseManifestError",
     "RunContext",
     "STATE_DIR_ENV",
     "SPOT_INTERRUPTION_REASON",
@@ -176,6 +179,7 @@ __all__ = [
     "rebind_trading_day",
     "resolve_dispatch_attempts",
     "resolve_code_sha",
+    "resolve_release_manifest",
     "run_job",
     "spot_interruption_guard",
 ]
@@ -406,6 +410,39 @@ CODE_SHA_ENV = "CRUCIBLE_CODE_SHA"
 #: exports it for the smoke, so a run manifest names its dependency set and
 #: not only its code.
 WHEELHOUSE_DIGEST_ENV = "CRUCIBLE_WHEELHOUSE_DIGEST"
+
+#: alpha-engine-config-I12517 (S-29 design note §3): the `release_manifest.v1`
+#: digest this run executes under. The box bootstrap exports it from the
+#: environment's release pointer (`releases/env/{env}/current`) at job start,
+#: the same way it exports `CRUCIBLE_WHEELHOUSE_DIGEST` from the release it
+#: installed. promote.yml's soak gate counts a staging run toward a digest only
+#: when the run's manifest names it.
+RELEASE_MANIFEST_ENV = "CRUCIBLE_RELEASE_MANIFEST"
+
+
+class ReleaseManifestError(ValueError):
+    """`$CRUCIBLE_RELEASE_MANIFEST` is set but is not a sha256 hex digest."""
+
+
+def resolve_release_manifest() -> str | None:
+    """The release manifest digest this run executes under, or ``None``.
+
+    Unset or empty means no release pointer was followed (a laptop, CI, or a
+    box not bootstrapped from a manifest), and the manifest omits the field.
+    A malformed value is refused here, before any work, like
+    :class:`CodeShaError`: written into the manifest it would fail
+    validation on the primary write AND on the fallback, which carries
+    runner identity, and the run would leave no manifest at all.
+    """
+    value = os.environ.get(RELEASE_MANIFEST_ENV, "")
+    if not value:
+        return None
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ReleaseManifestError(
+            f"${RELEASE_MANIFEST_ENV}={value!r} is not a sha256 hex digest (64 lowercase hex "
+            "characters); the bootstrap exports it from the release pointer's `digest`"
+        )
+    return value
 
 
 #: `code_sha` could not be resolved to a real, measured commit sha.
@@ -1098,6 +1135,9 @@ def run_job(
     # Same shape again (alpha-engine-config-I10732): a ladder the box
     # declared but this process cannot read is refused before any work.
     dispatch_attempts = resolve_dispatch_attempts()
+    # Same shape (alpha-engine-config-I12517): a malformed release digest is
+    # refused before any work; both manifest builders then read a valid one.
+    resolve_release_manifest()
     if trading_day is None:
         trading_day = resolve_trading_day(started)
     else:
@@ -1431,6 +1471,11 @@ def _write_manifest(
         # manifest too: it is runner-measured identity, not a job-contributed
         # field the validator could have rejected.
         manifest["wheelhouse_digest"] = wheelhouse_digest
+    release_manifest = resolve_release_manifest()
+    if release_manifest is not None:
+        # Same "omitted entirely" shape (alpha-engine-config-I12517). Runner
+        # identity, so the fallback manifest carries it too.
+        manifest["release_manifest"] = release_manifest
     if ctx.fault_capability_class is not None:
         # Same "omitted entirely" shape, same reason (alpha-engine-config-I10343).
         # This is the field that makes an INDUCED router failure distinguishable
@@ -1626,6 +1671,11 @@ def _minimal_failed_manifest(
         # manifest too: it is runner-measured identity, not a job-contributed
         # field the validator could have rejected.
         rebuilt["wheelhouse_digest"] = wheelhouse_digest
+    release_manifest = resolve_release_manifest()
+    if release_manifest is not None:
+        # Same "omitted entirely" shape (alpha-engine-config-I12517). Runner
+        # identity, so the fallback manifest carries it too.
+        rebuilt["release_manifest"] = release_manifest
     if ctx.fault_capability_class is not None:
         rebuilt["fault_capability_class"] = ctx.fault_capability_class
     return rebuilt
