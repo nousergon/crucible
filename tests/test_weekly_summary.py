@@ -20,7 +20,11 @@ from crucible.keys import (
 )
 from crucible.store import LocalStore
 from crucible.weekly_summary import (
+    ARC_FAILED,
+    ARC_SUCCEEDED,
     COMPARISON_DATES,
+    STAGE_FAILED,
+    STAGE_NOT_RUN,
     WEEKLY_SUMMARY_SCHEMA,
     build_summary,
     compute_estimate,
@@ -82,12 +86,13 @@ STAGE = (
 
 def summary(**kw):
     store = docs()
+    kw.setdefault("arc_status", ARC_SUCCEEDED)
+    kw.setdefault("stages", [STAGE])
     return build_summary(
         trading_day=DAY,
         run_id="R",
         arc_started="2026-10-31T11:00:00Z",
         arc_finished="2026-10-31T12:00:00Z",
-        stages=[STAGE],
         read=store.get,
         read_events=lambda key: (
             [{"kind": "negative_result"}] if key == experiments_key(DAY) else []
@@ -130,6 +135,68 @@ class TestSummary:
 
     def test_an_absent_cycle_is_marked_absent(self):
         assert summary()["slots"]["u"] == {"cycle_key": arena_cycle_key("u", DAY), "present": False}
+
+
+FAILED_KEY = "runs/features.compute/2026-10-30/run.json"
+NOT_RUN = ("runs/experiment.run/2026-10-30/r/run.json", "runs/report/2026-10-30/run.json")
+
+
+class TestFailedArc:
+    """`alpha-engine-config-I13055`: an arc that fails part-way files a summary
+    that names the failed stage and the stages not run, and never reads as a
+    success."""
+
+    def test_the_failed_stage_and_every_unreached_stage_are_rows(self):
+        failed = {"status": "failed", "started": "2026-10-31T11:05:00Z", "cost_usd": 0.5}
+        s = summary(
+            arc_status=ARC_FAILED,
+            arc_reason="ArcStageFailed: weekly arc stage features.compute exited 1",
+            failed_stage=(FAILED_KEY, failed),
+            not_run=NOT_RUN,
+        )
+        assert s["arc"]["status"] == ARC_FAILED and s["arc"]["failed_stage"] == "features.compute"
+        assert s["arc"]["reason"].startswith("ArcStageFailed")
+        assert (s["arc"]["stages_declared"], s["arc"]["stages_completed"]) == (4, 1)
+        statuses = [(r["job"], r["slot"], r["status"]) for r in s["stages"]]
+        assert statuses == [
+            ("data.weekly", None, "ok"),
+            ("features.compute", None, STAGE_FAILED),
+            ("experiment.run", "r", STAGE_NOT_RUN),
+            ("report", None, STAGE_NOT_RUN),
+        ]
+        assert s["llm_cost_usd"] == 0.75
+
+    def test_an_earlier_runs_ok_manifest_at_the_failed_key_still_reads_failed(self):
+        stale = {"status": "ok", "started": "2026-10-24T11:00:00Z", "cost_usd": 9.0}
+        s = summary(
+            arc_status=ARC_FAILED, arc_reason="x", failed_stage=(FAILED_KEY, stale), not_run=()
+        )
+        row = s["stages"][-1]
+        assert row["status"] == STAGE_FAILED and row["started"] is None
+        assert s["llm_cost_usd"] == 0.25
+
+    def test_a_refusal_before_stage_one_marks_every_stage_not_run(self):
+        s = summary(stages=[], arc_status=ARC_FAILED, arc_reason="refused", not_run=NOT_RUN)
+        assert s["arc"]["failed_stage"] is None and s["arc"]["stages_completed"] == 0
+        assert {r["status"] for r in s["stages"]} == {STAGE_NOT_RUN}
+
+    def test_a_success_says_so(self):
+        arc = summary()["arc"]
+        assert arc["status"] == ARC_SUCCEEDED and arc["reason"] is None
+        assert (arc["stages_declared"], arc["stages_completed"]) == (1, 1)
+
+    @pytest.mark.parametrize(
+        "kw",
+        [
+            {"arc_status": ARC_SUCCEEDED, "not_run": NOT_RUN},
+            {"arc_status": ARC_SUCCEEDED, "failed_stage": (FAILED_KEY, None)},
+            {"arc_status": ARC_FAILED},
+            {"arc_status": "ok"},
+        ],
+    )
+    def test_a_summary_that_could_read_as_a_success_is_refused(self, kw):
+        with pytest.raises(ValueError):
+            summary(**kw)
 
 
 class TestComputeEstimate:

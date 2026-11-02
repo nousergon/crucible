@@ -71,9 +71,16 @@ from crucible.keys import closing_record_key, manifest_key, weekly_summary_key
 from crucible.runmode import RUN_MODE_LIVE
 from crucible.runner import RunContext, run_job
 from crucible.store import ETAG_ABSENT, Store, open_store, read_only, resolve_store_uri
-from crucible.weekly import PREFLIGHT_REFUSED_EXIT_CODE, arc_stages, preflight, run_arc
+from crucible.weekly import (
+    PREFLIGHT_REFUSED_EXIT_CODE,
+    ArcStageFailed,
+    Stage,
+    arc_stages,
+    preflight,
+    run_arc,
+)
 from crucible.weekly_notice import send_notice
-from crucible.weekly_summary import WEEKLY_SUMMARY_SCHEMA, build_summary
+from crucible.weekly_summary import ARC_FAILED, ARC_SUCCEEDED, WEEKLY_SUMMARY_SCHEMA, build_summary
 from crucible.weekly_summary import encode as encode_summary
 
 __all__ = [
@@ -270,7 +277,9 @@ def weekly_handler(args: argparse.Namespace) -> int:
 
     A stage failure propagates. `run_job` writes the arc's `failed` manifest in
     its `finally`, naming the stage in `reason`, and the process exits
-    non-zero.
+    non-zero. Before it does, the body files `weekly_summary.json` marked
+    `failed`, naming the failed stage and the declared stages not run
+    (`alpha-engine-config-I13055`).
 
     `--preflight` runs none of that (`alpha-engine-config-I12863`): it asks
     only whether the arc would refuse before stage 1, prints the verdict as one
@@ -301,14 +310,21 @@ def weekly_handler(args: argparse.Namespace) -> int:
         # every stage is run under that one answer. A stage left to
         # re-resolve would let the arc manifest and its stage manifests
         # disagree about the same week.
-        ran = run_arc(ctx.trading_day, store=store_uri, dry_run=dry_run, run_mode=ctx.run_mode)
+        try:
+            ran = run_arc(ctx.trading_day, store=store_uri, dry_run=dry_run, run_mode=ctx.run_mode)
+        except Exception as exc:
+            # A failed arc files its summary too (`alpha-engine-config-I13055`),
+            # marked failed, then re-raises unchanged: the failure is still the
+            # arc's manifest and exit code.
+            _record_failed_weekly_summary(ctx, store, planned, exc)
+            raise
         stage_docs: list[tuple[str, dict[str, object]]] = []
         for stage in ran:
             key = manifest_key(stage.job, ctx.trading_day.isoformat(), discriminator=stage.slot)
             payload = store.get_bytes(key)
             ctx.record_input(key, payload)
             stage_docs.append((key, load_document_bytes(key, payload)))
-        _record_weekly_summary(ctx, store, stage_docs)
+        _record_weekly_summary(ctx, store, stage_docs, arc_status=ARC_SUCCEEDED)
         ctx.record_rows(rows_in=len(planned), rows_out=len(ran))
         ctx.record_metric(
             {
@@ -347,8 +363,68 @@ def weekly_handler(args: argparse.Namespace) -> int:
     return 0
 
 
+def _record_failed_weekly_summary(
+    ctx: RunContext, store: Store, planned: list[Stage], exc: Exception
+) -> None:
+    """File the summary of an arc that failed part-way (`alpha-engine-config-I13055`).
+
+    The stages that completed come from :class:`ArcStageFailed`, never from
+    whatever manifests the store holds for this day: an earlier run's `ok`
+    manifest at a key this run never reached would read as a stage that ran.
+    The failed stage is a `failed` row and every declared stage after it a
+    `not-run` row. Any other exception (the pre-stage-1 refusal, a store
+    error) leaves no stage run, so every declared stage is `not-run`.
+
+    A failure to file is printed and swallowed HERE, deliberately: this runs
+    inside the arc's failure path, and raising would replace the stage error
+    the arc's manifest must name with a summary error.
+    """
+    day = ctx.trading_day.isoformat()
+    try:
+        completed = list(exc.completed) if isinstance(exc, ArcStageFailed) else []
+        failed = exc.stage if isinstance(exc, ArcStageFailed) else None
+        stage_docs: list[tuple[str, dict[str, object]]] = []
+        for stage in completed:
+            key = manifest_key(stage.job, day, discriminator=stage.slot)
+            stage_docs.append((key, load_document_bytes(key, store.get_bytes(key))))
+        failed_stage: tuple[str, dict[str, object] | None] | None = None
+        if failed is not None:
+            key = manifest_key(failed.job, day, discriminator=failed.slot)
+            doc = load_document_bytes(key, store.get_bytes(key)) if store.exists(key) else None
+            failed_stage = (key, doc)
+        reached = {stage.label for stage in completed}
+        if failed is not None:
+            reached.add(failed.label)
+        _record_weekly_summary(
+            ctx,
+            store,
+            stage_docs,
+            arc_status=ARC_FAILED,
+            arc_reason=f"{type(exc).__name__}: {exc}",
+            failed_stage=failed_stage,
+            not_run=[
+                manifest_key(stage.job, day, discriminator=stage.slot)
+                for stage in planned
+                if stage.label not in reached
+            ],
+        )
+    except Exception as summary_exc:  # noqa: BLE001 - see docstring
+        print(
+            f"weekly summary NOT filed for failed arc {day}: "
+            f"{type(summary_exc).__name__}: {summary_exc}",
+            file=sys.stderr,
+        )
+
+
 def _record_weekly_summary(
-    ctx: RunContext, store: Store, stage_docs: list[tuple[str, dict[str, object]]]
+    ctx: RunContext,
+    store: Store,
+    stage_docs: list[tuple[str, dict[str, object]]],
+    *,
+    arc_status: str,
+    arc_reason: str | None = None,
+    failed_stage: tuple[str, dict[str, object] | None] | None = None,
+    not_run: list[str] | None = None,
 ) -> None:
     """File `report/{day}/weekly_summary.json` and the estimated compute cost metric."""
     day = ctx.trading_day.isoformat()
@@ -363,6 +439,10 @@ def _record_weekly_summary(
         read=lambda key: load_store_document(store, key) if store.exists(key) else None,
         read_events=lambda key: list(load_store_jsonl(store, key)),
         generated_utc=now,
+        arc_status=arc_status,
+        arc_reason=arc_reason,
+        failed_stage=failed_stage,
+        not_run=not_run or [],
     )
     key = weekly_summary_key(day)
     ctx.record_output(key, encode_summary(summary), WEEKLY_SUMMARY_SCHEMA)
