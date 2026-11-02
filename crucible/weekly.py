@@ -42,10 +42,19 @@ __all__ = [
     "SELECT_NEWEST_VERDICT_JOBS",
     "Stage",
     "arc_stages",
+    "PREFLIGHT_REFUSED_EXIT_CODE",
     "assert_arc_champions_producible",
     "failed_stage_job",
+    "preflight",
     "run_arc",
 ]
+
+#: The exit code of `crucible weekly --preflight` when the arc WOULD refuse
+#: before stage 1. Distinct from 0 (would run), from `cli.USAGE_EXIT_CODE` (2,
+#: a malformed invocation) and from 1 (an uncaught raise: the store or recipe
+#: tree could not be read). A probe reads 0 as clean, this as armed, and
+#: anything else as unmeasured — so "could not look" is never read as "fine".
+PREFLIGHT_REFUSED_EXIT_CODE = 3
 
 #: The job name the arc itself runs and files its manifest under. That
 #: manifest records every stage it completed as an input, which is what
@@ -239,6 +248,66 @@ def assert_arc_champions_producible(
         trading_day=trading_day.isoformat(),
         context=f"weekly arc for {trading_day.isoformat()} refused before stage 1",
     )
+
+
+def preflight(
+    trading_day: dt.date,
+    *,
+    store: str | None,
+    registry: dict[str, Component] | None = None,
+) -> dict[str, object]:
+    """Would the arc for ``trading_day`` refuse before stage 1? Answer without running it.
+
+    `alpha-engine-config-I12863` slice 2. The v2 weekly has no Step Function:
+    the schedule invokes a dispatcher that launches a box at once, so this
+    refusal is the arc's first STOPPING decision and it is reached only after
+    the launch has spent. A champion-pointer move or a recipe-tree merge arms it
+    with no deploy (the 2026-08-28 class). The pre-spend probe in
+    alpha-engine-config (`scripts/check_prespend_gate_arm.py`) asks it here,
+    ahead of the fire, through the release in force.
+
+    It calls the arc's own two functions, :func:`arc_stages` and
+    :func:`assert_arc_champions_producible`, rather than restating them, so the
+    probe cannot pass where `run_arc` would refuse. Nothing is written: the
+    store is opened read-only by that function, and no manifest is filed. A
+    store or recipe tree that cannot be read RAISES, exactly as it does before
+    stage 1, and is never reported as producible.
+    """
+    from crucible.documents import load_store_document  # noqa: PLC0415 - avoids a cycle
+    from crucible.keys import champion_key  # noqa: PLC0415 - avoids a cycle
+    from crucible.slots.producibility import (  # noqa: PLC0415 - avoids a cycle
+        UnproducibleChampionError,
+    )
+    from crucible.store import open_store  # noqa: PLC0415 - avoids a cycle
+
+    stages = arc_stages(trading_day, registry)
+    slots = [slot for slot in SLOTS if any(stage.slot == slot for stage in stages)]
+    # What each dispatched slot's pointer names, or None. Reported because "no
+    # pointer" PASSES the refusal (a slot that never promoted serves nothing),
+    # so a probe aimed at the wrong store root reads every slot as producible.
+    # Measured 2026-11-02 against the bucket root instead of `.../crucible`.
+    # The caller can tell "nothing to refuse" from "looked at nothing".
+    reader = open_store(store, dry_run=True)
+    pointers: dict[str, object] = {
+        slot: (
+            load_store_document(reader, champion_key(slot)).get("arm_id")
+            if reader.exists(champion_key(slot))
+            else None
+        )
+        for slot in slots
+    }
+    verdict: dict[str, object] = {
+        "check": "assert_arc_champions_producible",
+        "trading_day": trading_day.isoformat(),
+        "slots": slots,
+        "pointers": pointers,
+        "stages": len(stages),
+    }
+    try:
+        assert_arc_champions_producible(trading_day, stages, store=store)
+    except UnproducibleChampionError as exc:
+        return {**verdict, "verdict": "refused", "reason": str(exc)}
+    return {**verdict, "verdict": "producible", "reason": None}
 
 
 class ArcStageFailed(RuntimeError):

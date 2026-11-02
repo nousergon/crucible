@@ -71,7 +71,7 @@ from crucible.keys import closing_record_key, manifest_key, weekly_summary_key
 from crucible.runmode import RUN_MODE_LIVE
 from crucible.runner import RunContext, run_job
 from crucible.store import ETAG_ABSENT, Store, open_store, read_only, resolve_store_uri
-from crucible.weekly import arc_stages, run_arc
+from crucible.weekly import PREFLIGHT_REFUSED_EXIT_CODE, arc_stages, preflight, run_arc
 from crucible.weekly_notice import send_notice
 from crucible.weekly_summary import WEEKLY_SUMMARY_SCHEMA, build_summary
 from crucible.weekly_summary import encode as encode_summary
@@ -271,8 +271,18 @@ def weekly_handler(args: argparse.Namespace) -> int:
     A stage failure propagates. `run_job` writes the arc's `failed` manifest in
     its `finally`, naming the stage in `reason`, and the process exits
     non-zero.
+
+    `--preflight` runs none of that (`alpha-engine-config-I12863`): it asks
+    only whether the arc would refuse before stage 1, prints the verdict as one
+    JSON object, writes no manifest, and exits 0 (would run) or
+    :data:`~crucible.weekly.PREFLIGHT_REFUSED_EXIT_CODE` (would refuse). A
+    store it cannot read raises, so it exits non-zero with the traceback.
     """
     store_uri = getattr(args, "store", None)
+    if getattr(args, "preflight", False):
+        verdict = preflight(args.trading_day, store=store_uri)
+        print(json.dumps(verdict, sort_keys=True))
+        return 0 if verdict["verdict"] == "producible" else PREFLIGHT_REFUSED_EXIT_CODE
     dry_run = bool(getattr(args, "dry_run", False))
     store = open_store(store_uri, dry_run=dry_run)
 
