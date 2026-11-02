@@ -1196,6 +1196,17 @@ def build_parser() -> argparse.ArgumentParser:
                     "with the positional target; exactly one is required."
                 ),
             )
+        if spec.name == "weekly":
+            # The pre-spend probe's read-only question (alpha-engine-config-I12863).
+            sub.add_argument(
+                "--preflight",
+                action="store_true",
+                help=(
+                    "Run no stage. Print whether the arc would refuse before stage 1 "
+                    "(a champion pointer naming an arm this release cannot produce) as "
+                    "JSON; write nothing. Exit 0 = would run, 3 = would refuse."
+                ),
+            )
         if spec.name == "release.pin":
             sub.add_argument("sha", metavar="RELEASE_SHA")
             sub.add_argument("--target", choices=["current", "trader"], default="current")

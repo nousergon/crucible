@@ -24,9 +24,11 @@ from crucible.store import LocalStore
 from crucible.weekly import (
     ARC_SLOT_JOBS,
     ARCTIC_LIBRARY_JOBS,
+    PREFLIGHT_REFUSED_EXIT_CODE,
     ArcStageFailed,
     arc_stages,
     failed_stage_job,
+    preflight,
     run_arc,
 )
 
@@ -568,3 +570,102 @@ class TestChampionsAreProducibleBeforeStageOne:
         with pytest.raises(UnproducibleChampionError, match="no recipe named 'thinktank_coverage'"):
             self._run(v2)
         assert self.seen == []
+
+
+class TestPreflightAsksTheArcsOwnRefusal:
+    """`alpha-engine-config-I12863` slice 2. `crucible weekly --preflight` is
+    what the pre-spend probe runs ahead of the v2 weekly's fire: the v2 weekly
+    has no Step Function, so the pre-stage-1 refusal is reached only after the
+    dispatcher's launch has spent. It must answer exactly as `run_arc` would,
+    run no stage, and write nothing."""
+
+    @pytest.fixture
+    def v2(self, tmp_path) -> LocalStore:
+        store = LocalStore(tmp_path / "v2")
+        for name, body in _R_RECIPES.items():
+            store.put_bytes(f"strategy/current/arms/r/{name}.yaml", body.encode())
+        return store
+
+    @staticmethod
+    def _point_r_at(store: LocalStore, name: str) -> str:
+        arm_id = next(s.arm_id for s in load_arm_specs("r", store=store) if s.name == name)
+        store.put_bytes(champion_key("r"), json.dumps({"arm_id": arm_id}).encode())
+        return arm_id
+
+    def _cli(self, store: LocalStore, capsys: pytest.CaptureFixture[str]) -> tuple[int, dict]:
+        from crucible.cli import main  # noqa: PLC0415 - mirrors the arc's own lazy import
+
+        before = sorted(store.list_keys())
+        code = main(
+            [
+                "weekly",
+                "--preflight",
+                "--date",
+                FRIDAY.isoformat(),
+                "--store",
+                str(store.root),
+                "--run-mode",
+                RUN_MODE_LIVE,
+            ]
+        )
+        assert sorted(store.list_keys()) == before, "a preflight writes nothing, manifest included"
+        return code, json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+    def test_a_producible_pointer_exits_zero_and_says_so(
+        self, v2: LocalStore, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        arm_id = self._point_r_at(v2, "no_agent_quant")
+        code, verdict = self._cli(v2, capsys)
+        assert code == 0
+        assert verdict["verdict"] == "producible"
+        assert verdict["reason"] is None
+        assert verdict["trading_day"] == FRIDAY.isoformat()
+        assert "r" in verdict["slots"]
+        assert verdict["stages"] == _expected_stage_count()
+        assert verdict["pointers"]["r"] == arm_id
+
+    def test_an_empty_store_reports_no_pointers_so_a_wrong_root_is_visible(
+        self, tmp_path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """No pointer passes the refusal, so a probe aimed at the wrong root
+        would read clean. The verdict says it looked at nothing."""
+        code, verdict = self._cli(LocalStore(tmp_path / "wrong-root"), capsys)
+        assert code == 0
+        assert verdict["verdict"] == "producible"
+        assert set(verdict["pointers"].values()) == {None}
+
+    def test_a_refused_pointer_exits_the_refusal_code_naming_the_arm(
+        self, v2: LocalStore, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        refused = self._point_r_at(v2, "scanner_predictor_direct")
+        code, verdict = self._cli(v2, capsys)
+        assert code == PREFLIGHT_REFUSED_EXIT_CODE
+        assert verdict["verdict"] == "refused"
+        assert refused in verdict["reason"]
+        assert "predicted_alpha_ratio" in verdict["reason"]
+
+    def test_the_refusal_code_is_neither_success_usage_nor_a_raise(self) -> None:
+        """The probe reads 0 as clean, this as armed and anything else as
+        unmeasured. Sharing 1 (an uncaught raise) or 2 (usage) would read
+        "could not look" as "armed", or the reverse."""
+        from crucible.cli import USAGE_EXIT_CODE  # noqa: PLC0415
+
+        assert PREFLIGHT_REFUSED_EXIT_CODE not in {0, 1, USAGE_EXIT_CODE}
+
+    @pytest.mark.parametrize("name", ["no_agent_quant", "scanner_predictor_direct"])
+    def test_the_verdict_matches_what_run_arc_does(self, v2: LocalStore, name: str) -> None:
+        """One predicate, two callers: the preflight may never pass where the
+        arc refuses, nor refuse where it runs."""
+        self._point_r_at(v2, name)
+        verdict = preflight(FRIDAY, store=str(v2.root))
+        try:
+            run_arc(FRIDAY, store=str(v2.root), run_mode=RUN_MODE_LIVE, main=lambda _argv: 0)
+        except UnproducibleChampionError:
+            assert verdict["verdict"] == "refused"
+        else:
+            assert verdict["verdict"] == "producible"
+
+    def test_an_unreadable_pointer_raises_rather_than_passing(self, v2: LocalStore) -> None:
+        v2.put_bytes(champion_key("r"), b"{not json")
+        with pytest.raises(Exception):  # noqa: B017, PT011 - any raise; never a verdict
+            preflight(FRIDAY, store=str(v2.root))
