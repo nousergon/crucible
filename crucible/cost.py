@@ -362,7 +362,7 @@ class ClosedMonthReading:
         }
 
 
-def _validator_refusal(error: Mapping[str, Any]) -> str:
+def _validator_refusal(error: Mapping[str, object]) -> str:
     """`` (<reason>)`` when a validation error is one of the allocation
     validators' declared static refusals, else ``""``.
 
