@@ -1342,6 +1342,20 @@ class RunManifestV2(_Strict):
             "which installed from no wheelhouse and so has no digest to name."
         ),
     )
+    #: `alpha-engine-config-I12517` (S-29 design note §3): the release
+    #: manifest digest this run executed under, read from the environment's
+    #: release pointer at job start. Absent where no pointer is followed.
+    release_manifest: Sha256 | None = Field(
+        default=None,
+        description=(
+            "I12517: the `release_manifest.v1` digest this run executed under, as the box read it "
+            "from `releases/env/{env}/current` at job start. It binds the run to one release, so "
+            "promote.yml's soak gate (nous-ergon-ops `scripts/promote_soak_gate.py`) can count "
+            "this run toward that digest. Absent where no release pointer is followed (a laptop, "
+            "CI, or a box not yet bootstrapped from a manifest); the soak gate counts such a run "
+            "as unknown, never as green."
+        ),
+    )
     #: `alpha-engine-config-I10343`: present only when this run's LLM routing
     #: was deliberately redirected to a fault-injection capability class.
     #: Absent for every natural run.

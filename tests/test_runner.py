@@ -22,7 +22,7 @@ import os
 import pytest
 
 from crucible.manifest import ManifestValidationError, manifest_key, validate
-from crucible.runner import CodeShaError, RunContext, run_job
+from crucible.runner import CodeShaError, ReleaseManifestError, RunContext, run_job
 from crucible.store import LocalStore
 
 TRADING_DAY = dt.date(2026, 8, 28)
@@ -767,3 +767,64 @@ class TestKrepisRunIdExport:
         manifest_run_id = _read_manifest(store, "smoke")["run_id"]
         assert seen == [manifest_run_id]
         assert seen[0] != "stale-from-a-previous-process"
+
+
+class TestReleaseManifestBinding:
+    """alpha-engine-config-I12517 (S-29 design note §3): a run names the
+    release manifest digest it executed under, so the soak gate can count it.
+    Omitted when unset; refused before any work when malformed."""
+
+    DIGEST = "ab" * 32
+
+    def test_the_digest_from_the_environment_is_recorded(self, tmp_path, monkeypatch) -> None:
+        store = LocalStore(tmp_path)
+        monkeypatch.setenv("CRUCIBLE_RELEASE_MANIFEST", self.DIGEST)
+        run_job("smoke", lambda ctx: None, store=store, trading_day=TRADING_DAY)
+        doc = _read_manifest(store, "smoke")
+        validate(doc)
+        assert doc["release_manifest"] == self.DIGEST
+
+    def test_unset_omits_the_field_entirely(self, tmp_path, monkeypatch) -> None:
+        store = LocalStore(tmp_path)
+        monkeypatch.delenv("CRUCIBLE_RELEASE_MANIFEST", raising=False)
+        run_job("smoke", lambda ctx: None, store=store, trading_day=TRADING_DAY)
+        assert "release_manifest" not in _read_manifest(store, "smoke")
+
+    def test_a_failed_run_still_names_its_release(self, tmp_path, monkeypatch) -> None:
+        store = LocalStore(tmp_path)
+        monkeypatch.setenv("CRUCIBLE_RELEASE_MANIFEST", self.DIGEST)
+
+        def boom(ctx: RunContext) -> None:
+            raise ValueError("deliberate")
+
+        with pytest.raises(ValueError, match="deliberate"):
+            run_job("smoke", boom, store=store, trading_day=TRADING_DAY, transient_retry=False)
+        doc = _read_manifest(store, "smoke")
+        assert doc["status"] == "failed"
+        assert doc["release_manifest"] == self.DIGEST
+
+    def test_the_fallback_manifest_carries_it(self, tmp_path, monkeypatch) -> None:
+        """Runner identity survives a job-contributed field the validator rejects."""
+        store = LocalStore(tmp_path)
+        monkeypatch.setenv("CRUCIBLE_RELEASE_MANIFEST", self.DIGEST)
+
+        def job(ctx: RunContext) -> None:
+            ctx.rows_in = -1  # schema minimum is 0: forces the fallback write
+
+        run_job("smoke", job, store=store, trading_day=TRADING_DAY)
+        doc = _read_manifest(store, "smoke")
+        validate(doc)
+        assert doc["status"] == "failed"
+        assert doc["release_manifest"] == self.DIGEST
+
+    @pytest.mark.parametrize("bad", ["AB" * 32, "ab" * 31, "not-a-digest", "g" * 64])
+    def test_a_malformed_digest_is_refused_before_any_work(
+        self, tmp_path, monkeypatch, bad
+    ) -> None:
+        store = LocalStore(tmp_path)
+        monkeypatch.setenv("CRUCIBLE_RELEASE_MANIFEST", bad)
+        ran: list[bool] = []
+        with pytest.raises(ReleaseManifestError, match="CRUCIBLE_RELEASE_MANIFEST"):
+            run_job("smoke", lambda ctx: ran.append(True), store=store, trading_day=TRADING_DAY)
+        assert ran == []
+        assert not store.exists(manifest_key("smoke", TRADING_DAY.isoformat()))

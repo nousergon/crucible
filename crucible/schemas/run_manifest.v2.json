@@ -692,6 +692,20 @@
       "title": "Reason",
       "type": "string"
     },
+    "release_manifest": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "I12517: the `release_manifest.v1` digest this run executed under, as the box read it from `releases/env/{env}/current` at job start. It binds the run to one release, so promote.yml's soak gate (nous-ergon-ops `scripts/promote_soak_gate.py`) can count this run toward that digest. Absent where no release pointer is followed (a laptop, CI, or a box not yet bootstrapped from a manifest); the soak gate counts such a run as unknown, never as green.",
+      "title": "Release Manifest"
+    },
     "release_sha": {
       "description": "Sha of the immutable release artifact this process was installed from. Differs from code_sha only when running from a working tree, where it is the same value.",
       "pattern": "^[0-9a-f]{40}$",
