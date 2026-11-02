@@ -33,9 +33,9 @@ import datetime as dt
 import json
 import os
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import ValidationError
 
@@ -111,7 +111,9 @@ __all__ = [
     "PAGE_CONDITIONS",
     "PENDING_CONFIRMATION",
     "SUBSCRIBERS_METRIC",
+    "SESSION_SERVED_METRIC",
     "SWEEP_JOB",
+    "TRADER_SESSION_JOB",
     "Page",
     "PageGroup",
     "SubscriberReading",
@@ -128,6 +130,7 @@ __all__ = [
     "evaluate_absence",
     "evaluate_dispatch_absence",
     "evaluate_failure",
+    "evaluate_held_session",
     "evaluate_min_active_arms",
     "group_pages",
     "heartbeat",
@@ -2097,6 +2100,118 @@ def evaluate_min_active_arms(
     return pages
 
 
+#: `alpha-engine-config-I13057`: the job whose HELD session pages, and the
+#: metric that says whether it served. Stated here, not imported from
+#: `crucible_trader`: the trader depends on this package, never the reverse.
+TRADER_SESSION_JOB = "trader.session"
+SESSION_SERVED_METRIC = "trader_session_served"
+
+
+def _session_served(manifest: Mapping[str, object]) -> tuple[bool, str] | None:
+    """``(served, status_reason)`` from the session's served metric, or None
+    when the manifest records no such metric. A non-numeric value is read as
+    not served: a flag nobody can read has not said the day was served."""
+    rows = manifest.get("metrics")
+    if not isinstance(rows, list):
+        return None
+    for row in cast("list[object]", rows):
+        if not isinstance(row, dict):
+            continue
+        fields = cast("dict[str, object]", row)
+        if fields.get("name") != SESSION_SERVED_METRIC:
+            continue
+        value = fields.get("value")
+        served = isinstance(value, int | float) and not isinstance(value, bool) and value != 0
+        return served, str(fields.get("status_reason") or "held")
+    return None
+
+
+def evaluate_held_session(
+    store: Store,
+    *,
+    now: dt.datetime | None = None,
+    registry: dict[str, Component] | None = None,
+    access_faults: list[str] | None = None,
+) -> list[Page]:
+    """`alpha-engine-config-I13057`: page for a trading day the trader HELD.
+
+    `crucible_trader.daily_session` records a held session (no champion, feed
+    or construction input for the day) as `status: ok` with
+    `trader_session_served = 0`, deliberately: a hold is not a failed run.
+    That left the one shape neither condition saw. The manifest exists, so
+    there is no ABSENCE; it is `ok`, so there is no FAILURE. The 2026-10-06
+    hold ("no champion pointer for slot 's'") was found by a person reading
+    manifests (nous-ergon-ops#1998).
+
+    Reuses the FAILURE condition rather than adding a third (§4.6 admits
+    exactly two), as :func:`evaluate_min_active_arms` does: a trading day the
+    trader did not serve is a day the job failed to do the one thing it
+    exists to do. The page carries the trader's own hold reason verbatim.
+
+    A day pages only when NO `ok` manifest for it served: a re-run that
+    served clears an earlier hold. A `failed` manifest is left to
+    :func:`evaluate_failure`, which already pages it, and an unreadable one
+    likewise. An `ok` manifest with no served metric pages too: every `ok`
+    path in the trader records it, so its absence is a contract break that
+    would otherwise blind this rule.
+    """
+    moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
+    reg = registry if registry is not None else load_registry()
+    component = reg.get(TRADER_SESSION_JOB)
+    if component is None or component.lifecycle != "ACTIVE":
+        return []
+    pages: list[Page] = []
+    for trading_day in days_to_evaluate(store, moment):
+        listed = read_manifests_under(
+            store, manifest_prefix(TRADER_SESSION_JOB, trading_day.isoformat())
+        )
+        if listed.listing_problem is not None:
+            # Not appended: `evaluate_failure` lists this same prefix in the
+            # same sweep and carries the identical problem out through
+            # `access_faults`, so the sweep still exits non-zero naming it.
+            if access_faults is None:
+                raise StoreAccessError(listed.listing_problem)
+            continue
+        served = False
+        unserved: list[tuple[str, str | None, str]] = []
+        for _key, manifest in listed.documents:
+            if manifest.get("status") != "ok":
+                continue
+            reading = _session_served(manifest)
+            if reading is not None and reading[0]:
+                served = True
+                continue
+            why = (
+                f"the ok manifest records no {SESSION_SERVED_METRIC} metric"
+                if reading is None
+                else reading[1]
+            )
+            run_id = str(manifest.get("run_id") or _UNPARSEABLE_RUN_ID)
+            unserved.append((run_id, manifest_synthetic_marker(manifest), why))
+        if served or not unserved:
+            continue
+        run_id, synthetic, why = unserved[-1]
+        pages.append(
+            Page(
+                condition="failure",
+                job=TRADER_SESSION_JOB,
+                trading_day=trading_day,
+                reason=(
+                    f"session not served ({SESSION_SERVED_METRIC}=0): {why}\n"
+                    "    Auto-fix: none. The next scheduled session (10:45 ET, next "
+                    "trading day) re-resolves the contract, but nothing re-serves "
+                    "this day.\n"
+                    "    Resolution: publish what the hold names (champion pointer, "
+                    "feed or construction input) and confirm the next trader.session "
+                    f"manifest records {SESSION_SERVED_METRIC}=1."
+                ),
+                run_id=run_id,
+                synthetic=synthetic,
+            )
+        )
+    return pages
+
+
 # ── The bus, the transport, and the ceiling ───────────────────────────────
 
 
@@ -3251,6 +3366,7 @@ def sweep(
         )
         + evaluate_failure(store, now=moment, registry=registry, access_faults=access_faults)
         + evaluate_min_active_arms(store, now=moment, access_faults=access_faults)
+        + evaluate_held_session(store, now=moment, registry=registry, access_faults=access_faults)
     )
     groups = group_pages(pages)
     if dry_run:
