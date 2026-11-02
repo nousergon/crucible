@@ -12,6 +12,8 @@ from botocore.exceptions import ClientError
 
 from crucible.release import RELEASE_OBJECT_LOCK_RETENTION, release_json_key, wheel_key
 from crucible.release_lock_sweep import (
+    _PROMOTION_OBJECT_RE,
+    _RELEASE_OBJECT_RE,
     ReleaseLockReading,
     release_lock_findings,
     release_lock_metric,
@@ -351,6 +353,59 @@ class TestFindings:
             findings = release_lock_findings(store)
 
             assert [f.key for f in findings] == [key], filename
+
+    def test_the_promotion_pipelines_locked_keys_are_checked(self) -> None:
+        """alpha-engine-config-I12517 (staging S-29). nous-ergon-ops'
+        release writer Object-Locks a manifest and every Lambda zip it
+        names; both are promotable identities, so an unlocked one is UNMET
+        exactly like an unlocked wheel."""
+        manifest = f"releases/manifests/{'1' * 64}.json"
+        zip_key = f"releases/artifacts/lambda/crucible-v2-dispatch/{'2' * 64}.zip"
+        client = _FakeS3Client()
+        store = _store(client)
+        client.put(f"crucible/{manifest}", locked=False)
+        client.put(f"crucible/{zip_key}", locked=True)
+
+        findings = {f.key: f.state for f in release_lock_findings(store)}
+
+        assert findings == {manifest: "UNMET", zip_key: "MET"}
+
+    def test_the_promotion_pipelines_unlocked_keys_are_never_checked(self) -> None:
+        """Provenance records, env pointers, history and promotion records
+        are unlocked by design (nous-ergon-ops `scripts/release_store.py`);
+        grading them would page on the contract, not on a defect. A key
+        that only resembles a manifest or zip (wrong depth, not a 64-hex
+        name) is not one either."""
+        digest = "3" * 64
+        unlocked_by_design = [
+            f"releases/manifests/provenance/{digest}/123-1.json",
+            "releases/env/staging/current",
+            f"releases/env/prod/history/00000001-20261115T230000Z-{digest}.json",
+            f"releases/env/prod/promotions/20261115T230000Z-{digest}.json",
+            "releases/manifests/not-a-digest.json",
+            f"releases/manifests/{digest}.json.tmp",
+            f"releases/artifacts/lambda/{digest}.zip",
+            f"releases/artifacts/lambda/fn/nested/{digest}.zip",
+            f"releases/artifacts/lambda/fn/{'4' * 63}.zip",
+        ]
+        client = _FakeS3Client()
+        store = _store(client)
+        for key in unlocked_by_design:
+            client.put(f"crucible/{key}", locked=False)  # would be UNMET if checked
+        client.put(f"crucible/{release_json_key(SHA_LOCKED)}", locked=True)
+
+        findings = release_lock_findings(store)
+
+        assert [f.key for f in findings] == [release_json_key(SHA_LOCKED)]
+
+    def test_the_retention_repair_selector_does_not_widen(self) -> None:
+        """`crucible.release_retention` (a WRITE path) selects with
+        `_RELEASE_OBJECT_RE`; the promotion keys widen only the read-only
+        sweep, never what the repair would rewrite."""
+        assert not _RELEASE_OBJECT_RE.match(f"releases/manifests/{'1' * 64}.json")
+        assert not _RELEASE_OBJECT_RE.match(f"releases/artifacts/lambda/fn/{'2' * 64}.zip")
+        assert _PROMOTION_OBJECT_RE.match(f"releases/manifests/{'1' * 64}.json")
+        assert not _PROMOTION_OBJECT_RE.match(release_json_key(SHA_LOCKED))
 
     def test_a_non_s3_backend_reads_unmeasurable_never_a_silent_zero_findings(
         self, tmp_path

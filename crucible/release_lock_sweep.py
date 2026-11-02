@@ -110,6 +110,36 @@ _RELEASE_OBJECT_RE = re.compile(
     r"(?:release\.json|crucible-[^/]+\.whl|wheelhouse/[^/]+)$"
 )
 
+#: The promotion pipeline's Object-Locked keys, which live beside the
+#: sha-scoped releases rather than under them (alpha-engine-config-I12517,
+#: staging S-29; epic alpha-engine-config-I12488). nous-ergon-ops
+#: `scripts/release_store.py` writes exactly two kinds of them with
+#: `ObjectLockMode=GOVERNANCE` and the same retention as
+#: `RELEASE_OBJECT_LOCK_RETENTION`, on the PutObject itself:
+#:
+#: - `releases/manifests/{digest}.json` -- a release manifest, named by the
+#:   sha256 of its own canonical bytes;
+#: - `releases/artifacts/lambda/{name}/{sha256}.zip` -- a Lambda zip a
+#:   manifest names, named by its own hash (`name` follows that writer's
+#:   `_NAME` rule).
+#:
+#: A promotion deploys a manifest digest that staging ran; an unlocked
+#: manifest or zip is a promotable identity that can be rewritten under the
+#: digest that names it, which is what this sweep exists to catch. Never
+#: matched: `releases/manifests/provenance/...` (one record per write
+#: attempt, written unlocked on purpose, like crucible's own provenance) and
+#: `releases/env/{env}/...` (pointers, history and promotion records:
+#: compare-and-swap or append-only, unlocked by design).
+#:
+#: Kept SEPARATE from `_RELEASE_OBJECT_RE` on purpose: that pattern is also
+#: the selector `crucible.release_retention` repairs (a WRITE path, scoped to
+#: one sha's prefix). This one only widens what the read-only sweep grades;
+#: the repair's scope is unchanged.
+_PROMOTION_OBJECT_RE = re.compile(
+    r"^releases/(?:manifests/[0-9a-f]{64}\.json"
+    r"|artifacts/lambda/[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[0-9a-f]{64}\.zip)$"
+)
+
 #: `GetObjectRetention`'s error code for "this object has no Object Lock
 #: retention set" — the genuinely-unlocked case, distinct from every other
 #: `ClientError` this call can raise (access denial, the key having
@@ -157,11 +187,15 @@ def _release_object_keys(store: Store) -> list[str]:
     """Every published release identity object, sorted for determinism.
 
     Filters `store.list_keys("releases/")` to keys the sha-scoped release
-    identity pattern matches — never a bare suffix check, which cannot tell
-    a release identity object from a same-named object living somewhere
-    else under the prefix.
+    identity pattern or the promotion pipeline's pattern matches — never a
+    bare suffix check, which cannot tell a release identity object from a
+    same-named object living somewhere else under the prefix.
     """
-    return sorted(key for key in store.list_keys(RELEASES_ROOT) if _RELEASE_OBJECT_RE.match(key))
+    return sorted(
+        key
+        for key in store.list_keys(RELEASES_ROOT)
+        if _RELEASE_OBJECT_RE.match(key) or _PROMOTION_OBJECT_RE.match(key)
+    )
 
 
 def _read_one(store: S3Store, key: str) -> ReleaseLockReading:
