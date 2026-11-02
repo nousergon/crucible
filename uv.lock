@@ -283,7 +283,7 @@ requires-dist = [
     { name = "boto3", specifier = ">=1.43.118" },
     { name = "cvxpy", specifier = ">=1.9.3,<1.10" },
     { name = "jsonschema", specifier = ">=4.26.0" },
-    { name = "krepis", extras = ["openai"], specifier = "==0.59.83" },
+    { name = "krepis", extras = ["openai"], specifier = "==0.59.88" },
     { name = "lightgbm", specifier = ">=4.7.0" },
     { name = "nousergon-lib", extras = ["arcticdb"], marker = "extra == 'arcticdb'", specifier = "==0.124.190" },
     { name = "nousergon-lib", extras = ["github-app", "gates"], specifier = "==0.124.190" },
@@ -540,7 +540,7 @@ wheels = [
 
 [[package]]
 name = "krepis"
-version = "0.59.83"
+version = "0.59.88"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "boto3" },
@@ -548,9 +548,9 @@ dependencies = [
     { name = "pyyaml" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/15/68/5e87fb75ed45b3db48bf01910fd6c14ad47028aeb9e7dfb4023e1a07db4d/krepis-0.59.83.tar.gz", hash = "sha256:c53c45cfcd5307df47895544c484e310b9dd3adb384193f0943d7efe75b09abe", size = 810397, upload-time = "2026-10-25T08:59:04.509Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a2/a9/e340efaf1d79d3536534f08afec41570dd6b79bd1b6f917c58767eaacf9f/krepis-0.59.88.tar.gz", hash = "sha256:6264dd4ba8792815a56b1691f76c50e3e46286930c6247f1aae8b699fd7bfb2c", size = 817523, upload-time = "2026-11-02T05:33:53.683Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/9a/9d/fda84cd2bf1e5430d39c3ee1a1ce13c855ccdcc736a84a21fb4226450f82/krepis-0.59.83-py3-none-any.whl", hash = "sha256:5cf0ceb35553742e5061710da272539dc1705b2b81e61e4698a2837bd4869f1d", size = 504170, upload-time = "2026-10-25T08:59:02.784Z" },
+    { url = "https://files.pythonhosted.org/packages/20/14/52793f2e7accfb362bbf3f7739339ddef411e8ba0d77fa05bfdf31fa20be/krepis-0.59.88-py3-none-any.whl", hash = "sha256:ede0b44549fdd18cd92a81ad12a23b7d67e3231f294c6817cc1c86c38c9fd5f0", size = 507993, upload-time = "2026-11-02T05:33:51.906Z" },
 ]
 
 [package.optional-dependencies]
