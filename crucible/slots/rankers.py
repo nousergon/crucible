@@ -102,6 +102,22 @@ class RankerSpec:
         return self.fn(features, params)
 
 
+def _required_param(params: Mapping[str, Any], ranker: str, name: str) -> Any:
+    """A tuned value the recipe must supply. There is no default here on purpose.
+
+    Tuned values are strategy and live only in the private strategy tree
+    (`repository-tiering-policy.md` test 3). A fallback literal in this public
+    module would publish a value, and would let a recipe that omitted it run
+    on a number nobody declared.
+    """
+    if name not in params:
+        raise ValueError(
+            f"ranker {ranker!r} needs parameter {name!r} from the arm's recipe; "
+            "this public module carries no default for a tuned value"
+        )
+    return params[name]
+
+
 def _liquid(features: pd.DataFrame) -> pd.DataFrame:
     """The liquid subset. The gate is a feature, computed once, read by all."""
     return features[features["liquidity_pass_raw"] == 1.0]
@@ -135,9 +151,9 @@ def _quant_composite(features: pd.DataFrame, params: Mapping[str, Any]) -> pd.Se
     is not the edge.
     """
     block = _liquid(features)
-    w_momentum = float(params.get("momentum_weight", 0.5))
-    w_trend = float(params.get("trend_weight", 0.3))
-    w_reversal = float(params.get("reversal_weight", 0.2))
+    w_momentum = float(_required_param(params, "quant_composite", "momentum_weight"))
+    w_trend = float(_required_param(params, "quant_composite", "trend_weight"))
+    w_reversal = float(_required_param(params, "quant_composite", "reversal_weight"))
     total = w_momentum + w_trend + w_reversal
     if total <= 0:
         raise ValueError(
@@ -180,7 +196,7 @@ def _predicted_alpha_within_cut(features: pd.DataFrame, params: Mapping[str, Any
     does not carry, so it refuses BY NAME until the M slot materializes it.
     """
     block = _liquid(features)
-    cut = int(params.get("cut_top_n", 20))
+    cut = int(_required_param(params, "predicted_alpha_within_cut", "cut_top_n"))
     pool = block.nlargest(cut, "momentum_20d_zscore")
     return pool["predicted_alpha_ratio"].dropna()
 

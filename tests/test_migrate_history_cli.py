@@ -71,9 +71,9 @@ registered_at: '2026-07-13'
 bootstrap: true
 promotion_source: operator_bootstrap
 params:
-  top_n: 15
-  momentum_weight: 0.5
-  trend_weight: 0.3
+  top_n: 12
+  momentum_weight: 0.4
+  trend_weight: 0.4
   reversal_weight: 0.2
 notes: fixture recipe carrying v1 provenance
 """

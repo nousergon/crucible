@@ -76,9 +76,9 @@ slot: r
 ranker: quant_composite
 registered_at: '2026-09-04'
 params:
-  top_n: 15
-  momentum_weight: 0.5
-  trend_weight: 0.3
+  top_n: 12
+  momentum_weight: 0.4
+  trend_weight: 0.4
   reversal_weight: 0.2
 notes: >-
   What this arm believes, in one paragraph: which effect it is betting on and
