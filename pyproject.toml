@@ -72,7 +72,9 @@ dependencies = [
     # case (Polygon's apiKey= reached a Telegram alert on 2026-10-02).
     # 0.59.89 (alpha-engine-config-I13042, krepis-PR282): redact_secrets also runs
     # on the SNS leg of alerts.publish and in email_sender.send_email.
-    "krepis[openai]==0.59.89",
+    # 0.59.90 (alpha-engine-config-I13152, krepis-PR283): redaction also covers an
+    # HTML-escaped `&amp;` separator, a percent-encoded value and the alert footer.
+    "krepis[openai]==0.59.90",
     # Run-manifest schema validation. The schema is the enforcement surface
     # for `status in {ok, failed}` (plan §4.2), so validation is a runtime
     # dependency, not a test-only one.
