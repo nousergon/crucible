@@ -102,7 +102,7 @@ class RankerSpec:
         return self.fn(features, params)
 
 
-def _required_param(params: Mapping[str, Any], ranker: str, name: str) -> Any:
+def _required_param(params: Mapping[str, object], ranker: str, name: str) -> float:
     """A tuned value the recipe must supply. There is no default here on purpose.
 
     Tuned values are strategy and live only in the private strategy tree
@@ -115,7 +115,10 @@ def _required_param(params: Mapping[str, Any], ranker: str, name: str) -> Any:
             f"ranker {ranker!r} needs parameter {name!r} from the arm's recipe; "
             "this public module carries no default for a tuned value"
         )
-    return params[name]
+    value = params[name]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"ranker {ranker!r} parameter {name!r} must be a number; got {value!r}")
+    return float(value)
 
 
 def _liquid(features: pd.DataFrame) -> pd.DataFrame:
@@ -151,9 +154,9 @@ def _quant_composite(features: pd.DataFrame, params: Mapping[str, Any]) -> pd.Se
     is not the edge.
     """
     block = _liquid(features)
-    w_momentum = float(_required_param(params, "quant_composite", "momentum_weight"))
-    w_trend = float(_required_param(params, "quant_composite", "trend_weight"))
-    w_reversal = float(_required_param(params, "quant_composite", "reversal_weight"))
+    w_momentum = _required_param(params, "quant_composite", "momentum_weight")
+    w_trend = _required_param(params, "quant_composite", "trend_weight")
+    w_reversal = _required_param(params, "quant_composite", "reversal_weight")
     total = w_momentum + w_trend + w_reversal
     if total <= 0:
         raise ValueError(
