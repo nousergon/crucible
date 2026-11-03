@@ -67,8 +67,8 @@ def r_strategy_dir(strategy_dir):
         "no_agent_quant",
         "quant_composite",
         top_n=15,
-        momentum_weight=0.5,
-        trend_weight=0.3,
+        momentum_weight=0.4,
+        trend_weight=0.4,
         reversal_weight=0.2,
     )
     _write_r_recipe(strategy_dir, "scanner_predictor_direct", "predicted_alpha_direct", top_n=10)

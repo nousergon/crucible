@@ -477,8 +477,8 @@ _R_RECIPES = {
     ),
     "no_agent_quant": (
         "name: no_agent_quant\nslot: r\nranker: quant_composite\n"
-        "registered_at: '2026-06-15'\nparams:\n  top_n: 15\n  momentum_weight: 0.5\n"
-        "  trend_weight: 0.3\n  reversal_weight: 0.2\n"
+        "registered_at: '2026-06-15'\nparams:\n  top_n: 12\n  momentum_weight: 0.4\n"
+        "  trend_weight: 0.4\n  reversal_weight: 0.2\n"
     ),
 }
 
