@@ -121,7 +121,8 @@ __all__ = [
     "PENDING_CONFIRMATION",
     "SUBSCRIBERS_METRIC",
     "SESSION_SERVED_METRIC",
-    "BACK_OFFICE_QUEUE_JOB",
+    "BACK_OFFICE_FAIL_METRICS",
+    "BACK_OFFICE_JOB",
     "EXCEPTION_OVERDUE_METRIC",
     "EXCEPTION_SCORE_METRIC",
     "OVERDUE_LOOKBACK_TRADING_DAYS",
@@ -147,7 +148,7 @@ __all__ = [
     "evaluate_dispatch_absence",
     "evaluate_failure",
     "evaluate_held_session",
-    "evaluate_overdue_breaks",
+    "evaluate_back_office_breaks",
     "evaluate_min_active_arms",
     "evaluate_shadow_books_absence",
     "group_pages",
@@ -2232,31 +2233,43 @@ def evaluate_held_session(
 
 
 #: `alpha-engine-config-I13129`: the job whose manifest carries the back
-#: office's queue reading, the label its page goes out under, and the two
-#: metric rows that say whether a queue item is overdue. Stated here, not
-#: imported from `crucible_trader`, for the reason `TRADER_SESSION_JOB` gives.
+#: office's control readings, the label their page goes out under, and the
+#: metric rows that say a control failed. Stated here, not imported from
+#: `crucible_trader`, for the reason `TRADER_SESSION_JOB` gives.
 TRADER_RECONCILE_JOB = "trader.reconcile"
 #: NOT a runner job: a label, like :data:`SHADOW_BOOKS_JOB`. A page under
 #: `trader.reconcile` itself would share an incident with that job's FAILURE
-#: page on the same day, and "the broker disagrees" and "a person has not
-#: decided yet" are two different things to go and do.
-BACK_OFFICE_QUEUE_JOB = "trader.back_office_queue"
+#: page on the same day, and "the broker disagrees" and "the books did not
+#: tie, or a person has not decided yet" are different things to go and do.
+BACK_OFFICE_JOB = "trader.back_office"
 #: The dedicated row (crucible-trader step 5e): FAIL while any queue item is
-#: older than the back office's age limit.
+#: older than the back office's age limit (3 trading days).
 EXCEPTION_OVERDUE_METRIC = "exception_queue_overdue"
 #: The row every trader release that files a score carries: WATCH exactly
 #: while an item is overdue (crucible-trader `file_exception_score`). Read
 #: only when the dedicated row is absent, so a trader PINNED before that row
 #: existed still pages.
 EXCEPTION_SCORE_METRIC = "exception_score_filed"
+#: Every row whose FAIL is a back-office break that must not stay silent
+#: (I13129: "each check raises a break when it fails rather than staying
+#: silent"). `ledger_book_of_record` (step 5d) is FAIL when the ledger did not
+#: post or a 1h check broke: roll-forward, completeness, break aging, period
+#: lock, the daily rebuild. `month_rebuild` (5g) is FAIL when a published
+#: close, statement or fee bill does not rebuild from raw. Its WATCH (a gap
+#: booked to suspense) is not here: that gap is a queue item, and ages there.
+BACK_OFFICE_FAIL_METRICS: tuple[str, ...] = (
+    EXCEPTION_OVERDUE_METRIC,
+    "ledger_book_of_record",
+    "month_rebuild",
+)
 #: How far back the sweep looks for the latest reading, and how far back it
-#: walks to find where an unbroken overdue streak began.
+#: walks to find where an unbroken failing streak began.
 OVERDUE_LOOKBACK_TRADING_DAYS = 20
 
 
 def _overdue_reading(manifest: Mapping[str, object]) -> tuple[bool, str] | None:
-    """``(overdue, status_reason)`` from a reconcile manifest, or None when it
-    records neither queue row (the score was not filed, or an older trader)."""
+    """``(failing, reason)`` from a reconcile manifest, or None when it records
+    none of the back-office rows (nothing filed them, or an older trader)."""
     rows = manifest.get("metrics")
     if not isinstance(rows, list):
         return None
@@ -2265,13 +2278,23 @@ def _overdue_reading(manifest: Mapping[str, object]) -> tuple[bool, str] | None:
         if isinstance(row, dict):
             fields = cast("dict[str, object]", row)
             by_name.setdefault(str(fields.get("name")), fields)
-    dedicated = by_name.get(EXCEPTION_OVERDUE_METRIC)
-    if dedicated is not None:
-        return dedicated.get("status") == "FAIL", str(dedicated.get("status_reason") or "")
+    read = False
+    failing: list[str] = []
+    for name in BACK_OFFICE_FAIL_METRICS:
+        row = by_name.get(name)
+        if row is not None:
+            read = True
+            if row.get("status") == "FAIL":
+                failing.append(f"{name}: {row.get('status_reason') or 'FAIL'}")
     score = by_name.get(EXCEPTION_SCORE_METRIC)
-    if score is not None and score.get("status") in ("OK", "WATCH"):
-        return score.get("status") == "WATCH", str(score.get("status_reason") or "")
-    return None
+    if EXCEPTION_OVERDUE_METRIC not in by_name and score is not None:
+        if score.get("status") in ("OK", "WATCH"):
+            read = True
+        if score.get("status") == "WATCH":
+            failing.append(f"{EXCEPTION_SCORE_METRIC}: {score.get('status_reason') or 'WATCH'}")
+    if not read:
+        return None
+    return bool(failing), " | ".join(failing)
 
 
 def _latest_overdue_reading(
@@ -2301,35 +2324,38 @@ def _latest_overdue_reading(
     return best
 
 
-def evaluate_overdue_breaks(
+def evaluate_back_office_breaks(
     store: Store,
     *,
     now: dt.datetime | None = None,
     registry: dict[str, Component] | None = None,
     access_faults: list[str] | None = None,
 ) -> list[Page]:
-    """`alpha-engine-config-I13129`: a back-office queue item older than the
-    age limit (3 trading days) pages.
+    """`alpha-engine-config-I13129`: a back-office break pages: a queue item
+    older than the age limit (3 trading days), or a failed ledger or
+    month-rebuild check.
 
-    `trader.reconcile` step 5e scores every stored exception proposal against
-    the reviewer's decisions and counts the undecided ones past the limit.
-    Before this, an overdue queue only made a metric row WATCH: the manifest
-    exists (no ABSENCE) and its status says nothing about the queue (no
-    FAILURE), so a break nobody decided aged in silence.
+    `trader.reconcile` scores the reviewer's queue (step 5e), checks the
+    ledger (5d: roll-forward, completeness, break aging, period lock, daily
+    rebuild) and rebuilds a published month from raw (5g). Each reports a
+    metric row and none raises, by design, so the reconcile verdict stays
+    the broker's. That left all three silent: the manifest exists (no
+    ABSENCE) and its status says nothing about them (no FAILURE). The rows
+    paged nobody; :data:`BACK_OFFICE_FAIL_METRICS` lists which now do.
 
     Reuses the FAILURE condition rather than adding a third (§4.6 admits
-    exactly two), as :func:`evaluate_held_session` does: a queue the back
-    office cannot clear inside its own limit is the back office failing at
-    the one thing it exists to do. It never reads or changes the reconcile
-    verdict.
+    exactly two), as :func:`evaluate_held_session` does: books that do not
+    tie, or a queue the back office cannot clear inside its own limit, is the
+    back office failing at the one thing it exists to do. It never reads or
+    changes the reconcile verdict.
 
-    **One incident per overdue streak, not one per day.** Only the latest
+    **One incident per failing streak, not one per day.** Only the latest
     reading counts, and the page's trading day is the FIRST day of the
-    unbroken run of overdue readings ending there, like
+    unbroken run of failing readings ending there, like
     :func:`evaluate_min_active_arms`. A standing backlog is one bus row and
     one page against the two-a-month ceiling, re-observed by every sweep
-    until a decision clears it; a day with no reading is skipped, never a
-    break, because its absence is the reconcile's own ABSENCE page.
+    until it clears; a day with no reading is skipped, never a break, because
+    its absence is the reconcile's own ABSENCE page.
     """
     moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
     reg = registry if registry is not None else load_registry()
@@ -2371,15 +2397,16 @@ def evaluate_overdue_breaks(
     return [
         Page(
             condition="failure",
-            job=BACK_OFFICE_QUEUE_JOB,
+            job=BACK_OFFICE_JOB,
             trading_day=anchor,
             reason=(
-                f"back-office queue overdue: {reason or 'an item is past the age limit'} "
-                f"(latest reading {latest_day.isoformat()})\n"
-                "    Auto-fix: none. Nothing decides a break but the reviewer.\n"
-                "    Resolution: record agree or correct for each overdue item on the "
-                "back-office review page (a deferral keeps it queued), and confirm the next "
-                f"{TRADER_RECONCILE_JOB} manifest records {EXCEPTION_OVERDUE_METRIC} OK."
+                f"back-office break: {reason} (latest reading {latest_day.isoformat()})\n"
+                "    Auto-fix: none. Nothing clears a break but a decision or a fix.\n"
+                "    Resolution: an overdue item needs agree or correct on the back-office "
+                "review page (a deferral keeps it queued); a ledger or rebuild failure "
+                "needs its cause found in that day's trader/ledger/ documents. Confirm "
+                f"the next {TRADER_RECONCILE_JOB} manifest has none of "
+                f"{', '.join(BACK_OFFICE_FAIL_METRICS)} at FAIL."
             ),
             run_id=run_id,
             synthetic=synthetic,
@@ -3665,7 +3692,9 @@ def sweep(
         + evaluate_failure(store, now=moment, registry=registry, access_faults=access_faults)
         + evaluate_min_active_arms(store, now=moment, access_faults=access_faults)
         + evaluate_held_session(store, now=moment, registry=registry, access_faults=access_faults)
-        + evaluate_overdue_breaks(store, now=moment, registry=registry, access_faults=access_faults)
+        + evaluate_back_office_breaks(
+            store, now=moment, registry=registry, access_faults=access_faults
+        )
         + evaluate_shadow_books_absence(
             store, now=moment, registry=registry, access_faults=access_faults
         )

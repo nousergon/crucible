@@ -1,11 +1,14 @@
-"""`alpha-engine-config-I13129`: a back-office queue item past its age limit pages.
+"""`alpha-engine-config-I13129`: a back-office break pages.
+
+An overdue queue item, or a failed ledger or month-rebuild check.
 
 `trader.reconcile` step 5e scores the reviewer's queue every trading day and
 counts the items older than 3 trading days. That count used to make a metric
 row WATCH and nothing else: the manifest exists (no ABSENCE) and its status
 is about the broker, not the queue (no FAILURE), so a break nobody decided
-aged in silence. `crucible.alerts.evaluate_overdue_breaks` reuses the FAILURE
-condition, once per overdue streak.
+aged in silence, and the ledger's and month rebuild's FAIL rows paged nobody
+either. `crucible.alerts.evaluate_back_office_breaks` reuses the FAILURE
+condition, once per failing streak.
 """
 
 from __future__ import annotations
@@ -21,13 +24,13 @@ import pytest
 from conftest import CapturingTransport
 
 from crucible.alerts import (
-    BACK_OFFICE_QUEUE_JOB,
+    BACK_OFFICE_JOB,
     EXCEPTION_OVERDUE_METRIC,
     EXCEPTION_SCORE_METRIC,
     OVERDUE_LOOKBACK_TRADING_DAYS,
     TRADER_RECONCILE_JOB,
     StoreAccessError,
-    evaluate_overdue_breaks,
+    evaluate_back_office_breaks,
     sweep,
 )
 from crucible.components import load_registry
@@ -97,9 +100,9 @@ class TestEvaluateOverdueBreaks:
     def test_an_overdue_queue_pages_with_the_traders_reason(self, tmp_path: pathlib.Path) -> None:
         store = LocalStore(tmp_path)
         _write(store, FRIDAY, _overdue())
-        (page,) = evaluate_overdue_breaks(store, now=SATURDAY_NIGHT)
+        (page,) = evaluate_back_office_breaks(store, now=SATURDAY_NIGHT)
         assert page.condition == "failure"
-        assert page.job == BACK_OFFICE_QUEUE_JOB
+        assert page.job == BACK_OFFICE_JOB
         assert page.trading_day == FRIDAY
         assert page.run_id == "01JG0000000000000000000RC1"
         assert "prop-1 (2026-08-21, 5 trading days)" in page.reason
@@ -108,7 +111,7 @@ class TestEvaluateOverdueBreaks:
     def test_a_queue_with_nothing_overdue_pages_nothing(self, tmp_path: pathlib.Path) -> None:
         store = LocalStore(tmp_path)
         _write(store, FRIDAY, _overdue("OK", "nothing older than 3"))
-        assert evaluate_overdue_breaks(store, now=SATURDAY_NIGHT) == []
+        assert evaluate_back_office_breaks(store, now=SATURDAY_NIGHT) == []
 
     def test_a_reconcile_that_failed_on_the_broker_still_reports_its_queue(
         self, tmp_path: pathlib.Path
@@ -116,8 +119,8 @@ class TestEvaluateOverdueBreaks:
         """The broker failure pages on its own; the queue it read is a second incident."""
         store = LocalStore(tmp_path)
         _write(store, FRIDAY, _overdue(), status="failed")
-        (page,) = evaluate_overdue_breaks(store, now=SATURDAY_NIGHT)
-        assert page.job == BACK_OFFICE_QUEUE_JOB
+        (page,) = evaluate_back_office_breaks(store, now=SATURDAY_NIGHT)
+        assert page.job == BACK_OFFICE_JOB
 
     def test_a_trader_pinned_before_the_dedicated_row_pages_on_its_watch(
         self, tmp_path: pathlib.Path
@@ -125,16 +128,16 @@ class TestEvaluateOverdueBreaks:
         store = LocalStore(tmp_path)
         reason = "back-office queue for 2026-08-28: 1 open, 1 overdue, agreement None"
         _write(store, FRIDAY, [_row(EXCEPTION_SCORE_METRIC, "WATCH", reason)])
-        (page,) = evaluate_overdue_breaks(store, now=SATURDAY_NIGHT)
+        (page,) = evaluate_back_office_breaks(store, now=SATURDAY_NIGHT)
         assert "1 overdue" in page.reason
         _write(store, FRIDAY, [_row(EXCEPTION_SCORE_METRIC, "OK", "0 overdue")])
-        assert evaluate_overdue_breaks(store, now=SATURDAY_NIGHT) == []
+        assert evaluate_back_office_breaks(store, now=SATURDAY_NIGHT) == []
 
     def test_an_unfiled_score_is_not_an_overdue_reading(self, tmp_path: pathlib.Path) -> None:
         store = LocalStore(tmp_path)
         _write(store, FRIDAY, [_row(EXCEPTION_SCORE_METRIC, "FAIL", "NOT filed"), "junk"])
         _write(store, THURSDAY, [], run_id="01JG0000000000000000000RC0")
-        assert evaluate_overdue_breaks(store, now=SATURDAY_NIGHT) == []
+        assert evaluate_back_office_breaks(store, now=SATURDAY_NIGHT) == []
 
     def test_a_manifest_with_no_metric_list_is_skipped(self, tmp_path: pathlib.Path) -> None:
         store = LocalStore(tmp_path)
@@ -144,7 +147,40 @@ class TestEvaluateOverdueBreaks:
         store.put_bytes(
             manifest_key(TRADER_RECONCILE_JOB, "2026-08-28"), json.dumps(payload).encode()
         )
-        assert evaluate_overdue_breaks(store, now=SATURDAY_NIGHT) == []
+        assert evaluate_back_office_breaks(store, now=SATURDAY_NIGHT) == []
+
+    def test_a_failed_ledger_check_pages(self, tmp_path: pathlib.Path) -> None:
+        store = LocalStore(tmp_path)
+        reason = "ledger checks failed on 2026-08-28: period_lock 2026-07 closed month changed"
+        _write(
+            store, FRIDAY, [*_overdue("OK", "none"), _row("ledger_book_of_record", "FAIL", reason)]
+        )
+        (page,) = evaluate_back_office_breaks(store, now=SATURDAY_NIGHT)
+        assert "ledger_book_of_record: " + reason in page.reason
+        assert EXCEPTION_OVERDUE_METRIC not in page.reason.split("Resolution")[0]
+
+    def test_a_month_that_does_not_rebuild_pages_beside_an_overdue_queue(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        store = LocalStore(tmp_path)
+        _write(store, FRIDAY, [*_overdue(), _row("month_rebuild", "FAIL", "fee bill differs")])
+        (page,) = evaluate_back_office_breaks(store, now=SATURDAY_NIGHT)
+        head = page.reason.split("\n")[0]
+        assert "prop-1" in head and "month_rebuild: fee bill differs" in head
+
+    def test_a_gap_booked_to_suspense_is_left_to_the_queue(self, tmp_path: pathlib.Path) -> None:
+        """Ledger WATCH: the gap is a queue item and ages there, not here."""
+        store = LocalStore(tmp_path)
+        _write(store, FRIDAY, [_row("ledger_book_of_record", "WATCH", "1 break to suspense")])
+        assert evaluate_back_office_breaks(store, now=SATURDAY_NIGHT) == []
+
+    def test_a_clean_ledger_reading_ends_a_streak(self, tmp_path: pathlib.Path) -> None:
+        store = LocalStore(tmp_path)
+        _write(store, WEDNESDAY, [_row("ledger_book_of_record", "FAIL", "roll_forward")])
+        _write(store, THURSDAY, [_row("ledger_book_of_record", "OK", "ties")])
+        _write(store, FRIDAY, [_row("ledger_book_of_record", "FAIL", "roll_forward")])
+        (page,) = evaluate_back_office_breaks(store, now=SATURDAY_NIGHT)
+        assert page.trading_day == FRIDAY
 
     def test_the_latest_run_of_the_day_decides(self, tmp_path: pathlib.Path) -> None:
         """A re-run after the reviewer decided clears the day."""
@@ -157,7 +193,7 @@ class TestEvaluateOverdueBreaks:
             discriminator="b",
         )
         _write(store, FRIDAY, _overdue(), run_id="01JG...A".ljust(26, "A"), discriminator="a")
-        assert evaluate_overdue_breaks(store, now=SATURDAY_NIGHT) == []
+        assert evaluate_back_office_breaks(store, now=SATURDAY_NIGHT) == []
 
     def test_a_standing_backlog_is_one_incident_anchored_where_it_began(
         self, tmp_path: pathlib.Path
@@ -166,7 +202,7 @@ class TestEvaluateOverdueBreaks:
         _write(store, TUESDAY, _overdue("OK", "not yet"))
         _write(store, WEDNESDAY, _overdue())
         _write(store, FRIDAY, _overdue())  # Thursday has no reading: skipped, not a break
-        (page,) = evaluate_overdue_breaks(store, now=SATURDAY_NIGHT)
+        (page,) = evaluate_back_office_breaks(store, now=SATURDAY_NIGHT)
         assert page.trading_day == WEDNESDAY
         assert "latest reading 2026-08-28" in page.reason
 
@@ -174,7 +210,7 @@ class TestEvaluateOverdueBreaks:
         store = LocalStore(tmp_path)
         _write(store, dt.date(2026, 7, 1), _overdue())
         assert OVERDUE_LOOKBACK_TRADING_DAYS == 20
-        assert evaluate_overdue_breaks(store, now=SATURDAY_NIGHT) == []
+        assert evaluate_back_office_breaks(store, now=SATURDAY_NIGHT) == []
 
     def test_a_retired_reconcile_row_pages_nothing(self, tmp_path: pathlib.Path) -> None:
         store = LocalStore(tmp_path)
@@ -186,7 +222,7 @@ class TestEvaluateOverdueBreaks:
                 registry[TRADER_RECONCILE_JOB], lifecycle="RETIRED"
             ),
         }
-        assert evaluate_overdue_breaks(store, now=SATURDAY_NIGHT, registry=retired) == []
+        assert evaluate_back_office_breaks(store, now=SATURDAY_NIGHT, registry=retired) == []
 
     def test_an_unlistable_prefix_is_an_access_fault_not_silence(
         self, tmp_path: pathlib.Path
@@ -198,10 +234,10 @@ class TestEvaluateOverdueBreaks:
                 return super().list_keys(prefix)
 
         with pytest.raises(StoreAccessError):
-            evaluate_overdue_breaks(_Denied(tmp_path), now=SATURDAY_NIGHT)
+            evaluate_back_office_breaks(_Denied(tmp_path), now=SATURDAY_NIGHT)
         faults: list[str] = []
         assert (
-            evaluate_overdue_breaks(_Denied(tmp_path), now=SATURDAY_NIGHT, access_faults=faults)
+            evaluate_back_office_breaks(_Denied(tmp_path), now=SATURDAY_NIGHT, access_faults=faults)
             == []
         )
         assert len(faults) == 1  # one fault, however many days could not be listed
@@ -215,8 +251,7 @@ class TestTheSweepPagesAnOverdueQueue:
             r
             for r in rows
             if any(
-                m["job"] == BACK_OFFICE_QUEUE_JOB
-                for m in cast("list[dict[str, object]]", r["members"])
+                m["job"] == BACK_OFFICE_JOB for m in cast("list[dict[str, object]]", r["members"])
             )
         ]
 
@@ -233,7 +268,7 @@ class TestTheSweepPagesAnOverdueQueue:
         later = SATURDAY_NIGHT + dt.timedelta(days=1)
         second = sweep(store, now=later, transport=transport, sweep_run_id="Y" * 26)
         assert len(self._rows(store, second)) == 1
-        sent = [c for c in transport.calls if BACK_OFFICE_QUEUE_JOB in c.message]
+        sent = [c for c in transport.calls if BACK_OFFICE_JOB in c.message]
         assert len(sent) == 1  # re-observed by the second sweep, never re-sent
 
     def test_an_unreadable_streak_start_still_pages_the_latest_day(
@@ -248,5 +283,5 @@ class TestTheSweepPagesAnOverdueQueue:
         store = _Denied(tmp_path)
         _write(store, FRIDAY, _overdue())
         faults: list[str] = []
-        (page,) = evaluate_overdue_breaks(store, now=SATURDAY_NIGHT, access_faults=faults)
+        (page,) = evaluate_back_office_breaks(store, now=SATURDAY_NIGHT, access_faults=faults)
         assert page.trading_day == FRIDAY and len(faults) == 1
