@@ -97,6 +97,15 @@ def _exclusions_for(events: frozenset[str]) -> set[str]:
 #: `<workflow>:<job>` pairs that may run on a PR because their subject is the
 #: tree, or the pull request itself. Every entry names why.
 PR_REACHABLE_JOBS: dict[str, str] = {
+    # alpha-engine-config-I13002 (pyarrow/numpy lockstep, nous-ergon-ops#2041).
+    "pyarrow-numpy-constraint.yml:check": (
+        "checks out this tree and nousergon-data (public), pip-installs "
+        "packaging and pyyaml, and runs nousergon-data's "
+        "check_pyarrow_numpy_constraint.py against this checkout. "
+        "`permissions: contents: read`, no cloud credential, no secret. Its "
+        "subject is the diff itself: a pyarrow/numpy pin in this PR that "
+        "disagrees with the shared declaration."
+    ),
     # alpha-engine-config-I7777 (provider-linkage roster rollout).
     "provider-linkage-guard.yml:guard": (
         "a job-level `uses:` of nousergon-lib's provider-linkage-guard.yml, "
