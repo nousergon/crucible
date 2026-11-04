@@ -540,6 +540,7 @@ JOB_VALUES: tuple[str, ...] = (
     "data.daily",
     "data.weekly",
     "data.heal",
+    "replay.full_universe",
     "experiment.new",
     "experiment.register",
     "experiment.run",

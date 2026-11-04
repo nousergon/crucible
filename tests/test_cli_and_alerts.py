@@ -194,6 +194,8 @@ class TestJobSurface:
             "data.daily",
             "data.weekly",
             "data.heal",
+            # alpha-engine-config-I12519: the full-universe staging replay.
+            "replay.full_universe",
             "experiment.new",
             # alpha-engine-config-I10927: the DERIVED sibling of
             # `experiment.new`. An arc stage at 11:00, before
@@ -731,6 +733,13 @@ class TestDryRunNeverWrites:
     #: docstring, which states the reason but never asserted it against
     #: `JOBS` itself.
     _EXCLUDED_WITH_REASON = {
+        "replay.full_universe": (
+            "needs a release digest ($CRUCIBLE_RELEASE_MANIFEST) and a separate replay "
+            "store, and its compile IS data.daily (dry-run covered above). Its own "
+            "dry-run property (--dry-run reaches the compile, and the run store gains no "
+            "key at all) is asserted directly by tests/test_replay_full_universe.py::"
+            "test_dry_run_writes_nothing_in_either_store"
+        ),
         "experiment.new": "needs a synced strategy tree with real arm recipes",
         "experiment.register": (
             "needs a synced strategy tree with real arm recipes, same as "
