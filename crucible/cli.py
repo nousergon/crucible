@@ -65,6 +65,7 @@ from crucible.keys import manifest_key as _promote_manifest_key
 from crucible.llm import FAULT_INJECTION_CAPABILITY_CLASSES
 from crucible.models import FAULT_OUTCOME_VALUES
 from crucible.release_retention import RELEASE_LOCK_JOB, release_lock_handler
+from crucible.replay import REPLAY_JOB, handle_replay_full_universe
 from crucible.review import REVIEW_RECORD_JOB, review_record_handler
 from crucible.runmode import RUN_MODES, RunModeError, resolve_run_mode
 from crucible.track_a import HANDLERS as TRACK_A_HANDLERS
@@ -738,6 +739,13 @@ JOBS: dict[str, JobSpec] = {
     "data.daily": JobSpec("data.daily", "Compile one trading day of market data", True),
     "data.weekly": JobSpec("data.weekly", "Weekly data refresh and coverage pass", True),
     "data.heal": JobSpec("data.heal", "Repair a named gap in the store, idempotently", False),
+    # alpha-engine-config-I12519 (S-31). On-demand: the full-universe staging
+    # replay the promote soak gate's scale clause reads (`crucible.replay`).
+    "replay.full_universe": JobSpec(
+        "replay.full_universe",
+        "Compile one trading day at full universe into a separate replay store",
+        False,
+    ),
     "experiment.new": JobSpec("experiment.new", "Register an immutable arm from a recipe", False),
     # alpha-engine-config-I10927. The DERIVED sibling of `experiment.new`: it
     # registers every recipe the pinned release declares and the slot's
@@ -1046,6 +1054,7 @@ HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
     INTEGRATION_TEST_JOB: integration_test_handler,
     REVIEW_RECORD_JOB: review_record_handler,
     ACCEPTANCE_PUBLISH_JOB: acceptance_publish_handler,
+    REPLAY_JOB: handle_replay_full_universe,
 }
 
 
@@ -1315,6 +1324,15 @@ def build_parser() -> argparse.ArgumentParser:
                     "The reading `tests/acceptance/check_reading.py --write-json` just "
                     "wrote. Published as-is: this job records a measurement, it does not "
                     "take a second one."
+                ),
+            )
+        if spec.name == REPLAY_JOB:
+            sub.add_argument(
+                "--replay-store",
+                metavar="URI",
+                help=(
+                    "Store the full-universe compile writes into. Absent, "
+                    "$CRUCIBLE_REPLAY_STORE; neither set, or one overlapping --store, is refused."
                 ),
             )
         if spec.name == "migrate.history":

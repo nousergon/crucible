@@ -179,6 +179,33 @@ components:
     dispatch: null
     deadline: null
 
+  replay.full_universe:
+    description: >-
+      Compile one trading day's data.daily at FULL universe into a separate
+      replay store, and file this job's own manifest in the run store at the
+      key the promote soak gate's scale clause reads
+      (alpha-engine-config-I12519, S-31; delivery-policy ENV-SCALE-REPLAY).
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs,rows_in,rows_out
+      # A replay grades nothing itself; the soak gate reads its status.
+      outcome: null
+    log_location: cloudwatch:/crucible/replay.full_universe
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/runs
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    # On-demand, like data.heal: dispatched for a candidate digest before a
+    # promotion. A missing record refuses the promotion by name, which is
+    # what grades its absence.
+    schedule: null
+    dispatch: null
+    deadline: null
+
   holdout:
     description: >-
       Read the sealed holdout's seal state, or unseal it under a named human
