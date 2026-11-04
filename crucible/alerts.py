@@ -121,6 +121,11 @@ __all__ = [
     "PENDING_CONFIRMATION",
     "SUBSCRIBERS_METRIC",
     "SESSION_SERVED_METRIC",
+    "BACK_OFFICE_QUEUE_JOB",
+    "EXCEPTION_OVERDUE_METRIC",
+    "EXCEPTION_SCORE_METRIC",
+    "OVERDUE_LOOKBACK_TRADING_DAYS",
+    "TRADER_RECONCILE_JOB",
     "SHADOW_BOOKS_DEADLINE",
     "SHADOW_BOOKS_JOB",
     "SWEEP_JOB",
@@ -142,6 +147,7 @@ __all__ = [
     "evaluate_dispatch_absence",
     "evaluate_failure",
     "evaluate_held_session",
+    "evaluate_overdue_breaks",
     "evaluate_min_active_arms",
     "evaluate_shadow_books_absence",
     "group_pages",
@@ -2225,6 +2231,162 @@ def evaluate_held_session(
     return pages
 
 
+#: `alpha-engine-config-I13129`: the job whose manifest carries the back
+#: office's queue reading, the label its page goes out under, and the two
+#: metric rows that say whether a queue item is overdue. Stated here, not
+#: imported from `crucible_trader`, for the reason `TRADER_SESSION_JOB` gives.
+TRADER_RECONCILE_JOB = "trader.reconcile"
+#: NOT a runner job: a label, like :data:`SHADOW_BOOKS_JOB`. A page under
+#: `trader.reconcile` itself would share an incident with that job's FAILURE
+#: page on the same day, and "the broker disagrees" and "a person has not
+#: decided yet" are two different things to go and do.
+BACK_OFFICE_QUEUE_JOB = "trader.back_office_queue"
+#: The dedicated row (crucible-trader step 5e): FAIL while any queue item is
+#: older than the back office's age limit.
+EXCEPTION_OVERDUE_METRIC = "exception_queue_overdue"
+#: The row every trader release that files a score carries: WATCH exactly
+#: while an item is overdue (crucible-trader `file_exception_score`). Read
+#: only when the dedicated row is absent, so a trader PINNED before that row
+#: existed still pages.
+EXCEPTION_SCORE_METRIC = "exception_score_filed"
+#: How far back the sweep looks for the latest reading, and how far back it
+#: walks to find where an unbroken overdue streak began.
+OVERDUE_LOOKBACK_TRADING_DAYS = 20
+
+
+def _overdue_reading(manifest: Mapping[str, object]) -> tuple[bool, str] | None:
+    """``(overdue, status_reason)`` from a reconcile manifest, or None when it
+    records neither queue row (the score was not filed, or an older trader)."""
+    rows = manifest.get("metrics")
+    if not isinstance(rows, list):
+        return None
+    by_name: dict[str, dict[str, object]] = {}
+    for row in cast("list[object]", rows):
+        if isinstance(row, dict):
+            fields = cast("dict[str, object]", row)
+            by_name.setdefault(str(fields.get("name")), fields)
+    dedicated = by_name.get(EXCEPTION_OVERDUE_METRIC)
+    if dedicated is not None:
+        return dedicated.get("status") == "FAIL", str(dedicated.get("status_reason") or "")
+    score = by_name.get(EXCEPTION_SCORE_METRIC)
+    if score is not None and score.get("status") in ("OK", "WATCH"):
+        return score.get("status") == "WATCH", str(score.get("status_reason") or "")
+    return None
+
+
+def _latest_overdue_reading(
+    store: Store, trading_day: dt.date, access_faults: list[str] | None
+) -> tuple[bool, str, str, str | None] | None:
+    """The day's reading from its LATEST reconcile run that carries one, as
+    ``(overdue, reason, run_id, synthetic)``; None when no run of the day does.
+    Any manifest status counts: a reconcile that failed on the broker still
+    filed the queue it read, and that failure pages on its own."""
+    listed = read_manifests_under(
+        store, manifest_prefix(TRADER_RECONCILE_JOB, trading_day.isoformat())
+    )
+    if listed.listing_problem is not None:
+        if access_faults is None:
+            raise StoreAccessError(listed.listing_problem)
+        if listed.listing_problem not in access_faults:
+            access_faults.append(listed.listing_problem)
+        return None
+    best: tuple[bool, str, str, str | None] | None = None
+    for _key, manifest in listed.documents:
+        reading = _overdue_reading(manifest)
+        if reading is None:
+            continue
+        run_id = str(manifest.get("run_id") or _UNPARSEABLE_RUN_ID)
+        if best is None or run_id > best[2]:
+            best = (reading[0], reading[1], run_id, manifest_synthetic_marker(manifest))
+    return best
+
+
+def evaluate_overdue_breaks(
+    store: Store,
+    *,
+    now: dt.datetime | None = None,
+    registry: dict[str, Component] | None = None,
+    access_faults: list[str] | None = None,
+) -> list[Page]:
+    """`alpha-engine-config-I13129`: a back-office queue item older than the
+    age limit (3 trading days) pages.
+
+    `trader.reconcile` step 5e scores every stored exception proposal against
+    the reviewer's decisions and counts the undecided ones past the limit.
+    Before this, an overdue queue only made a metric row WATCH: the manifest
+    exists (no ABSENCE) and its status says nothing about the queue (no
+    FAILURE), so a break nobody decided aged in silence.
+
+    Reuses the FAILURE condition rather than adding a third (§4.6 admits
+    exactly two), as :func:`evaluate_held_session` does: a queue the back
+    office cannot clear inside its own limit is the back office failing at
+    the one thing it exists to do. It never reads or changes the reconcile
+    verdict.
+
+    **One incident per overdue streak, not one per day.** Only the latest
+    reading counts, and the page's trading day is the FIRST day of the
+    unbroken run of overdue readings ending there, like
+    :func:`evaluate_min_active_arms`. A standing backlog is one bus row and
+    one page against the two-a-month ceiling, re-observed by every sweep
+    until a decision clears it; a day with no reading is skipped, never a
+    break, because its absence is the reconcile's own ABSENCE page.
+    """
+    moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
+    reg = registry if registry is not None else load_registry()
+    component = reg.get(TRADER_RECONCILE_JOB)
+    if component is None or component.lifecycle != "ACTIVE":
+        return []
+    day = resolve_trading_day(moment)
+    faults_before = len(access_faults) if access_faults is not None else 0
+
+    def unlistable() -> bool:
+        # One fault ends the walk: what lies beyond an unread day is unknown,
+        # and twenty copies of the same denial would bury the one that matters.
+        return access_faults is not None and len(access_faults) > faults_before
+
+    latest: tuple[bool, str, str, str | None] | None = None
+    latest_day = day
+    for _ in range(OVERDUE_LOOKBACK_TRADING_DAYS):
+        latest = _latest_overdue_reading(store, day, access_faults)
+        if unlistable():
+            return []
+        if latest is not None:
+            latest_day = day
+            break
+        day = previous_trading_day(day)
+    if latest is None or not latest[0]:
+        return []
+    _, reason, run_id, synthetic = latest
+    anchor = latest_day
+    probe = previous_trading_day(anchor)
+    for _ in range(OVERDUE_LOOKBACK_TRADING_DAYS):
+        prior = _latest_overdue_reading(store, probe, access_faults)
+        if unlistable():
+            break
+        if prior is not None:
+            if not prior[0]:
+                break
+            anchor = probe
+        probe = previous_trading_day(probe)
+    return [
+        Page(
+            condition="failure",
+            job=BACK_OFFICE_QUEUE_JOB,
+            trading_day=anchor,
+            reason=(
+                f"back-office queue overdue: {reason or 'an item is past the age limit'} "
+                f"(latest reading {latest_day.isoformat()})\n"
+                "    Auto-fix: none. Nothing decides a break but the reviewer.\n"
+                "    Resolution: record agree or correct for each overdue item on the "
+                "back-office review page (a deferral keeps it queued), and confirm the next "
+                f"{TRADER_RECONCILE_JOB} manifest records {EXCEPTION_OVERDUE_METRIC} OK."
+            ),
+            run_id=run_id,
+            synthetic=synthetic,
+        )
+    ]
+
+
 #: `alpha-engine-config-I12353` gap 2: the subject an absent shadow book pages
 #: under. NOT a runner job and never a `components.yaml` row:
 #: `crucible_trader.shadow_books_daily` writes no manifest, which is exactly
@@ -3503,6 +3665,7 @@ def sweep(
         + evaluate_failure(store, now=moment, registry=registry, access_faults=access_faults)
         + evaluate_min_active_arms(store, now=moment, access_faults=access_faults)
         + evaluate_held_session(store, now=moment, registry=registry, access_faults=access_faults)
+        + evaluate_overdue_breaks(store, now=moment, registry=registry, access_faults=access_faults)
         + evaluate_shadow_books_absence(
             store, now=moment, registry=registry, access_faults=access_faults
         )
