@@ -262,10 +262,13 @@ def _resolve_expected_manifest(store: Store, args: argparse.Namespace) -> tuple[
 
     Rung 3 exists because rung 2 was measured to be a no-op on every live
     dispatch (`alpha-engine-config-I11050`, 2026-09-18): the box's bootstrap
-    ASSIGNS ``CRUCIBLE_STATE_DIR`` without exporting it, so
+    then ASSIGNED ``CRUCIBLE_STATE_DIR`` without exporting it, so
     `crucible.runner._record_expected_manifest_key` — which reads it out of
     the environment — returned early and wrote no breadcrumb, on every job.
-    A ladder whose only rung is one the substrate silently disables is not a
+    The export landed 2026-09-19 (nous-ergon-ops-PR1337,
+    `alpha-engine-config-I11080`) and rung 2 now answers on live dispatches;
+    rung 3 stays as defence in depth for a box on an older bootstrap. A
+    ladder whose only rung is one the substrate silently disables is not a
     ladder.
 
     **Rung 3 never ASSERTS a key.** A derived key that is not in the store is
