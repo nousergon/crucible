@@ -2890,11 +2890,15 @@ def _build_sessions(
     ``adv_by_day`` carries each session's `dollar_volume_20d_raw`, keyed by
     ticker (:func:`_read_session_adv`), and is joined onto ``SessionInputs.
     adv_usd`` — one entry per name in ``universe.tickers`` order, benchmark
-    and cash sentinels excluded (they are never in ``session.tickers`` to
-    begin with, so they are left NaN here, the same value
+    and cash sentinels excluded by index and left NaN, the same value
     `crucible.portfolio._clean_adv` already treats as "no coverage" and
-    additionally excludes both sentinels from by index — belt and suspenders,
-    not a second mechanism).
+    additionally excludes both sentinels from by index.
+
+    ``alpha_hat`` is the solver's convention, not the feed's scale
+    (`alpha-engine-config-I12121`): the benchmark entry is 0.0 even though the
+    M feed prices the benchmark ticker (it is in ``session.tickers``), and each
+    priced name enters as its excess over the mean of the names the session
+    priced. The recorded ``ResolvedSession`` keeps the feed's raw values.
     """
     n = len(universe.tickers)
     index = {ticker: i for i, ticker in enumerate(universe.tickers)}
@@ -2907,6 +2911,7 @@ def _build_sessions(
         caps = np.zeros(n)
         adv = np.full(n, np.nan)
         day_adv = adv_by_day.get(session.trading_day, {})
+        sentinels = (universe.benchmark_idx, universe.cash_idx)
         for ticker, a, e, c in zip(
             session.tickers,
             session.alpha_hat,
@@ -2915,7 +2920,26 @@ def _build_sessions(
             strict=True,
         ):
             i = index[ticker]
+            if i in sentinels:
+                # The M feed prices the benchmark ticker like any name, but the
+                # solver's convention is that the benchmark entry is 0.0, the
+                # null hypothesis (`solve_target_weights`). Copying the model's
+                # own forecast for it in made the benchmark a stock the model
+                # happened to dislike (alpha-engine-config-I12121).
+                continue
             alpha[i], eligible[i], caps[i] = a, e, c
+        # The solver reads alpha as DEVIATION from the benchmark, and an M arm
+        # predicts a raw forward return, whose level is the market's drift.
+        # Against a benchmark pinned at 0.0 that level is conviction nobody
+        # holds: every name looks better than the benchmark by the drift.
+        # So names enter as cross-sectional excess over the names this session
+        # priced, the same demeaned quantity every arm is graded on
+        # (`crucible.slots.model`). A shift, not a scale: ranks and dispersion
+        # are unchanged, and an all-zero (benched) session stays all zero
+        # (alpha-engine-config-I12121).
+        priced = [index[t] for t in session.tickers if index[t] not in sentinels]
+        if priced:
+            alpha[priced] -= alpha[priced].mean()
         # ADV is a property of the NAME on the day, read from the day's compiled
         # feature layer — not of whether the M champion priced it. A name in the
         # universe but not in this session (held from an earlier session, or
