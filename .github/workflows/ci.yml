@@ -180,7 +180,7 @@ jobs:
       - name: Every test_*/Test* is collectible by pytest (I10005)
         run: python3 .fleet/nousergon-lib/scripts/lint_test_shape.py .
 
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -451,7 +451,7 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -595,5 +595,5 @@ jobs:
     # was cancelled (superseded, or by a human), and never weaker than the
     # `failure()` arm this job already had.
     if: ${{ always() && github.event_name != 'pull_request' && (failure() || (contains(needs.*.result, 'cancelled') && !cancelled())) }}
-    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@f21194128d054106b389c9a07221234aaa2b351f
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@ddb5efc0dcc3e505cad18af5e2194fa21e2b71fa
     secrets: inherit
