@@ -174,6 +174,16 @@ class TestOpenStore:
     def test_a_path_resolves_to_the_local_backend(self, tmp_path) -> None:
         assert isinstance(open_store(str(tmp_path)), LocalStore)
 
+    def test_a_dry_run_never_creates_a_missing_local_store(self, tmp_path) -> None:
+        """codex c8efbe2e77190127: the weekly preflight's dry-run open made a
+        nonexistent --store directory. A dry run performs no write."""
+        missing = tmp_path / "no" / "such" / "store"
+        reader = open_store(str(missing), dry_run=True)
+        assert not missing.exists()
+        assert not reader.exists("champions/m.json")
+        open_store(str(missing))  # a real open still makes it
+        assert missing.is_dir()
+
     def test_no_store_and_no_env_refuses(self, monkeypatch) -> None:
         """There is deliberately no production-bucket fallback: a job that
         wrote to production because a flag was missing is noticed once."""
