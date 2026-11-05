@@ -628,6 +628,13 @@ class ArcticPriceSource(PriceSource):
                 missing, unlisted = _classify_absent_symbols(
                     absent, bounds, window_start=window_start, window_end=end
                 )
+                if missing and not self.library:
+                    retained, retained_unlisted = self._read_retained(
+                        missing, end=end, lookback_days=lookback_days
+                    )
+                    frames = {**frames, **retained}
+                    unlisted = sorted({*unlisted, *retained_unlisted})
+                    missing = [s for s in missing if s not in retained and s not in unlisted]
                 if missing:
                     raise MissingSourceError(
                         f"ArcticDB universe library on bucket {self.bucket!r} dropped "
@@ -641,6 +648,56 @@ class ArcticPriceSource(PriceSource):
         panel = normalize_panel(frames, end=end, lookback_days=lookback_days)
         panel.attrs["unlisted_in_window"] = unlisted
         return panel
+
+    def _read_retained(
+        self, symbols: list[str], *, end: dt.date, lookback_days: int
+    ) -> tuple[dict[str, pd.DataFrame], list[str]]:
+        """Requested names the data layer MOVED to the retention library.
+
+        2026-11-05: KVUE delisted after 2026-10-30 and the pruner moved its
+        history to the retention library, while the declared universe (the
+        weekly roster) still named it. The live read came back without it and
+        the whole compile failed as an outage, so no session was served. A
+        requested name whose history lives in retention is read from there;
+        one whose retained history lies wholly outside the window is
+        unlisted. Anything else, including a retention library that cannot
+        be opened or read, is left to the caller's outage error.
+        """
+        import pandas as pd  # pyright: ignore[reportMissingTypeStubs]
+        from nousergon_lib.arcticdb import (
+            _load_arctic_frames,  # pyright: ignore[reportUnknownVariableType, reportPrivateUsage]
+        )
+
+        try:
+            retention = self._retention_lib()
+            if retention is None:
+                return {}, []
+            held = [s for s in symbols if retention.has_symbol(s)]
+            if not held:
+                return {}, []
+            frames: dict[str, pd.DataFrame] = _load_arctic_frames(
+                retention,
+                held,
+                lookback_days=lookback_days,
+                end=str(end),
+                columns=None,
+                label="ArcticPriceSource.load_panel(retained)",
+            )
+            unlisted: list[str] = []
+            window_start = end - dt.timedelta(days=lookback_days)
+            for sym in held:
+                if sym in frames:
+                    continue
+                start_ts, end_ts = retention.get_description(sym).date_range
+                start, stop = pd.Timestamp(start_ts), pd.Timestamp(end_ts)
+                if not isinstance(start, pd.Timestamp) or not isinstance(stop, pd.Timestamp):
+                    continue  # NaT bounds: undecidable, left to the outage error
+                bounds = (start.date(), stop.date())
+                if not _overlaps_window(bounds, window_start=window_start, window_end=end):
+                    unlisted.append(sym)
+        except Exception:  # noqa: BLE001 - the caller's outage error still fires
+            return {}, []
+        return frames, unlisted
 
     def _retention_lib(self) -> Any:
         """The retention library, opened read-only (never created).
