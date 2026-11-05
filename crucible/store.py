@@ -492,9 +492,13 @@ class LocalStore(Store):
     tests the real contract.
     """
 
-    def __init__(self, root: Path | str) -> None:
+    def __init__(self, root: Path | str, *, create: bool = True) -> None:
         self.root = Path(root)
-        self.root.mkdir(parents=True, exist_ok=True)
+        # A dry run opens with ``create=False``: making the root is a write,
+        # and a dry run performs none (codex c8efbe2e77190127). A missing
+        # root then reads as an empty store.
+        if create:
+            self.root.mkdir(parents=True, exist_ok=True)
 
     def _assert_writable_key(self, key: str) -> None:
         """The same refusal :meth:`put_bytes` takes, reached without writing.
@@ -1458,5 +1462,5 @@ def open_store(uri: str | None, *, dry_run: bool = False) -> Store:
         bucket, _, prefix = rest.partition("/")
         store: Store = S3Store(bucket, prefix)
     else:
-        store = LocalStore(target)
+        store = LocalStore(target, create=not dry_run)
     return capturing(store) if dry_run else store
