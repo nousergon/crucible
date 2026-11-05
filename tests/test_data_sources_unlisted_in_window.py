@@ -218,3 +218,110 @@ class TestArcticPriceSourceClassification:
         source = ArcticPriceSource("test-bucket")
         with pytest.raises(MissingSourceError, match="dropped"):
             source.load_panel(end=cycle_date, lookback_days=400, symbols=requested)
+
+
+class _FakeRetention(_FakeLib):
+    """The retention library: bounds per symbol plus the frames a read returns."""
+
+    def __init__(self, bounds: dict[str, object], frames: dict[str, pd.DataFrame]) -> None:
+        super().__init__(bounds)
+        self.frames = frames
+
+
+class _FakeArctic:
+    def __init__(self, retention: object) -> None:
+        self._retention = retention
+
+    def get_library(self, name: str, **_: object) -> object:
+        if isinstance(self._retention, Exception):
+            raise self._retention
+        return self._retention
+
+
+class TestARequestedNameMovedToRetention:
+    """2026-11-05: KVUE delisted, the pruner moved its history to the retention
+    library, and the weekly roster still declared it. The compile failed as an
+    outage and no session was served."""
+
+    def _wire(self, monkeypatch, frames, retention: object, *, drop: str) -> None:
+        thinned = {t: f for t, f in frames.items() if t != drop}
+        monkeypatch.setattr("nousergon_lib.arcticdb.load_universe_ohlcv", lambda *a, **k: thinned)
+        monkeypatch.setattr(
+            "nousergon_lib.arcticdb.open_universe_lib", lambda bucket, region=None: _FakeLib({})
+        )
+        monkeypatch.setattr(
+            "nousergon_lib.arcticdb.open_arctic", lambda bucket, region=None: _FakeArctic(retention)
+        )
+        monkeypatch.setattr(
+            "nousergon_lib.arcticdb._load_arctic_frames",
+            lambda lib, symbols, **k: {s: lib.frames[s] for s in symbols if s in lib.frames},
+        )
+
+    def test_its_retained_history_is_read_into_the_panel(
+        self, frames, cycle_date, monkeypatch
+    ) -> None:
+        requested = sorted(frames)
+        gone = requested[0]
+        history = frames[gone].iloc[:-5]
+        retention = _FakeRetention({gone: (history.index[0], history.index[-1])}, {gone: history})
+        self._wire(monkeypatch, frames, retention, drop=gone)
+        panel = ArcticPriceSource("test-bucket").load_panel(
+            end=cycle_date, lookback_days=400, symbols=requested
+        )
+        assert gone in set(panel["ticker"])
+        assert panel.attrs["unlisted_in_window"] == []
+
+    def test_retained_history_wholly_before_the_window_is_unlisted(
+        self, frames, cycle_date, monkeypatch
+    ) -> None:
+        requested = sorted(frames)
+        gone = requested[0]
+        early = (cycle_date - dt.timedelta(days=900), cycle_date - dt.timedelta(days=800))
+        retention = _FakeRetention({gone: early}, {})
+        self._wire(monkeypatch, frames, retention, drop=gone)
+        panel = ArcticPriceSource("test-bucket").load_panel(
+            end=cycle_date, lookback_days=400, symbols=requested
+        )
+        assert panel.attrs["unlisted_in_window"] == [gone]
+
+    @pytest.mark.parametrize(
+        "retention",
+        [
+            _FakeRetention({}, {}),
+            RuntimeError("retention library open failed"),
+        ],
+        ids=["not-retained", "retention-unreadable"],
+    )
+    def test_anything_else_is_still_an_outage(
+        self, frames, cycle_date, monkeypatch, retention
+    ) -> None:
+        requested = sorted(frames)
+        gone = requested[0]
+        self._wire(monkeypatch, frames, retention, drop=gone)
+        with pytest.raises(MissingSourceError, match="dropped"):
+            ArcticPriceSource("test-bucket").load_panel(
+                end=cycle_date, lookback_days=400, symbols=requested
+            )
+
+    def test_retained_history_overlapping_the_window_that_reads_empty_is_an_outage(
+        self, frames, cycle_date, monkeypatch
+    ) -> None:
+        requested = sorted(frames)
+        gone = requested[0]
+        overlap = (cycle_date - dt.timedelta(days=30), cycle_date - dt.timedelta(days=5))
+        self._wire(monkeypatch, frames, _FakeRetention({gone: overlap}, {}), drop=gone)
+        with pytest.raises(MissingSourceError, match="dropped"):
+            ArcticPriceSource("test-bucket").load_panel(
+                end=cycle_date, lookback_days=400, symbols=requested
+            )
+
+    def test_unresolvable_retained_bounds_are_an_outage(
+        self, frames, cycle_date, monkeypatch
+    ) -> None:
+        requested = sorted(frames)
+        gone = requested[0]
+        self._wire(monkeypatch, frames, _FakeRetention({gone: (pd.NaT, pd.NaT)}, {}), drop=gone)
+        with pytest.raises(MissingSourceError, match="dropped"):
+            ArcticPriceSource("test-bucket").load_panel(
+                end=cycle_date, lookback_days=400, symbols=requested
+            )
