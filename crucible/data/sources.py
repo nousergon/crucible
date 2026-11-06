@@ -602,13 +602,18 @@ class ArcticPriceSource(PriceSource):
                 f"read for the window ending {end}: {type(exc).__name__}: {exc}"
             ) from exc
 
-        if not frames:
-            raise MissingSourceError(
-                f"ArcticDB {self._library_label()} on bucket {self.bucket!r} returned zero "
-                f"symbols for the window ending {end}. The batch read drops per-ticker "
-                "read failures at WARNING and returns what it got, so an empty result is "
-                "an outage or a wrong bucket/library, not an empty market."
-            )
+        empty = MissingSourceError(
+            f"ArcticDB {self._library_label()} on bucket {self.bucket!r} returned zero "
+            f"symbols for the window ending {end}. The batch read drops per-ticker "
+            "read failures at WARNING and returns what it got, so an empty result is "
+            "an outage or a wrong bucket/library, not an empty market."
+        )
+        # An empty live read of NAMED symbols on the universe library goes
+        # through the absent-symbol resolution below first: every requested
+        # name may have moved to the retention library (Codex finding
+        # ca476f1e). The empty refusal still holds once that recovery is done.
+        if not frames and (symbols is None or self.library):
+            raise empty
         unlisted: list[str] = []
         if symbols is not None:
             # `load_universe_ohlcv` "drops per-ticker read failures at WARNING and
@@ -645,6 +650,8 @@ class ArcticPriceSource(PriceSource):
                         "bias introduced by the source — a partial outage must fail the "
                         "run, not thin the panel."
                     )
+        if not frames:
+            raise empty
         panel = normalize_panel(frames, end=end, lookback_days=lookback_days)
         panel.attrs["unlisted_in_window"] = unlisted
         return panel

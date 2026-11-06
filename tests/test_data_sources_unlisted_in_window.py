@@ -325,3 +325,17 @@ class TestARequestedNameMovedToRetention:
             ArcticPriceSource("test-bucket").load_panel(
                 end=cycle_date, lookback_days=400, symbols=requested
             )
+
+    def test_an_empty_live_read_of_names_all_moved_to_retention_is_recovered(
+        self, frames, cycle_date, monkeypatch
+    ) -> None:
+        """Codex finding ca476f1e: the empty-result refusal runs only after the
+        retention recovery, so a request whose every name moved there is read."""
+        gone = sorted(frames)[0]
+        history = frames[gone].iloc[:-5]
+        retention = _FakeRetention({gone: (history.index[0], history.index[-1])}, {gone: history})
+        self._wire(monkeypatch, {gone: frames[gone]}, retention, drop=gone)
+        panel = ArcticPriceSource("test-bucket").load_panel(
+            end=cycle_date, lookback_days=400, symbols=[gone]
+        )
+        assert set(panel["ticker"]) == {gone}

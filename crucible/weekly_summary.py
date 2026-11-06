@@ -149,12 +149,24 @@ def _stage_row(key: str, manifest: Doc) -> dict[str, object]:
     }
 
 
-def _failed_row(key: str, manifest: Doc | None) -> dict[str, object]:
-    """The failed stage's row: its own manifest when that manifest says it
-    failed, otherwise the key alone marked failed. A manifest that reads
-    anything else at this key is an earlier run's, never this failure's."""
-    if manifest is not None and manifest.get("status") == STAGE_FAILED:
-        return _stage_row(key, manifest)
+def _this_arcs_failure(manifest: Doc | None, arc_started: str) -> bool:
+    """Whether ``manifest`` is the failed stage's record from THIS arc: it
+    says `failed` and started no earlier than the arc did. A `failed`
+    manifest that started before the arc is an earlier attempt's, left at the
+    key when this attempt failed before writing its own; its row and its
+    spend are that attempt's, never this one's."""
+    if manifest is None or manifest.get("status") != STAGE_FAILED:
+        return False
+    started, arc = _ts(manifest.get("started")), _ts(arc_started)
+    return started is not None and arc is not None and started >= arc
+
+
+def _failed_row(key: str, manifest: Doc | None, arc_started: str) -> dict[str, object]:
+    """The failed stage's row: its own manifest when that manifest is this
+    arc's failure, otherwise the key alone marked failed. A manifest that
+    reads anything else at this key is an earlier run's, never this failure's."""
+    if _this_arcs_failure(manifest, arc_started):
+        return _stage_row(key, cast("Doc", manifest))
     return {**_stage_row(key, {}), "status": STAGE_FAILED}
 
 
@@ -259,11 +271,11 @@ def build_summary(
     failed_label: str | None = None
     if failed_stage is not None:
         failed_key, failed_doc = failed_stage
-        failed_row = _failed_row(failed_key, failed_doc)
+        failed_row = _failed_row(failed_key, failed_doc, arc_started)
         rows.append(failed_row)
         slot = failed_row["slot"]
         failed_label = f"{failed_row['job']}[{slot}]" if slot else str(failed_row["job"])
-        if failed_doc is not None and failed_doc.get("status") == STAGE_FAILED:
+        if failed_doc is not None and _this_arcs_failure(failed_doc, arc_started):
             stage_list.append((failed_key, failed_doc))
     rows.extend(_not_run_row(k) for k in not_run)
     first: Doc = stage_list[0][1] if stage_list else {}
