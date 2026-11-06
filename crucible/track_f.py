@@ -35,6 +35,7 @@ import json
 import os
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 from typing import Any, cast
 
@@ -55,6 +56,7 @@ from crucible.gate import (
     LADDER_SCHEMA_VERSION,
     PHASES,
     TRACKER_REPO,
+    GateResult,
     Phase,
     build_ladder,
     closing_reading,
@@ -85,6 +87,7 @@ from crucible.weekly_summary import encode as encode_summary
 
 __all__ = [
     "CLOSE_OUTCOMES",
+    "EVERY_GATE_MEASUREMENT_FAILED_EXIT",
     "GATE_CLOSE_JOB",
     "closing_record_line",
     "file_closing_record",
@@ -532,6 +535,98 @@ def gate_handler(args: argparse.Namespace) -> int:
     reason so the refusal names this command rather than a flag nobody
     passed), and `run_job(write_manifest=False)` suppresses the manifest.
     With `--publish` every one of the three writes happens exactly as before.
+
+    **`--every-gate` reads every registered gate in ONE process**
+    (`alpha-engine-config-I12793`). See :func:`_every_gate`.
+    """
+    if getattr(args, "every_gate", False):
+        return _every_gate(args)
+    return _read_gate(args, readings=None)
+
+
+#: `crucible gate --every-gate`'s exit code when at least one gate could not be
+#: MEASURED (its job raised). Distinct from 1, which is the ordinary "a gate
+#: read UNMET", and from the CLI's usage-error 2, so the scheduled publisher can
+#: tell a working producer reporting an unmet phase from a reading that never
+#: happened.
+EVERY_GATE_MEASUREMENT_FAILED_EXIT = 3
+
+
+def _every_gate(args: argparse.Namespace) -> int:
+    """`crucible gate --every-gate`: read and report every registered gate once.
+
+    `alpha-engine-config-I12793`. `gate-close.yml`'s publish job used to spawn
+    one `crucible gate --gate <phase>` PROCESS per registered gate, and each of
+    those re-evaluated every OTHER gate to build the ladder it republishes -- so
+    six gates cost thirty-six full gate evaluations. One ladder (six
+    evaluations) measured 4,202 sequential S3 API calls on 2026-11-06, 88% of
+    its wall time, from a runner outside AWS. The S3 read cache
+    (`alpha-engine-config-I11792`) removed the repeated BODIES but not the
+    requests, so the job's wall time tracked the runner's round-trip time to
+    the store times 36: 9-12 minutes on 2026-11-04/05, and past the 30-minute
+    timeout on 2026-11-06 at ~6.8 minutes per process.
+
+    Here every gate is evaluated ONCE and each reading is handed to every
+    later ladder in the same process, so the job does six evaluations, the
+    same number `crucible gate.close` does. Each gate still runs as its own
+    `run_job` with its own reading, ladder and manifest, exactly as the
+    one-gate form does.
+
+    A gate whose reading RAISES does not stop the others: its traceback is
+    printed, the remaining gates are still read and published, and the process
+    exits :data:`EVERY_GATE_MEASUREMENT_FAILED_EXIT` naming it. Otherwise it
+    exits 1 if any gate read UNMET (the ordinary case) and 0 if every gate is
+    MET. An empty gate registry is refused rather than read as a clean pass
+    over nothing.
+    """
+    gates = gate_names()
+    if not gates:
+        print(
+            "crucible.gate.GATES is empty, so --every-gate would publish nothing and exit "
+            "0 -- which is indistinguishable from a healthy run. Refusing.",
+            file=sys.stderr,
+        )
+        return EVERY_GATE_MEASUREMENT_FAILED_EXIT
+    print(f"reading every registered gate: {' '.join(gates)}", flush=True)
+    readings: dict[tuple[str, dt.date], GateResult] = {}
+    unmet: list[str] = []
+    failed: list[str] = []
+    for name in gates:
+        one = argparse.Namespace(**vars(args))
+        one.gate = name
+        one.every_gate = False
+        try:
+            code = _read_gate(one, readings=readings)
+        except Exception:  # noqa: BLE001 - reported below; the other gates still publish
+            traceback.print_exc()
+            print(
+                f"crucible gate --gate {name}: the reading raised (traceback above)",
+                file=sys.stderr,
+            )
+            failed.append(name)
+            continue
+        sys.stdout.flush()
+        if code != 0:
+            unmet.append(name)
+    if failed:
+        print(f"gates that could not be measured: {' '.join(failed)}", file=sys.stderr)
+        return EVERY_GATE_MEASUREMENT_FAILED_EXIT
+    return 1 if unmet else 0
+
+
+def _read_gate(
+    args: argparse.Namespace,
+    *,
+    readings: dict[tuple[str, dt.date], GateResult] | None,
+) -> int:
+    """One gate's reading, ladder and manifest -- :func:`gate_handler`'s body.
+
+    ``readings`` is :func:`_every_gate`'s per-process memo, keyed by gate and
+    trading day: a gate already evaluated this process is not evaluated again,
+    and the ladder is built from the memo rather than re-reading every other
+    gate. ``None`` (the one-gate form) keeps the behaviour this command has
+    always had. A ``--weeks`` override is never memoised: it is a different
+    window, so a different reading.
     """
     dry_run = bool(getattr(args, "dry_run", False))
     publish = bool(getattr(args, "publish", False)) and not dry_run
@@ -552,9 +647,13 @@ def gate_handler(args: argparse.Namespace) -> int:
     result: dict[str, Any] = {}
 
     def body(ctx: RunContext) -> None:
-        reading = evaluate(
-            store, gate=args.gate, trading_day=ctx.trading_day, weeks=getattr(args, "weeks", None)
-        )
+        weeks = getattr(args, "weeks", None)
+        memo = readings if weeks is None else None
+        reading = memo.get((args.gate, ctx.trading_day)) if memo is not None else None
+        if reading is None:
+            reading = evaluate(store, gate=args.gate, trading_day=ctx.trading_day, weeks=weeks)
+            if memo is not None:
+                memo[(args.gate, ctx.trading_day)] = reading
         result["reading"] = reading
         document = reading.to_dict()
         document["run_id"] = ctx.run_id
@@ -594,11 +693,22 @@ def gate_handler(args: argparse.Namespace) -> int:
         # rather than by a second command because a surface refreshed by a
         # step somebody has to remember is the defect one layer along; the
         # weekly `console` arc stage republishes it on a cadence as well.
+        supplied: dict[str, GateResult] = {reading.gate: reading}
+        if memo is not None:
+            # alpha-engine-config-I12793: every gate is evaluated once per
+            # process and handed to every ladder after it, rather than each
+            # ladder re-reading the five gates it was not asked about.
+            for other in gate_names():
+                if (other, ctx.trading_day) not in memo:
+                    memo[(other, ctx.trading_day)] = evaluate(
+                        store, gate=other, trading_day=ctx.trading_day
+                    )
+                supplied.setdefault(other, memo[(other, ctx.trading_day)])
         ladder = build_ladder(
             store,
             trading_day=ctx.trading_day,
             now=ctx.started,
-            readings={reading.gate: reading},
+            readings=supplied,
         )
         if publish:
             ctx.record_output(
