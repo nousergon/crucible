@@ -31,6 +31,7 @@ import yaml
 
 from crucible.keys import strategy_slot_key
 from crucible.portfolio import (
+    _ROLLOUT_ABSENT,  # pyright: ignore[reportPrivateUsage]
     COST_MODEL_KINDS,
     COST_MODELS,
     PORTFOLIO_EVIDENCE_SCHEMA_VERSION,
@@ -79,6 +80,8 @@ FIXTURE_PARAMS: dict = {
     "conviction_ir_full": 0.75,
     "conviction_budget_min_multiple": 0.05,
     "conviction_gate_min_names": 3,
+    "max_position_pct": None,
+    "ineligible_held_exit": "forced",
     "book_notional_usd": 1_000_000.0,
 }
 
@@ -251,7 +254,7 @@ class TestTheParametersAreRequiredAndPrivate:
         with pytest.raises(PortfolioParamsError, match="carrying a 'portfolio' block"):
             load_portfolio_params(path)
 
-    @pytest.mark.parametrize("dropped", sorted(PORTFOLIO_PARAM_FIELDS))
+    @pytest.mark.parametrize("dropped", sorted(set(PORTFOLIO_PARAM_FIELDS) - set(_ROLLOUT_ABSENT)))
     def test_every_field_is_required_individually(self, dropped: str) -> None:
         payload = {k: v for k, v in FIXTURE_PARAMS.items() if k != dropped}
         with pytest.raises(PortfolioParamsError, match=dropped):

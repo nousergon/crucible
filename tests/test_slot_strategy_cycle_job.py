@@ -1715,6 +1715,8 @@ portfolio:
   conviction_ir_full: 0.75
   conviction_budget_min_multiple: 0.05
   conviction_gate_min_names: 3
+  max_position_pct: null
+  ineligible_held_exit: forced
   book_notional_usd: 1000000.0
 """
 
