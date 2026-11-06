@@ -108,6 +108,46 @@ def test_a_failed_compile_files_a_failed_record_the_gate_reads_as_red(
     assert "exited 1" in rec["reason"]
 
 
+def test_a_compile_that_raises_files_a_failed_record_over_an_earlier_ok(
+    stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex finding 85ceac0e: `cli.main` re-raises a job's exception, so a
+    compile that raises must still file this digest's `failed` record rather
+    than leave an earlier `ok` one for the day standing."""
+    run, replay = stores
+    real = cli.main
+    ok, _ = _fake_compile()
+    assert _replay(run, replay, monkeypatch, ok) == 0
+    monkeypatch.setattr(cli, "main", real)  # `_replay` left the fake installed
+
+    def raising(argv: Sequence[str]) -> int:
+        raise RuntimeError("compile broke")
+
+    with pytest.raises(RuntimeError, match="compile broke"):
+        _replay(run, replay, monkeypatch, raising)
+    rec = json.loads((run / GATE_KEY).read_text())
+    assert rec["status"] == "failed"
+    assert "compile broke" in rec["reason"]
+
+
+def test_an_inner_record_bound_to_another_release_is_not_this_replays_evidence(
+    stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex finding e1fd6859: a same-day compile for another release that
+    replaced the inner record is never read as this replay's evidence."""
+    run, replay = stores
+    inner, _ = _fake_compile()
+
+    def swapped(argv: Sequence[str]) -> int:
+        with monkeypatch.context() as m:
+            m.setenv(RELEASE_MANIFEST_ENV, "cd" * 32)
+            return inner(argv)
+
+    with pytest.raises(RuntimeError, match="another compile replaced it"):
+        _replay(run, replay, monkeypatch, swapped)
+    assert json.loads((run / GATE_KEY).read_text())["status"] == "failed"
+
+
 def test_the_env_var_supplies_the_replay_store(
     stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:

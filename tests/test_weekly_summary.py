@@ -175,6 +175,18 @@ class TestFailedArc:
         assert row["status"] == STAGE_FAILED and row["started"] is None
         assert s["llm_cost_usd"] == 0.25
 
+    def test_an_earlier_attempts_failed_manifest_is_not_this_arcs_work(self):
+        # Codex finding be9a8fb258ca73ed: a `failed` manifest left at the key
+        # by an attempt that started before this arc is that attempt's row
+        # and spend, never this arc's.
+        stale = {"status": "failed", "started": "2026-10-31T09:00:00Z", "cost_usd": 9.0}
+        s = summary(
+            arc_status=ARC_FAILED, arc_reason="x", failed_stage=(FAILED_KEY, stale), not_run=()
+        )
+        row = s["stages"][-1]
+        assert row["status"] == STAGE_FAILED and row["started"] is None
+        assert s["llm_cost_usd"] == 0.25
+
     def test_a_refusal_before_stage_one_marks_every_stage_not_run(self):
         s = summary(stages=[], arc_status=ARC_FAILED, arc_reason="refused", not_run=NOT_RUN)
         assert s["arc"]["failed_stage"] is None and s["arc"]["stages_completed"] == 0

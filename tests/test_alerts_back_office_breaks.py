@@ -33,6 +33,7 @@ from crucible.alerts import (
     evaluate_back_office_breaks,
     sweep,
 )
+from crucible.calendar import previous_trading_day
 from crucible.components import load_registry
 from crucible.manifest import manifest_key
 from crucible.store import LocalStore
@@ -205,6 +206,22 @@ class TestEvaluateOverdueBreaks:
         (page,) = evaluate_back_office_breaks(store, now=SATURDAY_NIGHT)
         assert page.trading_day == WEDNESDAY
         assert "latest reading 2026-08-28" in page.reason
+
+    def test_a_streak_longer_than_the_lookback_keeps_its_first_day(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """Codex finding 1f3925eff99ee3cb: the anchor of a streak longer than
+        the lookback never slides, so the incident keeps one identity."""
+        store = LocalStore(tmp_path)
+        day = FRIDAY
+        days = []
+        for _ in range(OVERDUE_LOOKBACK_TRADING_DAYS + 5):
+            days.append(day)
+            day = previous_trading_day(day)
+        for d in days:
+            _write(store, d, _overdue())
+        (page,) = evaluate_back_office_breaks(store, now=SATURDAY_NIGHT)
+        assert page.trading_day == days[-1]
 
     def test_a_reading_older_than_the_lookback_is_not_read(self, tmp_path: pathlib.Path) -> None:
         store = LocalStore(tmp_path)

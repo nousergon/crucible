@@ -118,7 +118,7 @@ def handle_replay_full_universe(
     """`crucible replay.full_universe [--date D] [--replay-store URI]`."""
     from crucible.config import settings as resolve_settings  # noqa: PLC0415
     from crucible.config import store_from_uri  # noqa: PLC0415
-    from crucible.documents import load_store_document  # noqa: PLC0415
+    from crucible.documents import load_document_bytes  # noqa: PLC0415
 
     if main is None:
         from crucible.cli import main as cli_main  # noqa: PLC0415 - cli imports this module
@@ -144,11 +144,24 @@ def handle_replay_full_universe(
         argv.append("--dry-run")
 
     # The compile runs BEFORE this job's own `run_job`, not inside it, so two
-    # manifests are never open in one process at once. A compile that dies
-    # without returning leaves no record here, which the gate reads as missing.
-    code = main(argv)
+    # manifests are never open in one process at once. A compile that RAISES
+    # (cli.main re-raises a job's exception) is caught and re-raised inside
+    # the body below, so it files a `failed` record at this digest's key
+    # rather than leaving an earlier `ok` record for the day standing (Codex
+    # finding 85ceac0e). Only a process that dies outright leaves no record.
+    compile_error: Exception | None = None
+    code: int | None = None
+    try:
+        code = main(argv)
+    except Exception as exc:  # noqa: BLE001 - recorded as this job's failure below
+        compile_error = exc
 
     def body(ctx: RunContext) -> None:
+        if compile_error is not None:
+            raise ReplayFailedError(
+                f"full-universe {INNER_JOB} for {day} raised in {replay_uri}: "
+                f"{type(compile_error).__name__}: {compile_error}"
+            ) from compile_error
         if code != 0:
             raise ReplayFailedError(
                 f"full-universe {INNER_JOB} for {day} exited {code} in {replay_uri}; "
@@ -158,12 +171,22 @@ def handle_replay_full_universe(
             return
         key = manifest_key(INNER_JOB, day)
         replay_store = store_from_uri(replay_uri)
-        inner = load_store_document(replay_store, key)
-        raw = replay_store.get_bytes(key)  # hashed for the lineage row; parsed above
+        # ONE read: the bytes checked are the bytes hashed into the lineage
+        # row, never a second read a concurrent same-day replay into this
+        # store could have swapped in between (Codex finding e1fd6859). The
+        # record must also be bound to THIS release: a same-day compile for
+        # another release that overwrote it is that release's evidence.
+        raw = replay_store.get_bytes(key)
+        inner = load_document_bytes(key, raw)
         if inner.get("status") != "ok":
             raise ReplayFailedError(
                 f"{replay_uri}/{key} reads status {inner.get('status')!r} "
                 f"({inner.get('reason')!r}), not ok"
+            )
+        if inner.get("release_manifest") != digest:
+            raise ReplayFailedError(
+                f"{replay_uri}/{key} is bound to release {inner.get('release_manifest')!r}, "
+                f"not this replay's {digest!r}: another compile replaced it"
             )
         # The inner manifest is the evidence; its key is relative to the replay
         # store printed below, never to this record's own store.

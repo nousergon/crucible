@@ -31,6 +31,7 @@ from crucible.alerts import (
 )
 from crucible.components import load_registry
 from crucible.manifest import manifest_key
+from crucible.runmode import RUN_MODE_REPLAY
 from crucible.store import LocalStore
 
 FRIDAY = dt.date(2026, 8, 28)
@@ -68,6 +69,7 @@ def _write_session(
     reason: str = "",
     run_id: str = "01JG0000000000000000000HLD",
     discriminator: str | None = None,
+    run_mode: str | None = None,
 ) -> None:
     payload = {
         "schema_version": "run_manifest.v2",
@@ -83,6 +85,8 @@ def _write_session(
     }
     if discriminator is not None:
         payload["discriminator"] = discriminator
+    if run_mode is not None:
+        payload["run_mode"] = run_mode
     store.put_bytes(
         manifest_key(TRADER_SESSION_JOB, FRIDAY.isoformat(), discriminator=discriminator),
         json.dumps(payload).encode(),
@@ -136,6 +140,28 @@ class TestEvaluateHeldSession:
             run_id="01JG0000000000000000000HLB",
         )
         assert evaluate_held_session(store, now=SATURDAY_NIGHT) == []
+
+    def test_a_served_replay_does_not_clear_a_held_production_session(self, tmp_path) -> None:
+        """Codex finding 85448a6184b9fea4: synthetic and production sessions
+        are judged apart, so a served replay neither suppresses the held
+        production day nor lends that page its synthetic marker."""
+        store = LocalStore(tmp_path)
+        _write_session(
+            store,
+            metrics=[_served_metric(0.0, HOLD_REASON)],
+            discriminator="a",
+            run_id="01JG0000000000000000000HLA",
+        )
+        _write_session(
+            store,
+            metrics=[_served_metric(1.0, "replay session on m:x")],
+            discriminator="b",
+            run_id="01JG0000000000000000000HLB",
+            run_mode=RUN_MODE_REPLAY,
+        )
+        (page,) = evaluate_held_session(store, now=SATURDAY_NIGHT)
+        assert page.run_id == "01JG0000000000000000000HLA"
+        assert page.synthetic is None
 
     def test_an_ok_session_that_does_not_say_whether_it_served_pages(self, tmp_path) -> None:
         """Fail loud: every `ok` path in the trader records the metric, so its

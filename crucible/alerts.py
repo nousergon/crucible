@@ -2192,14 +2192,19 @@ def evaluate_held_session(
             if access_faults is None:
                 raise StoreAccessError(listed.listing_problem)
             continue
-        served = False
-        unserved: list[tuple[str, str | None, str]] = []
+        # Keyed by synthetic marker (None = production), so a synthetic
+        # replay's served session never clears a held production day and a
+        # production page never carries a synthetic marker (Codex finding
+        # 85448a6184b9fea4): each population is judged on its own manifests.
+        served: set[str | None] = set()
+        unserved: dict[str | None, list[tuple[str, str]]] = {}
         for _key, manifest in listed.documents:
             if manifest.get("status") != "ok":
                 continue
+            marker = manifest_synthetic_marker(manifest)
             reading = _session_served(manifest)
             if reading is not None and reading[0]:
-                served = True
+                served.add(marker)
                 continue
             why = (
                 f"the ok manifest records no {SESSION_SERVED_METRIC} metric"
@@ -2207,28 +2212,29 @@ def evaluate_held_session(
                 else reading[1]
             )
             run_id = str(manifest.get("run_id") or _UNPARSEABLE_RUN_ID)
-            unserved.append((run_id, manifest_synthetic_marker(manifest), why))
-        if served or not unserved:
-            continue
-        run_id, synthetic, why = unserved[-1]
-        pages.append(
-            Page(
-                condition="failure",
-                job=TRADER_SESSION_JOB,
-                trading_day=trading_day,
-                reason=(
-                    f"session not served ({SESSION_SERVED_METRIC}=0): {why}\n"
-                    "    Auto-fix: none. The next scheduled session (10:45 ET, next "
-                    "trading day) re-resolves the contract, but nothing re-serves "
-                    "this day.\n"
-                    "    Resolution: publish what the hold names (champion pointer, "
-                    "feed or construction input) and confirm the next trader.session "
-                    f"manifest records {SESSION_SERVED_METRIC}=1."
-                ),
-                run_id=run_id,
-                synthetic=synthetic,
+            unserved.setdefault(marker, []).append((run_id, why))
+        for synthetic, held in unserved.items():
+            if synthetic in served:
+                continue
+            run_id, why = held[-1]
+            pages.append(
+                Page(
+                    condition="failure",
+                    job=TRADER_SESSION_JOB,
+                    trading_day=trading_day,
+                    reason=(
+                        f"session not served ({SESSION_SERVED_METRIC}=0): {why}\n"
+                        "    Auto-fix: none. The next scheduled session (10:45 ET, next "
+                        "trading day) re-resolves the contract, but nothing re-serves "
+                        "this day.\n"
+                        "    Resolution: publish what the hold names (champion pointer, "
+                        "feed or construction input) and confirm the next trader.session "
+                        f"manifest records {SESSION_SERVED_METRIC}=1."
+                    ),
+                    run_id=run_id,
+                    synthetic=synthetic,
+                )
             )
-        )
     return pages
 
 
@@ -2262,8 +2268,8 @@ BACK_OFFICE_FAIL_METRICS: tuple[str, ...] = (
     "ledger_book_of_record",
     "month_rebuild",
 )
-#: How far back the sweep looks for the latest reading, and how far back it
-#: walks to find where an unbroken failing streak began.
+#: How far back the sweep looks for the latest reading, and the longest run of
+#: days with no reading the walk back to a failing streak's first day crosses.
 OVERDUE_LOOKBACK_TRADING_DAYS = 20
 
 
@@ -2385,14 +2391,24 @@ def evaluate_back_office_breaks(
     _, reason, run_id, synthetic = latest
     anchor = latest_day
     probe = previous_trading_day(anchor)
-    for _ in range(OVERDUE_LOOKBACK_TRADING_DAYS):
+    # The bound is on a GAP of days with no reading, never on the streak's
+    # length: a streak longer than the bound would otherwise re-anchor one day
+    # later on every sweep and re-key its incident (Codex finding
+    # 1f3925eff99ee3cb). Every failing reading resets the gap, so the walk
+    # follows an unbroken streak to its first day, and it still ends once the
+    # store holds no reading for the bound's span (before the first reading).
+    gap = 0
+    while gap < OVERDUE_LOOKBACK_TRADING_DAYS:
         prior = _latest_overdue_reading(store, probe, access_faults)
         if unlistable():
             break
-        if prior is not None:
+        if prior is None:
+            gap += 1
+        else:
             if not prior[0]:
                 break
             anchor = probe
+            gap = 0
         probe = previous_trading_day(probe)
     return [
         Page(
