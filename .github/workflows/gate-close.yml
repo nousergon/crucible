@@ -287,47 +287,46 @@ jobs:
           case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}. If the role does not exist yet the crucible-v2 stack has not been applied since the nous-ergon-ops PR for alpha-engine-config-I10508 merged. That apply is OPERATOR-GATED as a security boundary, not automated: run bash scripts/apply_crucible_v2_stack.sh from a nous-ergon-ops checkout on main, then re-run this workflow. This job staying red until that happens is the detector, per pull-request-policy 4.2 form 3."; exit 1 ;; esac
 
       # The gate list is DERIVED from `crucible.gate.GATES`, never restated in
-      # YAML. A hardcoded list here is a registry copied at a call site, which
-      # is the contract-drift shape this repository has paid for more than
-      # once: a seventh phase would be added to the code and silently never
-      # published, and the artifact for it would simply not exist -- absence
-      # that nothing distinguishes from "not due yet".
+      # YAML: `--every-gate` reads it in the CLI. A hardcoded list here is a
+      # registry copied at a call site, which is the contract-drift shape this
+      # repository has paid for more than once: a seventh phase would be added
+      # to the code and silently never published, and the artifact for it
+      # would simply not exist -- absence that nothing distinguishes from "not
+      # due yet". An empty registry is refused by the CLI, never read as a
+      # clean pass over nothing.
+      #
+      # ONE process, not one per gate (alpha-engine-config-I12793). Every
+      # `crucible gate --gate <phase>` rebuilds the ladder, which re-evaluates
+      # every OTHER gate, so the old per-gate loop cost six gates x six
+      # evaluations = 36 gate readings; one ladder measured 4,202 sequential
+      # S3 calls on 2026-11-06 (88% of its wall time). Its wall time tracked the runner's
+      # round-trip time to S3: 9-12 minutes on 2026-11-04/05, and cancelled at
+      # this job's 30-minute timeout on 2026-11-06 at ~6.8 minutes per
+      # process. `--every-gate` evaluates each gate once and hands the readings
+      # to every ladder, the same six evaluations `gate.close` makes; each gate
+      # still gets its own dated reading, ladder and manifest.
       #
       # `--run-mode live`: a scheduled run is a live run, and
       # `run_manifest.v2` requires the field with no default. Unlike
       # `gate.close` nothing here branches on it, but a reading published
       # under the wrong mode would misdescribe itself on the artifact.
       #
-      # `set -euo pipefail` and no `|| true`: a gate that cannot be read is a
-      # failure of this job, not a gate to skip past. `crucible gate` exits
-      # non-zero when the gate is UNMET, which is the ordinary case on almost
-      # every day -- so the loop records each exit and fails only on a
-      # MEASUREMENT failure, which is exit code 2 or above from the CLI's
-      # own error path, never the 1 an unmet gate returns.
+      # No `|| true`: a gate that cannot be read is a failure of this job, not
+      # a gate to skip past. `crucible gate` exits 1 when a gate is UNMET,
+      # which is the ordinary case on almost every day, so the step fails only
+      # on a MEASUREMENT failure: exit 2 (usage) or 3 (a gate's reading raised;
+      # the CLI still reads and publishes every other gate first and names the
+      # one that failed).
       - name: Publish every registered gate's dated reading and the ladder
         run: |
           set -uo pipefail
-          gates="$(uv run python -c 'import crucible.gate as g; print(" ".join(sorted(g.GATES)))')"
           # The runner's default shell is `bash -e`, and `set -uo pipefail`
-          # does not clear `-e`. Each gate read below is therefore written
-          # `cmd && status=0 || status=$?` so an UNMET gate (exit 1, the
-          # ordinary case on almost every day) does not abort the loop and
-          # leave the remaining five gates unpublished.
-          if [ -z "${gates}" ]; then
-            echo "::error::crucible.gate.GATES is empty, so this job would publish nothing and exit 0 -- which is indistinguishable from a healthy run. Refusing."
-            exit 1
-          fi
-          echo "publishing: ${gates}"
-          failed=""
-          for gate in ${gates}; do
-            uv run crucible gate --gate "${gate}" --run-mode live --publish --store "$STORE_URI" && status=0 || status=$?
-            if [ "${status}" -gt 1 ]; then
-              echo "::error::crucible gate --gate ${gate} --publish failed to MEASURE (exit ${status}); its reading was not published"
-              failed="${failed} ${gate}"
-            fi
-          done
-          if [ -n "${failed}" ]; then
-            echo "::error::gates that could not be published:${failed}"
+          # does not clear `-e`, so the read is written
+          # `cmd && status=0 || status=$?`: an UNMET gate (exit 1) is not a
+          # failed job.
+          uv run crucible gate --every-gate --run-mode live --publish --store "$STORE_URI" && status=0 || status=$?
+          if [ "${status}" -gt 1 ]; then
+            echo "::error::crucible gate --every-gate --publish failed to MEASURE (exit ${status}); the gates it names above could not be published"
             exit 1
           fi
 

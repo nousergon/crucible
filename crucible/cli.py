@@ -1246,14 +1246,33 @@ def build_parser() -> argparse.ArgumentParser:
                 ),
             )
         if spec.name == "gate":  # track-F
+            # Exactly one of `--gate` / `--every-gate`, enforced in
+            # `_resolve_operator_input` as a usage error rather than by an
+            # argparse group, so the refusal carries the same wording and exit
+            # code as every other operator-input refusal.
             sub.add_argument(
                 "--gate",
-                required=True,
+                default=None,
                 choices=track_f.gate_names(),
                 help=(
                     "Which phase gate to read. A gate not registered in "
                     "`crucible.gate.GATES` has no clause list, and running it would "
                     "report a pass over nothing."
+                ),
+            )
+            sub.add_argument(
+                "--every-gate",
+                action="store_true",
+                # alpha-engine-config-I12793: the scheduled publisher in
+                # `gate-close.yml` used one process per gate, and each process
+                # re-evaluated every other gate for its ladder -- 36 gate
+                # evaluations for six gates, past the job's 30-minute timeout.
+                help=(
+                    "Read every registered gate in this one process, each evaluated "
+                    "once, instead of naming one with --gate. Each gate still gets its "
+                    "own reading, ladder and manifest. Exits 1 if any gate is unmet and "
+                    f"{track_f.EVERY_GATE_MEASUREMENT_FAILED_EXIT} if any could not be "
+                    "measured."
                 ),
             )
             sub.add_argument(
@@ -1710,6 +1729,19 @@ def _resolve_operator_input(args: argparse.Namespace) -> int:
         # clobbering a correct CI reading. Refused here, before either job's
         # `run_job` opens a store or attempts a read, exactly like the other
         # operator-input validations in this block.
+        if args.job == "gate":
+            every_gate = bool(getattr(args, "every_gate", False))
+            if every_gate == (getattr(args, "gate", None) is not None):
+                raise UsageError(
+                    "crucible gate takes exactly one of --gate <phase> or --every-gate."
+                )
+            if every_gate and (
+                getattr(args, "weeks", None) is not None or getattr(args, "closing_comment", False)
+            ):
+                raise UsageError(
+                    "crucible gate --every-gate reads every gate over its own declared "
+                    "window; --weeks and --closing-comment apply to one named --gate."
+                )
         if args.job in ("gate", track_f.GATE_CLOSE_JOB):
             missing = missing_required_env()
             if missing:

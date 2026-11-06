@@ -595,7 +595,9 @@ class TestTheDatedReadingsHaveAScheduledPublisher:
         published, and the missing artifact would be indistinguishable from one
         that is not due yet."""
         run = _publish_run_step()
-        assert "crucible.gate" in run and "GATES" in run
+        # `--every-gate` reads `crucible.gate.GATES` inside the CLI
+        # (alpha-engine-config-I12793), so the list exists nowhere in YAML.
+        assert "--every-gate" in run
         for gate in GATES:
             assert f"--gate {gate}" not in run, f"{gate} is restated in the workflow YAML"
 
@@ -612,25 +614,22 @@ class TestTheDatedReadingsHaveAScheduledPublisher:
         assert GATE_CLOSE_JOB not in _publish_run_step()
 
 
-class TestThePublishLoopSurvivesTheOrdinaryCase:
+class TestThePublishStepSurvivesTheOrdinaryCase:
     """An UNMET gate exits 1, and that is what almost every gate reads on
-    almost every day. The runner's default shell is `bash -e`, so a loop
-    written without care would abort on the first unmet gate and leave the
-    remaining five unpublished - silently, because the job would simply fail
-    and the artifacts would look no different from a run that never happened.
+    almost every day. The runner's default shell is `bash -e`, so a step
+    written without care would fail the job on an ordinary unmet phase - and a
+    daily red run on a working producer is how a channel gets muted. Since
+    alpha-engine-config-I12793 the CLI reads every gate in one process
+    (`--every-gate`) and keeps going past one that cannot be read itself
+    (`tests/test_gate_every_gate.py`); this asserts the step's exit handling.
     """
 
     @staticmethod
-    def _drive(
-        tmp_path: pathlib.Path, *, gates: str, exit_code: int
-    ) -> subprocess.CompletedProcess:
+    def _drive(tmp_path: pathlib.Path, *, exit_code: int) -> subprocess.CompletedProcess:
         bin_dir = _stub_bin(
             tmp_path,
             "uv",
-            "#!/usr/bin/env bash\n"
-            'if [ "$2" = "python" ]; then printf "%s\\n" "' + gates + '"; exit 0; fi\n'
-            'echo "ran: $*"\n'
-            f"exit {exit_code}\n",
+            '#!/usr/bin/env bash\necho "ran: $*"\n' + f"exit {exit_code}\n",
         )
         return subprocess.run(
             ["bash", "-e", "-c", _publish_run_step()],
@@ -645,29 +644,25 @@ class TestThePublishLoopSurvivesTheOrdinaryCase:
             },
         )
 
-    def test_an_unmet_gate_does_not_abort_the_remaining_gates(self, tmp_path) -> None:
-        result = self._drive(tmp_path, gates="phase0 phase1 phase2", exit_code=1)
+    def test_one_process_reads_every_gate(self, tmp_path) -> None:
+        result = self._drive(tmp_path, exit_code=0)
         assert result.returncode == 0, f"{result.stdout!r} {result.stderr!r}"
-        for gate in ("phase0", "phase1", "phase2"):
-            assert f"--gate {gate}" in result.stdout, result.stdout
+        assert result.stdout.count("ran: ") == 1
+        assert "--every-gate" in result.stdout
 
-    def test_a_measurement_failure_fails_the_job_and_names_the_gate(self, tmp_path) -> None:
-        """Exit 2 or above is the CLI's error path - the measurement itself
-        failed - and a reading that could not be measured must not be passed
-        over in silence, or the artifact simply stays at yesterday's date with
-        nothing saying why."""
-        result = self._drive(tmp_path, gates="phase0 phase1", exit_code=2)
+    def test_an_unmet_gate_does_not_fail_the_job(self, tmp_path) -> None:
+        result = self._drive(tmp_path, exit_code=1)
+        assert result.returncode == 0, f"{result.stdout!r} {result.stderr!r}"
+
+    @pytest.mark.parametrize("exit_code", [2, 3])
+    def test_a_measurement_failure_fails_the_job(self, tmp_path, exit_code) -> None:
+        """Exit 2 or above is the CLI's error path - a usage error, or a gate
+        whose reading raised - and a reading that could not be measured must
+        not be passed over in silence, or the artifact simply stays at
+        yesterday's date with nothing saying why."""
+        result = self._drive(tmp_path, exit_code=exit_code)
         assert result.returncode != 0
         assert "could not be published" in result.stdout
-        assert "phase0" in result.stdout and "phase1" in result.stdout
-
-    def test_an_empty_gate_list_refuses_rather_than_exiting_zero(self, tmp_path) -> None:
-        """The vacuous-success case, which is the one that would go unnoticed:
-        a derivation that returned nothing would publish nothing and exit 0,
-        indistinguishable from a healthy run."""
-        result = self._drive(tmp_path, gates="", exit_code=0)
-        assert result.returncode != 0
-        assert "would publish nothing" in result.stdout
 
 
 def _publish_identity_result(tmp_path: pathlib.Path, assumed: str) -> subprocess.CompletedProcess:
