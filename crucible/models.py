@@ -168,6 +168,7 @@ __all__ = [
     "RetirementLogRow",
     "ReviewDocument",
     "RunManifestV2",
+    "RunTurnover",
     "SERVED_SESSION_MODES",
     "SESSION_ENVIRONMENT_VAR",
     "STAGING_ENVIRONMENT",
@@ -1222,6 +1223,39 @@ def _run_manifest_v2_json_schema_extra(schema: dict[str, object]) -> None:
     ]
 
 
+class RunTurnover(_Strict):
+    """The book turnover a run that MOVES a book traded, against its budget.
+
+    `alpha-engine-config-I13305`. Carried only by a job that trades or
+    simulates a book (`trader.session`); absent for every other job. The
+    staging soak gate (nous-ergon-ops `scripts/promote_soak_gate.py`) grades
+    `breached` alone and reads a missing block as unknown, never as green.
+    """
+
+    value: float = Field(
+        ge=0.0,
+        description=(
+            "One-way turnover the session traded, as a fraction of the book's notional: half "
+            "the L1 distance between the book held into the session and the book it ended on."
+        ),
+    )
+    budget: float = Field(
+        ge=0.0,
+        description=(
+            "The turnover the session was allowed: the construction's effective daily cap "
+            "(the configured budget scaled by the conviction gate, raised only by the movement "
+            "the other constraints force, such as an exit from an ineligible name)."
+        ),
+    )
+    breached: bool = Field(
+        description=(
+            "True when `value` exceeds `budget` beyond solver tolerance. Computed by "
+            "`RunContext.record_turnover`, never passed in, so it cannot disagree with the two "
+            "numbers beside it."
+        ),
+    )
+
+
 class RunManifestV2(_Strict):
     """`run_manifest.v2`, whole — the record every job writes at
     `runs/{job}/{trading_day}/run.json` (plan §4.2, §9.2).
@@ -1355,6 +1389,17 @@ class RunManifestV2(_Strict):
             "this run toward that digest. Absent where no release pointer is followed (a laptop, "
             "CI, or a box not yet bootstrapped from a manifest); the soak gate counts such a run "
             "as unknown, never as green."
+        ),
+    )
+    #: `alpha-engine-config-I13305`: present only on a run that moves a book
+    #: (`trader.session`). Absent for every other job.
+    turnover: RunTurnover | None = Field(
+        default=None,
+        description=(
+            "I13305: the turnover this run traded against its budget, present only on a run "
+            "that moves a book (`trader.session`), recorded through "
+            "`RunContext.record_turnover`. The staging soak gate grades `breached`; a book-moving "
+            "run without this block reads as unknown there, never as green."
         ),
     )
     #: `alpha-engine-config-I10343`: present only when this run's LLM routing
