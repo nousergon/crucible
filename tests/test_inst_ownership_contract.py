@@ -45,6 +45,7 @@ from crucible.data.point_in_time import (
     fundamental_snapshot_key,
     inst_ownership_key,
 )
+from tests.support.thinktank import thinktank_objects
 
 SCHEMA_PATH = Path(__file__).parent / "contracts" / "inst_ownership.schema.json"
 _SECTORS = ("Energy", "Health Care", "Information Technology")
@@ -83,6 +84,7 @@ def _base_objects(tickers: list[str]) -> dict[str, bytes]:
         constituents_key(dt.date(2026, 9, 9)): _constituents(
             tickers, dt.date(2026, 9, 9), "2026-09-10T12:18:52+00:00"
         ),
+        **thinktank_objects(tickers),
     }
 
 

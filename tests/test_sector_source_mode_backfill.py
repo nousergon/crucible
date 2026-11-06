@@ -57,6 +57,7 @@ def _objects(tickers: list[str]) -> dict[str, bytes]:
     from test_point_in_time_attractiveness import _fundamentals, _inst, _parquet
 
     from crucible.keys import fundamental_snapshot_key, inst_ownership_key
+    from tests.support.thinktank import thinktank_objects
 
     return {
         constituents_key(dt.date(2026, 3, 2)): _constituents(
@@ -70,6 +71,7 @@ def _objects(tickers: list[str]) -> dict[str, bytes]:
             _fundamentals(tickers, dt.date(2026, 9, 9), seed=9)
         ),
         inst_ownership_key(2026, 1): _parquet(_inst(tickers, seed=1)),
+        **thinktank_objects(tickers),
     }
 
 

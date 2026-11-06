@@ -91,6 +91,8 @@ below changes, and is recorded here as an illustration rather than a pin.
 | `payout_ratio` | ratio | — | no | `fundamental.payout_ratio (TTM dividends / net income, clipped [0, 2])` | `point_in_time.fundamental.payout_ratio` |
 | `sustainable_growth_rate_ratio` | ratio | — | no | `roe_ratio * (1 - payout_ratio)` | `roe_ratio`, `payout_ratio` |
 | `institutional_accumulation_raw` | funds | — | no | `n_funds_increasing - n_funds_decreasing, 0 where fewer than 3 funds moved, from the newest 13F quarter whose filing deadline precedes the session` | `point_in_time.institutional.n_funds_increasing`, `point_in_time.institutional.n_funds_decreasing` |
+| `thinktank_rating_ratio` | ratio | — | no | `thinktank.rating / 100 from the newest Think Tank ratings document written before the session` | `point_in_time.thinktank.rating` |
+| `thinktank_covered_raw` | indicator | — | no | `1 where the admitted Think Tank document rates the name, 0 where it was admitted but does not, null where no document was admitted` | `point_in_time.thinktank.rating` |
 | `return_120d_log_return` | log_return | 120 | no | `log(close) - log(close).shift(120)` | `close_raw` |
 | `quality_pillar_pct` | pct | — | yes | `wmean(sector_pct(roe_ratio) .30, 100 - sector_pct(debt_to_equity_div2_ratio) .25, sector_pct(gross_margin_ratio) .25, sector_pct(current_ratio_div3_ratio) .20)` | `sector_raw`, `roe_ratio`, `debt_to_equity_div2_ratio`, `gross_margin_ratio`, `current_ratio_div3_ratio` |
 | `value_pillar_pct` | pct | — | yes | `wmean(100 - sector_pct(pe_div30_ratio) .40, 100 - sector_pct(pb_div5_ratio) .30, sector_pct(fcf_yield_ratio) .30)` | `sector_raw`, `pe_div30_ratio`, `pb_div5_ratio`, `fcf_yield_ratio` |

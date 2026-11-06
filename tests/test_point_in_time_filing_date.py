@@ -38,6 +38,7 @@ from crucible.keys import (
 from crucible.runner import run_job
 from crucible.store import LocalStore
 from tests.conftest import SESSIONS, synthetic_frames
+from tests.support.thinktank import thinktank_objects
 
 END = dt.date(2026, 9, 11)
 SECTORS = ("Energy", "Health Care", "Information Technology")
@@ -135,6 +136,7 @@ def _objects(tickers: list[str]) -> dict[str, bytes]:
             tickers, dt.date(2026, 9, 9), "2026-09-10T12:18:52+00:00"
         ),
         inst_ownership_key(2026, 1): _parquet(_inst(tickers, seed=1)),
+        **thinktank_objects(tickers),
     }
 
 

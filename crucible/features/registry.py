@@ -753,6 +753,38 @@ CATALOG: tuple[FeatureSpec, ...] = (
         ),
     ),
     FeatureSpec(
+        name="thinktank_rating_ratio",
+        market_wide=False,
+        unit="ratio",
+        expression=(
+            "thinktank.rating / 100 from the newest Think Tank ratings document "
+            "written before the session"
+        ),
+        description=(
+            "The Think Tank's per-ticker 0-100 attractiveness rating, scaled to [0, 1]. "
+            "Null for a name the Think Tank did not cover; only covered names are graded "
+            "for depth (see thinktank_covered_raw). The document is admitted from the "
+            "session after its updated_at, in New York time, and is refused once more "
+            "than 5 sessions old."
+        ),
+        inputs=("point_in_time.thinktank.rating",),
+    ),
+    FeatureSpec(
+        name="thinktank_covered_raw",
+        market_wide=False,
+        unit="indicator",
+        expression=(
+            "1 where the admitted Think Tank document rates the name, 0 where it was "
+            "admitted but does not, null where no document was admitted"
+        ),
+        description=(
+            "Whether the Think Tank covered the name that session. The denominator the "
+            "depth check uses for thinktank_rating_ratio, which is null by design for "
+            "the uncovered majority of the universe."
+        ),
+        inputs=("point_in_time.thinktank.rating",),
+    ),
+    FeatureSpec(
         name="return_120d_log_return",
         market_wide=False,
         unit="log_return",
@@ -939,11 +971,6 @@ PENDING_COLUMNS: dict[str, PendingColumn] = {
             name="predicted_alpha_ratio",
             producer="the M slot materializes it into the feature layer",
             milestone="track B",
-        ),
-        PendingColumn(
-            name="thinktank_rating_ratio",
-            producer="an LLM arm produces the per-ticker rating",
-            milestone="phase 5 (§9.1)",
         ),
     )
 }

@@ -64,8 +64,9 @@ crash).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from crucible.documents import UnreadableDocumentError, read_store_document
 from crucible.features.boundaries import DECLARED_SOURCE_BOUNDARIES, explain_dead_columns
@@ -74,11 +75,15 @@ from crucible.features.registry import feature_names, feature_version
 from crucible.keys import coverage_key, features_key, features_prefix
 from crucible.store import Store
 
+if TYPE_CHECKING:
+    import pandas as pd  # pyright: ignore[reportMissingTypeStubs] - pandas ships no stubs
+
 __all__ = [
     "DECLARED_SOURCE_BOUNDARIES",
     "FEATURES_PREFIX",
     "PARQUET_SUFFIX",
     "NULL_RATIO_CEILING",
+    "NULL_RATIO_DENOMINATORS",
     "FeatureLayerDepthReading",
     "FeatureLayerCompletenessReading",
     "check_feature_layer_depth",
@@ -242,6 +247,46 @@ def check_feature_layer_depth(
 #: unobserved, not green.
 NULL_RATIO_CEILING = 0.5
 
+#: Columns graded over a declared SUBSET of the rows, never the whole
+#: universe: column -> the indicator column whose value 1 marks a row the
+#: column is expected to carry. The Think Tank rates only the names it covers
+#: (30-176 of ~900 per session, measured 2026-10-28), so its rating is null on
+#: most rows BY DESIGN; graded over the universe it would read dead on every
+#: session and the reading would mean nothing. Graded over the covered rows, a
+#: covered name with no rating is still a defect. A session on which the
+#: indicator marks no row at all grades the column as fully null — the group
+#: measured nothing, which is never green.
+NULL_RATIO_DENOMINATORS: dict[str, str] = {
+    "thinktank_rating_ratio": "thinktank_covered_raw",
+}
+
+
+def _null_flags(frame: pd.DataFrame, column: str) -> list[bool]:
+    """Per-row nullness of ``column``, any dtype. pandas ships no stubs, so the
+    two helpers here are the only lines that cross its untyped surface."""
+    return [bool(v) for v in frame[column].isna().tolist()]  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType, reportUnknownArgumentType]
+
+
+def _indicator_flags(frame: pd.DataFrame, column: str) -> list[bool]:
+    """Per-row ``column == 1`` for a 0/1/null indicator column."""
+    return [bool(v) for v in (frame[column] == 1.0).tolist()]  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType, reportUnknownArgumentType]
+
+
+def column_null_ratio(frame: pd.DataFrame, column: str) -> float:
+    """The null fraction of ``column`` over the rows it is expected to carry."""
+    nulls = _null_flags(frame, column)
+    indicator = NULL_RATIO_DENOMINATORS.get(column)
+    if indicator is not None:
+        if indicator not in frame.columns:
+            return 1.0
+        expected = _indicator_flags(frame, indicator)
+        nulls = [null for null, keep in zip(nulls, expected, strict=True) if keep]
+        if not nulls:
+            return 1.0
+    if not nulls:
+        return math.nan
+    return sum(nulls) / len(nulls)
+
 
 #: Sessions sampled across the live version, newest and oldest always among
 #: them. Reading ONLY the newest session is what let
@@ -399,7 +444,7 @@ def check_feature_layer_completeness(
             empty_sessions.append(candidate)
             continue
         columns = [c for c in catalogue if c in frame.columns]
-        ratios = {col: float(frame[col].isna().mean()) for col in columns}
+        ratios = {col: column_null_ratio(frame, col) for col in columns}
         dead = tuple(sorted(col for col, ratio in ratios.items() if ratio >= NULL_RATIO_CEILING))
         # A dead column BEFORE its group's declared source boundary is a
         # boundary, not a defect (`crucible.features.boundaries`). Only what

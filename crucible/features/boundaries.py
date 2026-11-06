@@ -127,6 +127,15 @@ _INSTITUTIONAL_COLUMNS: frozenset[str] = frozenset(
     }
 )
 
+#: Both Think Tank columns: the rating and the covered flag the depth check
+#: grades the rating against (`crucible.features.depth.NULL_RATIO_DENOMINATORS`).
+_THINKTANK_COLUMNS: frozenset[str] = frozenset(
+    {
+        "thinktank_rating_ratio",
+        "thinktank_covered_raw",
+    }
+)
+
 #: The first session each group can be measured for. Both dates are DERIVED
 #: from the point-in-time knowledge rules and then MEASURED against the live
 #: layer; the derivation is in `reason`, the measurement in `evidence`.
@@ -167,6 +176,23 @@ _GROUP_BOUNDARIES: tuple[SourceBoundary, ...] = (
             "`institutional_accumulation_raw` is >= 50% non-null from 2022-11-15 and "
             "null on every session before it; the regulatory date is the declared "
             "convention in `crucible.data.point_in_time.quarter_knowledge_date`"
+        ),
+    ),
+    SourceBoundary(
+        group="thinktank",
+        first_measurable_session=dt.date(2026, 7, 7),
+        columns=_THINKTANK_COLUMNS,
+        reason=(
+            "A Think Tank ratings document is admissible only from the session after "
+            "its own `updated_at` (New York date), and the producer's first document, "
+            "labelled 2026-07-02, was written 2026-07-06 — so 2026-07-07 is the first "
+            "session any rating is admissible for. Deepening it needs Think Tank runs "
+            "before 2026-07-02, which cannot be produced point-in-time after the fact."
+        ),
+        evidence=(
+            "measured 2026-10-28: the data bucket's `thinktank/ratings/` prefix holds 74 "
+            "dated documents, earliest `2026-07-02.json` with `updated_at` "
+            "2026-07-06T14:33:37Z (`crucible.keys.thinktank_ratings_key`)"
         ),
     ),
 )
