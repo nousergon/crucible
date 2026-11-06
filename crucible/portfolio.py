@@ -447,7 +447,26 @@ PORTFOLIO_PARAM_FIELDS: dict[str, str] = {
     "conviction_budget_min_multiple": "number",
     "conviction_gate_min_names": "integer",
     "book_notional_usd": "number",
+    "max_position_pct": "number-or-null",
+    "ineligible_held_exit": "string",
 }
+
+#: ROLLOUT ONLY (alpha-engine-config-I13305): the two fields added on
+#: 2026-11-06, and the value an ABSENT key reads as -- exactly the behaviour
+#: before they existed (no per-name cap; a dropped held name is exited). Two
+#: readers load the same parameter file at different crucible versions: the
+#: harness at the published release, the trader at its pinned wheel, which
+#: moves only through its own smoke. A required key would refuse one reader
+#: whichever side moved first. Once the trader's pin carries these fields and
+#: `strategy/slots/s.yaml` declares both, this map is emptied and the fields
+#: become required like every other.
+_ROLLOUT_ABSENT: Mapping[str, float | str | None] = {
+    "max_position_pct": None,
+    "ineligible_held_exit": "forced",
+}
+
+#: The values `PortfolioParams.ineligible_held_exit` admits.
+INELIGIBLE_HELD_EXITS: frozenset[str] = frozenset({"forced", "discretionary"})
 
 _NULLABLE_PARAMS: frozenset[str] = frozenset(
     name for name, kind in PORTFOLIO_PARAM_FIELDS.items() if kind.endswith("-or-null")
@@ -504,8 +523,30 @@ class PortfolioParams:
     #: a participation-aware model's charge is `NAV^1.5` in this value, so a
     #: wrong one is a wrong grade for exactly the arms this field exists for.
     book_notional_usd: float
+    #: The most of the book one name may carry (`alpha-engine-config-I13305`).
+    #: ``null`` disables it. The benchmark fill and the cash sleeve are exempt:
+    #: one is the passive leg, the other is pinned. Until 2026-11-06 nothing
+    #: bounded a name -- stance caps are uniform 1.0 and every v2 name is
+    #: unsectored -- so a champion book could put 88% in MU.
+    max_position_pct: float | None
+    #: What happens to a held name the eligibility cut drops. ``forced`` pins it
+    #: to zero this session (a mandatory exit, outside the turnover budget).
+    #: ``discretionary`` lets the book keep it at no more than its current
+    #: weight, so the optimizer sells it down inside the turnover budget and
+    #: never adds to it: a name falling one rank out of the cut is not sold
+    #: whole the day after it was bought (2026-11-06, SNDK).
+    ineligible_held_exit: str
 
     def __post_init__(self) -> None:
+        if self.max_position_pct is not None and not 0.0 < self.max_position_pct <= 1.0:
+            raise PortfolioParamsError(
+                f"max_position_pct must be in (0, 1] or null; got {self.max_position_pct}"
+            )
+        if self.ineligible_held_exit not in INELIGIBLE_HELD_EXITS:
+            raise PortfolioParamsError(
+                f"ineligible_held_exit must be one of {sorted(INELIGIBLE_HELD_EXITS)}; got "
+                f"{self.ineligible_held_exit!r}"
+            )
         if self.covariance_shrinkage in _ESTIMATORS_NOT_CARRIED:
             raise PortfolioParamsError(
                 f"covariance_shrinkage {self.covariance_shrinkage!r} is not carried by "
@@ -565,7 +606,7 @@ class PortfolioParams:
             raise PortfolioParamsError(
                 f"{source}: portfolio parameters must be a mapping, got {type(payload).__name__}"
             )
-        missing = sorted(set(PORTFOLIO_PARAM_FIELDS) - set(payload))
+        missing = sorted(set(PORTFOLIO_PARAM_FIELDS) - set(payload) - set(_ROLLOUT_ABSENT))
         if missing:
             raise PortfolioParamsError(
                 f"{source}: portfolio parameters are missing {missing}. Every field is "
@@ -581,6 +622,10 @@ class PortfolioParams:
             )
         values: dict[str, Any] = {}
         for name, kind in PORTFOLIO_PARAM_FIELDS.items():
+            if name not in payload:
+                # Only a `_ROLLOUT_ABSENT` field reaches here (checked above).
+                values[name] = _ROLLOUT_ABSENT[name]
+                continue
             raw = payload[name]
             if raw is None:
                 if name not in _NULLABLE_PARAMS:
@@ -860,8 +905,10 @@ def solve_target_weights(
         )
     objective = cp.Maximize(sum(objective_terms))
 
+    effective_caps, eligibility = _name_caps(
+        stance_caps, eligibility, w_prev, benchmark_idx, cash_idx, params
+    )
     ineligible_idx = np.where(~eligibility)[0]
-    effective_caps = np.where(eligibility, stance_caps, 0.0)
 
     constraints = [
         cp.sum(w) == 1.0,
@@ -1452,6 +1499,37 @@ def _clip_and_renormalize(
     if total > 0:
         weights = weights / total
     return weights, mass_zeroed
+
+
+def _name_caps(
+    stance_caps: np.ndarray,
+    eligibility: np.ndarray,
+    w_prev: np.ndarray,
+    benchmark_idx: int,
+    cash_idx: int,
+    params: PortfolioParams,
+) -> tuple[np.ndarray, np.ndarray]:
+    """``(effective_caps, eligibility)``: each name's upper bound and whether it may be held.
+
+    `alpha-engine-config-I13305`. ``max_position_pct`` tightens every stance cap
+    but the benchmark's and the sleeve's. Under ``ineligible_held_exit:
+    discretionary`` a held name the cut dropped stays holdable at no more than
+    its current weight (and the cap), so selling it is the optimizer's choice
+    inside the turnover budget, never a forced exit; it can only shrink. An
+    ineligible name not held is pinned to zero as before.
+    """
+    caps = np.asarray(stance_caps, dtype=float).copy()
+    if params.max_position_pct is not None:
+        exempt = np.zeros(caps.shape, dtype=bool)
+        exempt[[benchmark_idx, cash_idx]] = True
+        caps = np.where(exempt, caps, np.minimum(caps, float(params.max_position_pct)))
+    eligible = np.asarray(eligibility, dtype=bool).copy()
+    effective = np.where(eligible, caps, 0.0)
+    if params.ineligible_held_exit == "discretionary":
+        kept = ~eligible & (np.asarray(w_prev, dtype=float) > 0.0)
+        effective = np.where(kept, np.minimum(np.asarray(w_prev, dtype=float), caps), effective)
+        eligible = eligible | kept
+    return effective, eligible
 
 
 def _mandatory_turnover_floor(

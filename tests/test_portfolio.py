@@ -65,6 +65,8 @@ _FIXTURE_PARAMS: dict = {
     "conviction_ir_full": 0.75,
     "conviction_budget_min_multiple": 0.05,
     "conviction_gate_min_names": 3,
+    "max_position_pct": None,
+    "ineligible_held_exit": "forced",
     "book_notional_usd": 1_000_000.0,
 }
 
@@ -1969,3 +1971,73 @@ class TestBudgetBindingComplementarySlackness:
     def test_binding_test_is_named_in_the_diagnostics(self):
         d = self._diag(0.20, 0.20, 0.0256)
         assert d["turnover_binding_test"] == "complementary_slackness"
+
+
+class TestPerNameCapAndHeldNameBuffer:
+    """alpha-engine-config-I13305: a name is bounded by `max_position_pct`, and a
+    held name the cut drops is sold down by choice, not forced out whole."""
+
+    def _universe(self, **param_overrides) -> dict:
+        u = _baseline_universe(n_active=4, sector_labels=["a", "b", "c", "d"])
+        u["stance_caps"] = np.full(len(u["tickers"]), 1.0)
+        u["alpha_hat"] = np.array([0.05, 0.001, 0.001, 0.001, 0.0, 0.0])
+        u["params"] = _params(max_daily_turnover=None, max_sector_pct=1.0, **param_overrides)
+        return u
+
+    def test_without_a_cap_one_name_can_take_most_of_the_book(self) -> None:
+        result = solve_target_weights(**self._universe())
+        assert result.weights[0] > 0.5
+
+    def test_the_cap_bounds_every_name_but_the_benchmark_and_cash(self) -> None:
+        result = solve_target_weights(**self._universe(max_position_pct=0.10))
+        assert result.weights[:4].max() <= 0.10 + 1e-4
+        assert result.weights[5] == pytest.approx(0.03, abs=1e-6)
+
+    def test_forced_policy_pins_a_dropped_held_name_to_zero(self) -> None:
+        u = self._universe()
+        u["w_prev"] = np.array([0.0, 0.4, 0.0, 0.0, 0.57, 0.03])
+        u["eligibility"] = np.array([True, False, True, True, True, True])
+        result = solve_target_weights(**u)
+        assert result.weights[1] == pytest.approx(0.0, abs=1e-8)
+
+    def test_discretionary_policy_keeps_a_dropped_held_name_up_to_its_weight(self) -> None:
+        u = self._universe(ineligible_held_exit="discretionary")
+        u["alpha_hat"] = np.array([0.0, 0.05, 0.0, 0.0, 0.0, 0.0])
+        u["w_prev"] = np.array([0.0, 0.4, 0.0, 0.0, 0.57, 0.03])
+        u["eligibility"] = np.array([True, False, True, True, True, True])
+        result = solve_target_weights(**u)
+        assert 0.0 < result.weights[1] <= 0.4 + 1e-4
+
+    def test_discretionary_policy_never_buys_a_name_not_held(self) -> None:
+        u = self._universe(ineligible_held_exit="discretionary")
+        u["eligibility"] = np.array([False, True, True, True, True, True])
+        result = solve_target_weights(**u)
+        assert result.weights[0] == pytest.approx(0.0, abs=1e-8)
+
+    def test_a_kept_name_above_the_cap_is_trimmed_to_it(self) -> None:
+        u = self._universe(ineligible_held_exit="discretionary", max_position_pct=0.10)
+        u["alpha_hat"] = np.array([0.0, 0.05, 0.0, 0.0, 0.0, 0.0])
+        u["w_prev"] = np.array([0.0, 0.4, 0.0, 0.0, 0.57, 0.03])
+        u["eligibility"] = np.array([True, False, True, True, True, True])
+        result = solve_target_weights(**u)
+        assert result.weights[1] <= 0.10 + 1e-4
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [("max_position_pct", 0.0), ("max_position_pct", 1.5), ("ineligible_held_exit", "x")],
+    )
+    def test_out_of_range_values_are_refused(self, field, value) -> None:
+        with pytest.raises(PortfolioParamsError):
+            _params(**{field: value})
+
+
+def test_the_two_new_fields_read_as_todays_behaviour_while_absent() -> None:
+    """ROLLOUT ONLY (I13305): a parameter file from before 2026-11-06 still loads."""
+    old = {
+        k: v
+        for k, v in _FIXTURE_PARAMS.items()
+        if k not in {"max_position_pct", "ineligible_held_exit"}
+    }
+    params = PortfolioParams.from_mapping(old, source="<pre-I13305 file>")
+    assert params.max_position_pct is None
+    assert params.ineligible_held_exit == "forced"
