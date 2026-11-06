@@ -828,3 +828,69 @@ class TestReleaseManifestBinding:
             run_job("smoke", lambda ctx: ran.append(True), store=store, trading_day=TRADING_DAY)
         assert ran == []
         assert not store.exists(manifest_key("smoke", TRADING_DAY.isoformat()))
+
+
+class TestTurnoverRecord:
+    """alpha-engine-config-I13305: a run that moves a book records the turnover it
+    traded and its budget, and the runner derives `breached`. Omitted otherwise."""
+
+    def test_within_budget_is_recorded_unbreached(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        run_job(
+            "smoke",
+            lambda ctx: ctx.record_turnover(value=0.18, budget=0.2),
+            store=store,
+            trading_day=TRADING_DAY,
+        )
+        doc = _read_manifest(store, "smoke")
+        validate(doc)
+        assert doc["turnover"] == {"value": 0.18, "budget": 0.2, "breached": False}
+
+    def test_over_budget_is_breached(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        run_job(
+            "smoke",
+            lambda ctx: ctx.record_turnover(value=0.97, budget=0.2),
+            store=store,
+            trading_day=TRADING_DAY,
+        )
+        doc = _read_manifest(store, "smoke")
+        validate(doc)
+        assert doc["turnover"]["breached"] is True
+
+    def test_a_book_on_its_cap_within_solver_tolerance_is_not_breached(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        run_job(
+            "smoke",
+            lambda ctx: ctx.record_turnover(value=0.2 + 1e-8, budget=0.2),
+            store=store,
+            trading_day=TRADING_DAY,
+        )
+        assert _read_manifest(store, "smoke")["turnover"]["breached"] is False
+
+    def test_a_job_that_moves_no_book_omits_the_field(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        run_job("smoke", lambda ctx: None, store=store, trading_day=TRADING_DAY)
+        assert "turnover" not in _read_manifest(store, "smoke")
+
+    def test_recording_twice_fails_the_run(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+
+        def twice(ctx: RunContext) -> None:
+            ctx.record_turnover(value=0.1, budget=0.2)
+            ctx.record_turnover(value=0.1, budget=0.2)
+
+        with pytest.raises(ValueError, match="already recorded"):
+            run_job("smoke", twice, store=store, trading_day=TRADING_DAY, transient_retry=False)
+
+    @pytest.mark.parametrize(("value", "budget"), [(-0.1, 0.2), (0.1, -0.2), (float("nan"), 0.2)])
+    def test_a_negative_or_non_finite_number_fails_the_run(self, tmp_path, value, budget) -> None:
+        store = LocalStore(tmp_path)
+        with pytest.raises(ValueError, match="finite and non-negative"):
+            run_job(
+                "smoke",
+                lambda ctx: ctx.record_turnover(value=value, budget=budget),
+                store=store,
+                trading_day=TRADING_DAY,
+                transient_retry=False,
+            )

@@ -131,6 +131,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import math
 import os
 import re
 import resource as posix_resource
@@ -174,6 +175,7 @@ __all__ = [
     "SPOT_INTERRUPTION_REASON",
     "SpotInterruptionError",
     "TRANSIENT_CLASSIFIERS",
+    "TURNOVER_TOLERANCE",
     "classify_transient",
     "invocation_discriminator",
     "rebind_trading_day",
@@ -410,6 +412,11 @@ CODE_SHA_ENV = "CRUCIBLE_CODE_SHA"
 #: exports it for the smoke, so a run manifest names its dependency set and
 #: not only its code.
 WHEELHOUSE_DIGEST_ENV = "CRUCIBLE_WHEELHOUSE_DIGEST"
+
+#: Relative and absolute slack `RunContext.record_turnover` allows above a
+#: budget before calling it breached: the slack `crucible.portfolio` puts on
+#: the turnover constraint's own right-hand side (alpha-engine-config-I13305).
+TURNOVER_TOLERANCE = 1e-6
 
 #: alpha-engine-config-I12517 (S-29 design note §3): the `release_manifest.v1`
 #: digest this run executes under. The box bootstrap exports it from the
@@ -664,6 +671,10 @@ class RunContext:
     #: arm (`alpha-engine-config-I9920`).
     _current_arm_id: str | None = field(default=None, repr=False)
     metrics: list[dict[str, Any]] = field(default_factory=list)
+    #: Set only via `record_turnover`, at most once, by a job that moves a book
+    #: (`alpha-engine-config-I13305`). `None` for every other job, and then
+    #: omitted from the manifest entirely.
+    turnover: dict[str, float | bool] | None = None
     attempts: list[dict[str, Any]] = field(default_factory=lambda: [{"n": 1, "reason": "initial"}])
     #: Set by `run_job`'s exception handler (never by the job body) when
     #: THIS attempt's own failure classifies as `SPOT_INTERRUPTION_REASON`
@@ -820,6 +831,27 @@ class RunContext:
         """§9.2 class 5. MetricRecord-shaped; the schema enforces that a
         value carries a unit and that a horizon is in trading days."""
         self.metrics.append(metric)
+
+    def record_turnover(self, *, value: float, budget: float) -> None:
+        """Record the book turnover this run traded and the budget it had (I13305).
+
+        ``breached`` is derived here, never passed, so it cannot disagree with
+        the two numbers it sits beside. The tolerance is the solver's: the
+        construction pins its own cap with the same relative and absolute
+        slack (`crucible.portfolio`), so a book that sits exactly on its cap
+        is not a breach. Called at most once per run.
+        """
+        if self.turnover is not None:
+            raise ValueError(f"run {self.run_id} ({self.job}) already recorded its turnover")
+        if not (math.isfinite(value) and math.isfinite(budget)) or value < 0 or budget < 0:
+            raise ValueError(
+                f"turnover value {value!r} and budget {budget!r} must be finite and non-negative"
+            )
+        self.turnover = {
+            "value": float(value),
+            "budget": float(budget),
+            "breached": bool(value > budget * (1.0 + TURNOVER_TOLERANCE) + TURNOVER_TOLERANCE),
+        }
 
     def record_output_cas(
         self, key: str, expected: str, payload: bytes, schema_version: str = "v1"
@@ -1476,6 +1508,10 @@ def _write_manifest(
         # Same "omitted entirely" shape (alpha-engine-config-I12517). Runner
         # identity, so the fallback manifest carries it too.
         manifest["release_manifest"] = release_manifest
+    if ctx.turnover is not None:
+        # Same "omitted entirely" shape (alpha-engine-config-I13305): only a
+        # run that moves a book records one.
+        manifest["turnover"] = ctx.turnover
     if ctx.fault_capability_class is not None:
         # Same "omitted entirely" shape, same reason (alpha-engine-config-I10343).
         # This is the field that makes an INDUCED router failure distinguishable
