@@ -1583,6 +1583,14 @@ components:
     #
     # `trader.reconcile` was left null in that edit and was scheduled on
     # 2026-10-30 once its timing settled (see its row).
+    #
+    # alpha-engine-config-I13334: the day's order book
+    # (`trader/order_books/{d}.json`, crucible-trader `order_book.py`) and its
+    # `trader_order_book_written` row. The trader never raises on a failed
+    # book write, so 2026-11-04's `AccessDenied` was an `ok` manifest that
+    # paged nobody. `crucible.alerts.evaluate_order_book` now pages a served
+    # session whose row is FAIL or absent, under `trader.order_book`, from
+    # 2026-11-04 on.
     description: >-
       Serve one trading session on the M champion (shadow until an order
       router exists) and record the served day, with its session mode, in the
@@ -1592,8 +1600,8 @@ components:
       execution: run.json
       cost: run.json:cost_usd
       resource: run.json:resource
-      lineage: run.json:outputs[trader/evidence.json,trader/execution_shortfall/*]
-      outcome: run.json:metrics[portfolio_construction,hold_book_engaged]
+      lineage: run.json:outputs[trader/evidence.json,trader/execution_shortfall/*,trader/order_books/*]
+      outcome: run.json:metrics[portfolio_construction,hold_book_engaged,trader_order_book_written]
     log_location: cloudwatch:/crucible/trader.session
     log_retention_days: 90
     alert_channel: telegram:crucible-pages

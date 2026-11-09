@@ -125,6 +125,9 @@ __all__ = [
     "BACK_OFFICE_JOB",
     "EXCEPTION_OVERDUE_METRIC",
     "EXCEPTION_SCORE_METRIC",
+    "ORDER_BOOK_JOB",
+    "ORDER_BOOK_METRIC",
+    "ORDER_BOOK_REQUIRED_FROM",
     "OVERDUE_LOOKBACK_TRADING_DAYS",
     "TRADER_RECONCILE_JOB",
     "SHADOW_BOOKS_DEADLINE",
@@ -148,6 +151,7 @@ __all__ = [
     "evaluate_dispatch_absence",
     "evaluate_failure",
     "evaluate_held_session",
+    "evaluate_order_book",
     "evaluate_back_office_breaks",
     "evaluate_min_active_arms",
     "evaluate_shadow_books_absence",
@@ -2238,6 +2242,121 @@ def evaluate_held_session(
     return pages
 
 
+#: `alpha-engine-config-I13334`: the label a missing or failed order book
+#: pages under, and the trader row that says whether it was written
+#: (crucible-trader `crucible_trader.order_book`). NOT a runner job, like
+#: :data:`BACK_OFFICE_JOB`: a page under `trader.session` itself would share an
+#: incident with that job's FAILURE or HELD page on the same day, and "the
+#: session did not run" and "the session ran but its book was not kept" are
+#: different things to go and do.
+ORDER_BOOK_JOB = "trader.order_book"
+ORDER_BOOK_METRIC = "trader_order_book_written"
+#: The first trading day whose served session owes an order book: the trader
+#: began writing it (and the row) on the 2026-11-05 morning session, which
+#: binds to 2026-11-04. A day before this has no book by design, and grading
+#: it would page every served session the trader ran before the book existed.
+ORDER_BOOK_REQUIRED_FROM = dt.date(2026, 11, 4)
+
+
+def _order_book_reading(manifest: Mapping[str, object]) -> tuple[bool, str]:
+    """``(written, reason)`` from a served session's order-book row. An absent
+    row is not written: every trader release since the book existed records
+    it, so its absence is a pin that lost the book, not a book that was kept."""
+    rows = manifest.get("metrics")
+    for row in cast("list[object]", rows) if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        fields = cast("dict[str, object]", row)
+        if fields.get("name") != ORDER_BOOK_METRIC:
+            continue
+        if fields.get("status") == "OK":
+            return True, ""
+        return False, str(fields.get("status_reason") or fields.get("status") or "FAIL")
+    return False, f"the served session's ok manifest records no {ORDER_BOOK_METRIC} row"
+
+
+def evaluate_order_book(
+    store: Store,
+    *,
+    now: dt.datetime | None = None,
+    registry: dict[str, Component] | None = None,
+    access_faults: list[str] | None = None,
+) -> list[Page]:
+    """`alpha-engine-config-I13334`: page when a served session's order book
+    was not written.
+
+    `crucible_trader.order_book.record_order_book` never raises into the
+    session, by design (a no-trade day is worse than a missing record), so a
+    failed write is an `ok` manifest with `trader_order_book_written` at FAIL.
+    Neither condition saw it: the manifest exists (no ABSENCE) and is `ok` (no
+    FAILURE). 2026-11-04's book failed on `AccessDenied` and paged nobody.
+
+    Reuses the FAILURE condition rather than adding a third (§4.6 admits
+    exactly two), as :func:`evaluate_held_session` does. Only an `ok` manifest
+    that SERVED owes a book: a failed manifest pages through
+    :func:`evaluate_failure`, a held one through :func:`evaluate_held_session`,
+    and no manifest through the ABSENCE condition. A day pages only when no
+    served `ok` manifest for it wrote the book, judged per synthetic marker so
+    a replay never clears a production day.
+    """
+    moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
+    reg = registry if registry is not None else load_registry()
+    component = reg.get(TRADER_SESSION_JOB)
+    if component is None or component.lifecycle != "ACTIVE":
+        return []
+    pages: list[Page] = []
+    for trading_day in days_to_evaluate(store, moment):
+        if trading_day < ORDER_BOOK_REQUIRED_FROM:
+            continue
+        listed = read_manifests_under(
+            store, manifest_prefix(TRADER_SESSION_JOB, trading_day.isoformat())
+        )
+        if listed.listing_problem is not None:
+            # Not appended: `evaluate_failure` lists this same prefix in the
+            # same sweep and carries the identical problem out.
+            if access_faults is None:
+                raise StoreAccessError(listed.listing_problem)
+            continue
+        written: set[str | None] = set()
+        missing: dict[str | None, list[tuple[str, str]]] = {}
+        for _key, manifest in listed.documents:
+            if manifest.get("status") != "ok":
+                continue
+            served = _session_served(manifest)
+            if served is None or not served[0]:
+                continue
+            marker = manifest_synthetic_marker(manifest)
+            ok, why = _order_book_reading(manifest)
+            if ok:
+                written.add(marker)
+                continue
+            run_id = str(manifest.get("run_id") or _UNPARSEABLE_RUN_ID)
+            missing.setdefault(marker, []).append((run_id, why))
+        for synthetic, failures in missing.items():
+            if synthetic in written:
+                continue
+            run_id, why = failures[-1]
+            pages.append(
+                Page(
+                    condition="failure",
+                    job=ORDER_BOOK_JOB,
+                    trading_day=trading_day,
+                    reason=(
+                        f"order book not kept ({ORDER_BOOK_METRIC}): {why}\n"
+                        "    Auto-fix: none. The orders went out; only the record of "
+                        "the book that explains them is missing.\n"
+                        "    Resolution: fix what the reason names (often the trader "
+                        "identity's write grant on trader/order_books/) and confirm the "
+                        f"next {TRADER_SESSION_JOB} manifest records {ORDER_BOOK_METRIC} "
+                        "at OK."
+                    ),
+                    run_id=run_id,
+                    synthetic=synthetic,
+                )
+            )
+    return pages
+
+
 #: `alpha-engine-config-I13129`: the job whose manifest carries the back
 #: office's control readings, the label their page goes out under, and the
 #: metric rows that say a control failed. Stated here, not imported from
@@ -3708,6 +3827,7 @@ def sweep(
         + evaluate_failure(store, now=moment, registry=registry, access_faults=access_faults)
         + evaluate_min_active_arms(store, now=moment, access_faults=access_faults)
         + evaluate_held_session(store, now=moment, registry=registry, access_faults=access_faults)
+        + evaluate_order_book(store, now=moment, registry=registry, access_faults=access_faults)
         + evaluate_back_office_breaks(
             store, now=moment, registry=registry, access_faults=access_faults
         )

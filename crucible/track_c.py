@@ -20,10 +20,11 @@ import argparse
 import datetime as dt
 import json
 import os
+import sys
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from crucible import alerts, release
+from crucible import alerts, daily_notice, release
 from crucible.board import (
     BOARD_SCHEMA_VERSION,
     board_delta,
@@ -33,8 +34,8 @@ from crucible.board import (
     read_acceptance,
     render_board_html,
 )
-from crucible.calendar import resolve_trading_day
-from crucible.components import load_registry
+from crucible.calendar import previous_trading_day, resolve_trading_day
+from crucible.components import NYSE_TZ, load_registry
 from crucible.console.public import (
     PUBLIC_JSON_KEY,
     PUBLIC_KEY,
@@ -777,6 +778,7 @@ def sweep_handler(args: argparse.Namespace) -> int:
             raise SystemExit(str(exc)) from exc
 
     def body(ctx: RunContext) -> None:
+        swept.append(ctx)
         # `alerts.sweep(dry_run=)` evaluates and groups exactly as a real
         # sweep would but never calls `emit` — `outcome["bus_keys"]` is `()`
         # on this path, so the loop below writes nothing without needing its
@@ -854,23 +856,63 @@ def sweep_handler(args: argparse.Namespace) -> int:
         ]
         ctx.record_metric(lock_metric)
 
-    run_job(
-        "alerts.sweep",
-        body,
-        store=store,
-        trading_day=args.trading_day,
-        run_mode=getattr(args, "run_mode", None),
-        # The sweep fires every calendar day at 21:00 ET, and Friday,
-        # Saturday and Sunday all resolve to Friday's trading day — three
-        # writers, one key, without this. `calendar_date` is only known once
-        # the runner resolves `trading_day`/`started`, so it is a callable
-        # rather than a value computed here (alpha-engine-config-I9781).
-        discriminator=lambda ctx: ctx.calendar_date.isoformat(),
-        dry_run=bool(getattr(args, "dry_run", False)),
-        now_override=now_override,
-    )
+    swept: list[RunContext] = []
+    try:
+        run_job(
+            "alerts.sweep",
+            body,
+            store=store,
+            trading_day=args.trading_day,
+            run_mode=getattr(args, "run_mode", None),
+            # The sweep fires every calendar day at 21:00 ET, and Friday,
+            # Saturday and Sunday all resolve to Friday's trading day — three
+            # writers, one key, without this. `calendar_date` is only known once
+            # the runner resolves `trading_day`/`started`, so it is a callable
+            # rather than a value computed here (alpha-engine-config-I9781).
+            discriminator=lambda ctx: ctx.calendar_date.isoformat(),
+            dry_run=bool(getattr(args, "dry_run", False)),
+            now_override=now_override,
+        )
+    finally:
+        # After the run, once, whatever its outcome: a body the runner retried
+        # would otherwise send twice. An operator's `--now` replay of a past
+        # day and a dry run send nothing.
+        if swept and not dry_run and now_override is None:
+            _send_daily_notice(store, swept[-1])
     print(json.dumps({k: v for k, v in result.items() if k != "metric"}, indent=2))
     return 0
+
+
+def _send_daily_notice(store: Store, ctx: RunContext) -> None:
+    """The daily v2 pipelines message (`crucible.daily_notice`), once per
+    trading day.
+
+    The sweep fires every calendar day at 21:00 ET; only the firing whose
+    New York date IS its trading day sends, so a weekend or a weekday holiday
+    (both resolve to the previous session) sends nothing. `calendar_date` is
+    the UTC date and is already the next day at 21:00 ET, so it cannot answer
+    this. The notice reports the PREVIOUS trading day, the one whose runs are
+    all past their deadlines; `crucible.daily_notice` says why.
+
+    A delivery failure is printed and swallowed HERE, deliberately, as
+    `track_f._send_weekly_notice` does: the sweep's outcome is its manifest
+    and its pages, and a Telegram outage must not fail the one job that pages.
+    """
+    if ctx.started.astimezone(NYSE_TZ).date() != ctx.trading_day:
+        return
+    day = previous_trading_day(ctx.trading_day).isoformat()
+    try:
+        daily_notice.send_notice(
+            store,
+            day,
+            console_artifact=manifest_key(
+                alerts.SWEEP_JOB,
+                ctx.trading_day.isoformat(),
+                discriminator=ctx.calendar_date.isoformat(),
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - see docstring
+        print(f"daily notice NOT delivered: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
 def heartbeat_handler(args: argparse.Namespace) -> int:
