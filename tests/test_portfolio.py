@@ -36,6 +36,7 @@ from crucible.portfolio import (
     PortfolioParamsError,
     TurnoverBudgetError,
     _apply_turnover_governor,
+    _decompose_mandatory_turnover,
     _estimate_covariance_daily,
     _mandatory_turnover_floor,
     _turnover_diagnostics,
@@ -1500,6 +1501,68 @@ class TestMandatoryTurnoverFloor:
             params=_params(cash_sleeve_pct=0.03),
         )
         assert floor == pytest.approx(0.03, abs=1e-9)
+
+
+class TestSectorCapIsAForcedSellDown:
+    """`alpha-engine-config-I12024`: a held sector over `max_sector_pct` is forced.
+
+    Once the S universe carries real sectors, a book held over the cap (the
+    2026-11-06 book held 52% Information Technology) must be sold down to it.
+    Under a 20% discretionary budget that sell-down made the program infeasible
+    unless the mandatory floor counted it, and an infeasible solve falls to the
+    hold path: the cap would never be reached.
+    """
+
+    def test_floor_counts_the_excess_of_an_over_cap_sector(self):
+        # Two names in one sector hold 0.50 against a 0.25 cap: 0.25 must leave.
+        w_prev = np.array([0.30, 0.20, 0.47, 0.03])
+        caps = np.array([1.0, 1.0, 1.0, 1.0])
+        sectors = ["tech", "tech", "__benchmark__", "__cash__"]
+        params = _params(cash_sleeve_pct=0.03, max_sector_pct=0.25)
+        assert _mandatory_turnover_floor(w_prev, caps, cash_idx=3, params=params) == pytest.approx(
+            0.0, abs=1e-12
+        )
+        assert _mandatory_turnover_floor(
+            w_prev, caps, cash_idx=3, params=params, sectors=sectors
+        ) == pytest.approx(0.25, abs=1e-9)
+
+    def test_decomposition_names_the_sector_cause(self):
+        w_prev = np.array([0.30, 0.20, 0.47, 0.03])
+        out = _decompose_mandatory_turnover(
+            w_prev,
+            np.ones(4),
+            np.ones(4, dtype=bool),
+            3,
+            _params(cash_sleeve_pct=0.03, max_sector_pct=0.25),
+            ["tech", "tech", "__benchmark__", "__cash__"],
+        )
+        # One-way: 0.25 sold is half the L1; the other half is the 0.25 bought
+        # back elsewhere, which the residual (renormalization) carries.
+        assert out["sector_cap"] == pytest.approx(0.125, abs=1e-9)
+        assert out["renormalization"] == pytest.approx(0.125, abs=1e-9)
+        assert out["position_cap"] == pytest.approx(0.0, abs=1e-12)
+        assert out["sectors_over_cap"] == ["tech"]
+        assert out["total"] == pytest.approx(0.25, abs=1e-9)
+
+    def test_an_over_cap_held_sector_solves_to_the_cap_under_a_small_budget(self):
+        u = _baseline_universe(n_active=4, sector_labels=["tech", "tech", "tech", "energy"])
+        u["alpha_hat"][:4] = 0.05
+        u["stance_caps"][:4] = 1.0
+        u["w_prev"] = np.array([0.30, 0.22, 0.0, 0.0, 0.45, 0.03])
+        u["params"] = _params(max_sector_pct=0.25, max_daily_turnover=0.05)
+        result = _solve(u)
+        assert result.diagnostics["status"] != "infeasible_fallback"
+        assert result.weights[:3].sum() <= 0.25 + 1e-4
+        by_cause = result.diagnostics["turnover_mandatory_floor_by_cause"]
+        assert by_cause["sector_cap"] == pytest.approx(0.135, abs=1e-6)
+        assert result.diagnostics["turnover_mandatory_floor"] == pytest.approx(0.27, abs=1e-6)
+
+    def test_the_unclassified_bucket_is_capped_like_any_sector(self):
+        # Names with no sector share one bucket; it is not a free pass.
+        u = _baseline_universe(n_active=5, sector_labels=["unclassified"] * 5)
+        u["alpha_hat"][:5] = 0.05
+        u["params"] = _params(max_sector_pct=0.20)
+        assert _solve(u).weights[:5].sum() <= 0.20 + 1e-4
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

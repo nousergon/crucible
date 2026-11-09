@@ -36,7 +36,12 @@ from crucible.slots.inputs import (
     ArmPredictionsContractError,
     resolve_strategy_sessions,
 )
-from crucible.slots.strategy import construct_book, load_strategy_slot, registration_specs
+from crucible.slots.strategy import (
+    UNCLASSIFIED_SECTOR,
+    construct_book,
+    load_strategy_slot,
+    registration_specs,
+)
 from tests.test_slot_strategy_cycle_job import AS_OF, _next_session, _run_grade, _run_produce
 
 #: The S cycle job's own fixture — a real panel, real champions' feeds, a real
@@ -411,3 +416,66 @@ class TestAHeldNameLeavingTheUniverseIsExitedNotRefused:
                 unsettled_last=True,
                 held_tickers=[*held, "NOPRICE"],
             )
+
+
+class TestTheUniverseCarriesTheFeatureLayersSectors:
+    """`alpha-engine-config-I12024`: `max_sector_pct` binds on real sectors.
+
+    Every name used to carry one `__unsectored__` sentinel, which the cap
+    excludes, so the cap bound nothing. The resolver now reads `sector_raw`
+    from the compiled feature layer; a name it does not label is
+    `unclassified`, a bucket the cap bounds like any sector, and is listed.
+    """
+
+    def _produced(self, world):
+        store, settings, _root, days = world
+        _run_produce(store, settings, days)
+        arm = _arm(settings)
+        population = load_store_document(
+            store, cycle_job.shadow_key(cycle_job.U_CHAMPION, AS_OF.isoformat())
+        )["population"]
+        return store, arm, sorted(population)
+
+    def test_each_name_carries_its_feature_layer_sector(self, world) -> None:
+        store, arm, population = self._produced(world)
+        labels = {
+            t: ("Energy" if i % 2 else "Information Technology") for i, t in enumerate(population)
+        }
+        unlabeled = population[0]
+        labels.pop(unlabeled)
+        cycle_job._write_features(store, days=[AS_OF], tickers=[*population, "SPY"], sectors=labels)
+        decision = _decide(store, arm.arm_id, arm.recipe.benchmark, AS_OF.isoformat())
+        sectors = dict(zip(decision.universe.tickers, decision.universe.sectors, strict=True))
+        for ticker, label in labels.items():
+            assert sectors[ticker] == label
+        assert sectors[unlabeled] == UNCLASSIFIED_SECTOR
+        assert decision.unclassified_sector == (unlabeled,)
+        assert sectors["SPY"] == "__benchmark__"
+
+    def test_the_cap_binds_on_the_resolved_sectors(self, world) -> None:
+        store, arm, population = self._produced(world)
+        one_sector = {t: "Information Technology" for t in population}
+        cycle_job._write_features(
+            store, days=[AS_OF], tickers=[*population, "SPY"], sectors=one_sector
+        )
+        decision = _decide(store, arm.arm_id, arm.recipe.benchmark, AS_OF.isoformat())
+        params = replace(_params(world[1]), max_sector_pct=0.25)
+        book = construct_book(
+            recipe=arm.recipe,
+            params=params,
+            universe=decision.universe,
+            sessions=decision.sessions,
+            portfolio_notional=params.book_notional_usd,
+            w_initial=_cash(decision.universe),
+        )
+        (weights,) = book.weights
+        stock = sum(
+            w for t, w in zip(decision.universe.tickers, weights, strict=True) if t in one_sector
+        )
+        assert stock <= 0.25 + 1e-4
+
+    def test_a_day_whose_panel_labels_no_name_is_refused(self, world) -> None:
+        store, arm, population = self._produced(world)
+        cycle_job._write_features(store, days=[AS_OF], tickers=[*population, "SPY"], sectors={})
+        with pytest.raises(MissingArtifactError, match="labels none of the"):
+            _decide(store, arm.arm_id, arm.recipe.benchmark, AS_OF.isoformat())

@@ -45,7 +45,7 @@ import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import yaml
@@ -76,6 +76,7 @@ from crucible.portfolio import (
 from crucible.slots.arms import SupersededArmUndeclaredError, resolve_declared_lineage
 from crucible.slots.inputs import InputRefusal, SlotUnservableError
 from crucible.slots.vocab import refuse_unknown_keys
+from crucible.store import Store
 
 __all__ = [
     "ALPHA_SLOT",
@@ -1365,16 +1366,21 @@ CASH_TICKER = "__CASH__"
 BENCHMARK_SECTOR = "__benchmark__"
 CASH_SECTOR = "__cash__"
 
-#: The sector label every real name carries today, and the reason it does.
-#: The v2 price panel (`crucible.keys.data_panel_key`) carries
-#: `trading_day, ticker, open_raw, high_raw, low_raw, close_raw, volume_raw`
-#: and no sector column; the feature catalogue declares no sector producer
-#: either. A sentinel rather than a guess: `max_sector_pct` then binds on no
-#: group at all, which is visibly a cap that did not apply, where inventing
-#: one sector per name would make it bind on singletons and inventing one
-#: shared sector would make it bind on everything. Recorded on every session
-#: inputs document as `sectors_source` so the absence is read, not assumed.
-UNSECTORED = "__unsectored__"
+#: The compiled feature column a real name's sector is read from
+#: (`crucible.features.registry` `sector_raw`: the GICS sector of the newest
+#: constituents snapshot FETCHED before the session, `crucible.data.point_in_time`).
+#: Until `alpha-engine-config-I12024` the book universe never read it and every
+#: name carried one `__unsectored__` sentinel, so `max_sector_pct` bound no group
+#: and a book could hold 86% in one sector (the 2026-11-06 target: PLTR, MU, SNDK
+#: and CVLT, all Information Technology).
+SECTOR_FEATURE_COLUMN = "sector_raw"
+
+#: The sector a real name carries when no decision day's feature panel labels
+#: it. Deliberately NOT of the `__x__` sentinel shape: `_real_sectors` then caps
+#: it as a group of its own at `max_sector_pct`, so a name with no sector is
+#: never a free pass around the cap — the names that lack one share one bucket,
+#: and that bucket is bounded like any sector.
+UNCLASSIFIED_SECTOR = "unclassified"
 
 #: Trading days of returns history the covariance estimate is taken over.
 COVARIANCE_LOOKBACK_TRADING_DAYS = 260
@@ -2246,9 +2252,11 @@ def _resolved_session(
         alpha_source=alpha_source,
         eligibility_source=eligibility_source,
         sectors_source=(
-            "absent — the v2 price panel carries no sector column and the feature "
-            f"catalogue declares no sector producer, so every name carries {UNSECTORED!r} "
-            "and `max_sector_pct` binds on no group. Recorded rather than guessed."
+            f"features[{SECTOR_FEATURE_COLUMN}] — the GICS sector the compiled feature "
+            "layer carries for each name, resolved with the book universe "
+            "(`crucible.slots.inputs.resolve_strategy_sessions`); a name it does not "
+            f"label is {UNCLASSIFIED_SECTOR!r}, a group capped at `max_sector_pct` like "
+            "any sector."
         ),
         stance_caps_source=(
             "uniform 1.0 — no conviction-stance producer exists in v2 (phase 5). A "
@@ -2870,6 +2878,65 @@ def _adv_by_day(
     return cache
 
 
+def _read_session_sectors(
+    store: Store, *, feature_version: str, trading_day: str
+) -> dict[str, str]:
+    """This trading day's :data:`SECTOR_FEATURE_COLUMN`, one entry per ticker the
+    compiled feature layer labels — or an empty mapping.
+
+    A null or blank label is left out rather than carried as a value: the
+    feature layer nulls the whole column on a session its sector group did not
+    measure (`crucible.data.point_in_time`), and an absent name is what
+    :func:`_universe_for` turns into :data:`UNCLASSIFIED_SECTOR`.
+    """
+    key = features_key(feature_version, trading_day)
+    if not store.exists(key):
+        return {}
+    frame = read_features(store.get_bytes(key))
+    if SECTOR_FEATURE_COLUMN not in frame.columns:
+        return {}
+    tickers = cast("Iterable[object]", frame["ticker"])
+    labels = cast("Iterable[object]", frame[SECTOR_FEATURE_COLUMN])
+    return {
+        str(ticker): label.strip()
+        for ticker, label in zip(tickers, labels, strict=True)
+        if isinstance(label, str) and label.strip()
+    }
+
+
+def sectors_by_name(
+    store: Store,
+    *,
+    feature_version: str,
+    days: Sequence[str],
+    names: Iterable[str],
+    cache: dict[str, dict[str, str]],
+) -> dict[str, str]:
+    """Each name's sector from the EARLIEST of ``days`` whose feature panel labels it.
+
+    The book universe is one frozen object across a walk (:class:`BookUniverse`),
+    so a name carries one sector for the whole walk. The earliest labelling day
+    is chosen so no session is capped on a label from later than its own walk's
+    start, except a name that entered the panel later — its label is the first
+    one that existed for it. The trader resolves one day, so its labels are that
+    day's exactly. ``cache`` is shared like the ADV cache: one read per day per
+    grade cycle, not one per arm.
+    """
+    wanted = set(names)
+    out: dict[str, str] = {}
+    for day in days:
+        if wanted <= out.keys():
+            break
+        if day not in cache:
+            cache[day] = _read_session_sectors(
+                store, feature_version=feature_version, trading_day=day
+            )
+        for name, label in cache[day].items():
+            if name in wanted and name not in out:
+                out[name] = label
+    return out
+
+
 def _build_sessions(
     resolved: Sequence[ResolvedSession],
     *,
@@ -2987,7 +3054,11 @@ def _build_sessions(
 
 
 def _universe_for(
-    resolved: Sequence[ResolvedSession], *, benchmark: str, held: Iterable[str] = ()
+    resolved: Sequence[ResolvedSession],
+    *,
+    benchmark: str,
+    held: Iterable[str] = (),
+    sectors: Mapping[str, str] | None = None,
 ) -> BookUniverse:
     """The union of every session's priced names and the held names, plus the two sentinels.
 
@@ -3006,7 +3077,12 @@ def _universe_for(
     mid-walk would make every weight vector a different object and the
     turnover between two of them meaningless — so the shape is fixed here and
     the MOVEMENT is expressed where it belongs, in `eligibility`.
+
+    ``sectors`` maps a name to its sector (:func:`sectors_by_name`). A name it
+    does not carry — or every name, when it is ``None`` — is
+    :data:`UNCLASSIFIED_SECTOR`, which the sector cap bounds as one group.
     """
+    labels = sectors or {}
     names = sorted(
         ({t for session in resolved for t in session.tickers} | {str(t) for t in held})
         - {benchmark, CASH_TICKER}
@@ -3014,7 +3090,11 @@ def _universe_for(
     tickers = (*names, benchmark, CASH_TICKER)
     return BookUniverse(
         tickers=tickers,
-        sectors=(*(UNSECTORED for _ in names), BENCHMARK_SECTOR, CASH_SECTOR),
+        sectors=(
+            *(labels.get(n, UNCLASSIFIED_SECTOR) for n in names),
+            BENCHMARK_SECTOR,
+            CASH_SECTOR,
+        ),
         benchmark_idx=len(names),
         cash_idx=len(names) + 1,
     )
@@ -3147,6 +3227,7 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
     # arm's point-in-time pass and its `_attest` re-resolution — not one per
     # arm, which would re-read the same day's artifact once per registered arm.
     adv_cache: dict[str, dict[str, float]] = {}
+    sector_cache: dict[str, dict[str, str]] = {}
 
     series: dict[str, ArmSeries] = {}
     preconditions: dict[str, list[ServingPrecondition]] = {}
@@ -3202,6 +3283,7 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
             feature_version=feature_version,
             returns=returns,
             adv_cache=adv_cache,
+            sector_cache=sector_cache,
         )
         resolved = list(arm_inputs.resolved)
         universe = arm_inputs.universe

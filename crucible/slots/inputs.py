@@ -1377,6 +1377,11 @@ class StrategySessionInputs:
     #: reconciled into the universe (`alpha-engine-config-I10754`). Empty for a
     #: walk that starts from cash, which is every grade.
     held_tickers: tuple[str, ...] = ()
+    #: The real names no decision day's feature panel gave a sector, so they
+    #: share the capped `UNCLASSIFIED_SECTOR` bucket (`alpha-engine-config-I12024`).
+    #: Recorded rather than only logged, so "which names did the cap bound
+    #: blind" is a field a caller can write down.
+    unclassified_sector: tuple[str, ...] = ()
 
 
 def _read_recorded_sessions(
@@ -1453,6 +1458,7 @@ def resolve_strategy_sessions(
     adv_cache: dict[str, dict[str, float]] | None = None,
     unsettled_last: bool = False,
     held_tickers: Iterable[str] | None = None,
+    sector_cache: dict[str, dict[str, str]] | None = None,
 ) -> StrategySessionInputs:
     """One S arm's construction inputs over ``decision_days`` — THE S-slot resolution.
 
@@ -1494,6 +1500,16 @@ def resolve_strategy_sessions(
     decision day RAISES: an exit with no price is not a trade anyone can fill.
     Pass only non-zero holdings: a zero-weight name adds a column the grade's
     universe would not have.
+
+    **Sectors** (`alpha-engine-config-I12024`). Each name's sector is the
+    compiled feature layer's `sector_raw` from the earliest decision day that
+    labels it (`crucible.slots.strategy.sectors_by_name`), so `max_sector_pct`
+    binds. A name no day labels is `UNCLASSIFIED_SECTOR` — one bucket, capped
+    like any sector — and is listed on ``unclassified_sector``. A
+    walk whose panels label NO name RAISES `MissingArtifactError`: the sector
+    group did not measure, and capping the whole book as one unclassified
+    bucket would sell three quarters of it on a data outage and buy it back the
+    day after. ``sector_cache`` is shared like ``adv_cache``.
     """
     from dataclasses import replace  # noqa: PLC0415 - local
 
@@ -1507,6 +1523,7 @@ def resolve_strategy_sessions(
         _adv_by_day,
         _build_sessions,
         _universe_for,
+        sectors_by_name,
     )
 
     resolved, keys = _read_recorded_sessions(store, arm_id=arm_id, decision_days=decision_days)
@@ -1566,7 +1583,28 @@ def resolve_strategy_sessions(
             "champion's cross-section is exited at the session's price; a held name with "
             "no price at all cannot be exited, sized or marked, and no proxy is substituted."
         )
-    universe = _universe_for(resolved, benchmark=benchmark, held=held)
+    real_names = sorted(
+        ({t for session in resolved for t in session.tickers} | set(held))
+        - {benchmark, CASH_TICKER}
+    )
+    sectors = sectors_by_name(
+        store,
+        feature_version=feature_version or DEFAULT_FEATURE_VERSION,
+        days=decision_days,
+        names=real_names,
+        cache={} if sector_cache is None else sector_cache,
+    )
+    if real_names and not sectors:
+        raise MissingArtifactError(
+            f"arm {arm_id!r}: the compiled feature layer labels none of the "
+            f"{len(real_names)} names with a sector on {list(decision_days)}. The sector "
+            "group did not measure, so `max_sector_pct` has nothing to bind on; capping "
+            "the whole book as one unclassified bucket would force a sell-down on a data "
+            "outage, so no book is constructed. Recompile the day's features with:\n"
+            f"    crucible data.daily --date {decision_days[-1]}"
+        )
+    unclassified = tuple(n for n in real_names if n not in sectors)
+    universe = _universe_for(resolved, benchmark=benchmark, held=held, sectors=sectors)
     adv = _adv_by_day(
         store,
         feature_version=feature_version or DEFAULT_FEATURE_VERSION,
@@ -1595,4 +1633,5 @@ def resolve_strategy_sessions(
         session_inputs_keys=tuple(keys),
         settled=placeholder is None,
         held_tickers=held,
+        unclassified_sector=unclassified,
     )

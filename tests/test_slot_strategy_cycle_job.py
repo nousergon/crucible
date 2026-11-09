@@ -188,23 +188,33 @@ attribution:
 
 
 def _write_features(
-    store, *, days: list[dt.date], tickers: list[str], dollar_volume_usd: float = 5e8
+    store,
+    *,
+    days: list[dt.date],
+    tickers: list[str],
+    dollar_volume_usd: float | None = 5e8,
+    sectors: dict[str, str] | None = None,
 ) -> None:
-    """Compile a minimal `dollar_volume_20d_raw` feature artifact per day.
+    """Compile a minimal `dollar_volume_20d_raw` + `sector_raw` feature artifact per day.
 
-    Enough to exercise `crucible.slots.strategy._read_session_adv` — it reads
-    `ticker` and the ADV column and nothing else — without pulling in the
-    full feature-compilation pipeline, which is `crucible/features/compute.py`
-    and out of scope for this job's own tests.
+    Enough to exercise `crucible.slots.strategy._read_session_adv` and
+    `_read_session_sectors` — they read `ticker` and their own column and
+    nothing else — without pulling in the full feature-compilation pipeline,
+    which is `crucible/features/compute.py` and out of scope for this job's own
+    tests. Every name gets a sector of its own unless ``sectors`` says
+    otherwise, so the sector cap binds no wider than the per-name cap.
+    ``dollar_volume_usd=None`` writes no ADV column (a sector-only panel).
     """
+    labels = sectors if sectors is not None else {t: f"sector-{t}" for t in tickers}
     for day in days:
-        frame = pd.DataFrame(
-            {
-                "trading_day": [day.isoformat()] * len(tickers),
-                "ticker": tickers,
-                "dollar_volume_20d_raw": [dollar_volume_usd] * len(tickers),
-            }
-        )
+        columns: dict[str, list[object]] = {
+            "trading_day": [day.isoformat()] * len(tickers),
+            "ticker": list(tickers),
+            "sector_raw": [labels.get(t) for t in tickers],
+        }
+        if dollar_volume_usd is not None:
+            columns["dollar_volume_20d_raw"] = [dollar_volume_usd] * len(tickers)
+        frame = pd.DataFrame(columns)
         store.put_bytes(
             features_key(DEFAULT_FEATURE_VERSION, day.isoformat()),
             frame.to_parquet(index=False),
@@ -284,6 +294,10 @@ def world(tmp_path):
                 sort_keys=True,
             ).encode("utf-8"),
         )
+
+    # Sector only: the construction reads `sector_raw` for every arm, while ADV
+    # is a participation-aware arm's input and its absence is tested on its own.
+    _write_features(store, days=decision_days, tickers=[*tickers, "SPY"], dollar_volume_usd=None)
 
     root = tmp_path / "strategy"
     (root / "arms" / SLOT).mkdir(parents=True)
@@ -435,7 +449,7 @@ class TestTheEvidenceReachesARealManifest:
             assert document["alpha_source"] == arm_predictions_key(M_CHAMPION, day.isoformat())
             assert document["eligibility_source"] == shadow_key(U_CHAMPION, day.isoformat())
             # Each absence is a SENTENCE on the record, not a missing key.
-            assert "no sector column" in document["sectors_source"]
+            assert "sector_raw" in document["sectors_source"]
             assert "no conviction-stance producer" in document["stance_caps_source"]
 
     def test_the_grade_is_point_in_time_not_reconstructed(self, world) -> None:

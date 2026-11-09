@@ -79,7 +79,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -526,8 +526,9 @@ class PortfolioParams:
     #: The most of the book one name may carry (`alpha-engine-config-I13305`).
     #: ``null`` disables it. The benchmark fill and the cash sleeve are exempt:
     #: one is the passive leg, the other is pinned. Until 2026-11-06 nothing
-    #: bounded a name -- stance caps are uniform 1.0 and every v2 name is
-    #: unsectored -- so a champion book could put 88% in MU.
+    #: bounded a name -- stance caps are uniform 1.0 and every v2 name was
+    #: unsectored until `alpha-engine-config-I12024` -- so a champion book
+    #: could put 88% in MU.
     max_position_pct: float | None
     #: What happens to a held name the eligibility cut drops. ``forced`` pins it
     #: to zero this session (a mandatory exit, outside the turnover budget).
@@ -953,6 +954,7 @@ def solve_target_weights(
         alpha_hat=alpha_hat,
         alpha_uncertainty=alpha_uncertainty,
         benchmark_idx=benchmark_idx,
+        sectors=sectors,
     )
 
     problem = cp.Problem(objective, constraints)
@@ -1537,6 +1539,7 @@ def _mandatory_turnover_floor(
     effective_caps: np.ndarray,
     cash_idx: int,
     params: PortfolioParams,
+    sectors: Sequence[str] | None = None,
 ) -> float:
     """One-way turnover the OTHER constraints force, regardless of alpha.
 
@@ -1559,16 +1562,49 @@ def _mandatory_turnover_floor(
 
     ``(Σd + |r|)/2`` is therefore an attainable one-way turnover for a point
     satisfying the box, the sleeve pin and the budget identity.
+
+    ``sectors`` adds the sector cap (`alpha-engine-config-I12024`): a held
+    sector above `max_sector_pct` is scaled down to it after the box
+    projection, and that sell-down is forced too. Without it a book that held
+    52% in one sector made the program infeasible under a 20% budget and fell
+    to the hold path — the cap would never have been reached.
+    """
+    projected = _forced_projection(w_prev, effective_caps, cash_idx, params, sectors)[1]
+    forced_l1 = float(np.sum(np.abs(projected - w_prev)))
+    residual = abs(1.0 - float(projected.sum()))
+    return (forced_l1 + residual) / 2.0
+
+
+def _forced_projection(
+    w_prev: np.ndarray,
+    effective_caps: np.ndarray,
+    cash_idx: int,
+    params: PortfolioParams,
+    sectors: Sequence[str] | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """``w_prev`` projected into the per-name box, then into every sector cap.
+
+    Returns ``(box_projected, projected)``. Each over-cap real sector is scaled
+    down pro rata to `max_sector_pct` — the smallest L1 move that satisfies the
+    group bound when every member keeps its sign. The two stages are returned
+    separately so the decomposition can attribute each unit to its cause.
     """
     lower = np.zeros_like(w_prev)
     upper = np.array(effective_caps, dtype=float)
     sleeve = float(params.cash_sleeve_pct)
     lower[cash_idx] = sleeve
     upper[cash_idx] = sleeve
-    projected = np.clip(w_prev, lower, upper)
-    forced_l1 = float(np.sum(np.abs(projected - w_prev)))
-    residual = abs(1.0 - float(projected.sum()))
-    return (forced_l1 + residual) / 2.0
+    box = np.clip(w_prev, lower, upper)
+    projected = box.copy()
+    if sectors is not None:
+        cap = float(params.max_sector_pct)
+        labels = list(sectors)
+        for label in _real_sectors(labels):
+            idx = [i for i, s in enumerate(labels) if s == label]
+            held = float(projected[idx].sum())
+            if held > cap:
+                projected[idx] *= cap / held
+    return box, projected
 
 
 def _decompose_mandatory_turnover(
@@ -1577,7 +1613,8 @@ def _decompose_mandatory_turnover(
     eligibility: np.ndarray,
     cash_idx: int,
     params: PortfolioParams,
-) -> dict:
+    sectors: Sequence[str] | None = None,
+) -> dict[str, float | int | list[str]]:
     """Which constraint forced each unit of the mandatory floor.
 
     "How much of today's trading was forced" has a different fix for each of
@@ -1591,16 +1628,16 @@ def _decompose_mandatory_turnover(
       independent, and the one of the three whose right response is a design
       question rather than an acknowledgement.
 
+    * ``sector_cap`` — a held sector sits above `max_sector_pct`, after the
+      per-name box (`alpha-engine-config-I12024`). Zero when no sectors are
+      supplied.
+
     Emitted on every solve, healthy included: a component emitting nothing is
     not healthy, it is unobserved.
     """
-    sleeve = float(params.cash_sleeve_pct)
-    lower = np.zeros_like(w_prev)
-    upper = np.array(effective_caps, dtype=float)
-    lower[cash_idx] = sleeve
-    upper[cash_idx] = sleeve
-    projected = np.clip(w_prev, lower, upper)
-    per_name = np.abs(projected - w_prev)
+    box, projected = _forced_projection(w_prev, effective_caps, cash_idx, params, sectors)
+    per_name = np.abs(box - w_prev)
+    sector_l1 = float(np.sum(np.abs(projected - box)))
 
     idx = np.arange(len(w_prev))
     is_cash = idx == cash_idx
@@ -1620,14 +1657,21 @@ def _decompose_mandatory_turnover(
     ]
     pinned_out = [int(i) for i in idx if is_ineligible[i] and per_name[i] > 1e-9]
 
+    labels: list[str] = list(sectors) if sectors is not None else []
+    over_sector = sorted(
+        {labels[i] for i in range(len(labels)) if abs(float(projected[i] - box[i])) > 1e-9}
+    )
+
     return {
         "cash_sleeve_pin": sleeve_l1 / 2.0,
         "ineligibility_pin": ineligible_l1 / 2.0,
         "position_cap": cap_l1 / 2.0,
+        "sector_cap": sector_l1 / 2.0,
         "renormalization": residual / 2.0,
-        "total": (sleeve_l1 + ineligible_l1 + cap_l1 + residual) / 2.0,
+        "total": (sleeve_l1 + ineligible_l1 + cap_l1 + sector_l1 + residual) / 2.0,
         "n_names_over_cap": len(over_cap),
         "n_names_pinned_out": len(pinned_out),
+        "sectors_over_cap": over_sector,
     }
 
 
@@ -1751,6 +1795,7 @@ def _apply_turnover_constraint(
     alpha_hat: np.ndarray | None = None,
     alpha_uncertainty: np.ndarray | None = None,
     benchmark_idx: int | None = None,
+    sectors: Sequence[str] | None = None,
 ) -> dict:
     """Append the L1 daily-turnover budget to ``constraints``.
 
@@ -1796,9 +1841,11 @@ def _apply_turnover_constraint(
     }
     if cap is None or cap <= 0:
         return meta
-    floor = _mandatory_turnover_floor(w_prev, effective_caps, cash_idx, params)
+    floor = _mandatory_turnover_floor(w_prev, effective_caps, cash_idx, params, sectors)
     by_cause = (
-        _decompose_mandatory_turnover(w_prev, effective_caps, eligibility, cash_idx, params)
+        _decompose_mandatory_turnover(
+            w_prev, effective_caps, eligibility, cash_idx, params, sectors
+        )
         if eligibility is not None
         else None
     )
