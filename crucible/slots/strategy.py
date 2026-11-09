@@ -67,6 +67,7 @@ from crucible.portfolio import (
     CostModelInputError,
     PortfolioParams,
     cost_model_from_mapping,
+    forced_exit_mask,
     load_portfolio_params_from_store,
     make_cash_sentinel_returns,
     portfolio_evidence,
@@ -888,6 +889,13 @@ class SessionInputs:
     name_sigma: np.ndarray | None = None
     alpha_uncertainty: np.ndarray | None = None
     alpha_uncertainty_epistemic: np.ndarray | None = None
+    #: The hard-risk layer's FORCED exits for this session (`crucible.hard_risk`):
+    #: shape (N,) bool, pinned to zero above eligibility and outside the
+    #: turnover budget. ``None`` when the caller supplies no hard-risk input
+    #: -- a grade walk has no broker average cost or NAV to evaluate it on.
+    hard_exit: np.ndarray | None = None
+    #: The drawdown ladder's sizing multiplier for this session (1.0 = off).
+    buy_multiplier: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -910,6 +918,7 @@ class ConstructedBook:
 def _refuse_an_unpriceable_forced_exit(
     *,
     recipe: StrategyRecipe,
+    params: PortfolioParams,
     universe: BookUniverse,
     session: SessionInputs,
     w_prev: np.ndarray,
@@ -928,7 +937,15 @@ def _refuse_an_unpriceable_forced_exit(
     """
     if recipe.cost_model.kind == "flat":
         return
-    eligible = np.asarray(session.eligibility, dtype=bool)
+    # A forced exit (the hard-risk layer or the negative-alpha pin) trades the
+    # whole holding exactly like an ineligibility pin does.
+    eligible = np.asarray(session.eligibility, dtype=bool) & ~forced_exit_mask(
+        np.asarray(session.alpha_hat, dtype=np.float64),
+        session.hard_exit,
+        universe.benchmark_idx,
+        universe.cash_idx,
+        params,
+    )
     adv = (
         np.full(len(universe.tickers), np.nan)
         if session.adv_usd is None
@@ -1005,7 +1022,7 @@ def construct_book(
 
     for session in sessions:
         _refuse_an_unpriceable_forced_exit(
-            recipe=recipe, universe=universe, session=session, w_prev=w_prev
+            recipe=recipe, params=params, universe=universe, session=session, w_prev=w_prev
         )
         result = solve_target_weights(
             list(universe.tickers),
@@ -1025,6 +1042,8 @@ def construct_book(
             adv_usd=session.adv_usd,
             portfolio_notional=portfolio_notional,
             name_sigma=session.name_sigma,
+            hard_exit=session.hard_exit,
+            buy_multiplier=session.buy_multiplier,
         )
         weights = np.asarray(result.weights, dtype=np.float64)
         delta = weights - w_prev
