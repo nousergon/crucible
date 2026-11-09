@@ -449,6 +449,7 @@ PORTFOLIO_PARAM_FIELDS: dict[str, str] = {
     "book_notional_usd": "number",
     "max_position_pct": "number-or-null",
     "ineligible_held_exit": "string",
+    "rebalance_band_pct": "number-or-null",
 }
 
 #: ROLLOUT ONLY (alpha-engine-config-I13305): the two fields added on
@@ -463,6 +464,10 @@ PORTFOLIO_PARAM_FIELDS: dict[str, str] = {
 _ROLLOUT_ABSENT: Mapping[str, float | str | None] = {
     "max_position_pct": None,
     "ineligible_held_exit": "forced",
+    # ROLLOUT ONLY, same two-reader reasoning: the v1 no-trade band (parity
+    # audit 2026-11-09, row 17). Absent reads as OFF -- every delta trades, the
+    # behaviour before the field existed.
+    "rebalance_band_pct": None,
 }
 
 #: The values `PortfolioParams.ineligible_held_exit` admits.
@@ -536,8 +541,21 @@ class PortfolioParams:
     #: never adds to it: a name falling one rank out of the cut is not sold
     #: whole the day after it was bought (2026-11-06, SNDK).
     ineligible_held_exit: str
+    #: The no-trade band (v1 parity audit 2026-11-09, row 17; v1
+    #: `optimizer_shadow._compute_trade_deltas`). After the solve, a name whose
+    #: weight would move by less than this fraction of the book keeps its held
+    #: weight and cash absorbs the difference: a few basis points of drift is
+    #: not worth a trade, and a daily trim-and-add is churn. A move to ZERO and
+    #: a cap-forced trim are never banded -- an exit is not drift. ``null``
+    #: disables the band. See :func:`_apply_rebalance_band`.
+    rebalance_band_pct: float | None
 
     def __post_init__(self) -> None:
+        if self.rebalance_band_pct is not None and not 0.0 < self.rebalance_band_pct < 1.0:
+            raise PortfolioParamsError(
+                f"rebalance_band_pct must be in (0, 1) or null; got {self.rebalance_band_pct}. "
+                "Zero is spelled null."
+            )
         if self.max_position_pct is not None and not 0.0 < self.max_position_pct <= 1.0:
             raise PortfolioParamsError(
                 f"max_position_pct must be in (0, 1] or null; got {self.max_position_pct}"
@@ -987,6 +1005,9 @@ def solve_target_weights(
         turnover_meta=turnover_meta,
         clip_mass_zeroed=clip_mass_zeroed,
     )
+    weights, band_meta = _apply_rebalance_band(
+        weights, w_prev, effective_caps, tickers, cash_idx, params
+    )
     diagnostics = _build_diagnostics(
         weights,
         w_prev,
@@ -1000,6 +1021,7 @@ def solve_target_weights(
         alpha_unc_meta=alpha_unc_meta,
     )
     diagnostics.update(governor)
+    diagnostics["rebalance_band"] = band_meta
     diagnostics.update(tcost.diagnostics)
     diagnostics.update(adv_cap_meta)
     diagnostics["solver_attempts"] = solver_notes
@@ -1950,6 +1972,88 @@ def _apply_turnover_governor(
                 "condition."
             )
     return weights, gov
+
+
+#: A weight move below this is solver noise, not an intention (v1
+#: `optimizer_shadow._DUST_DELTA`): never recorded as a trade the band removed.
+_BAND_DUST_DELTA = 1e-6
+
+
+def _apply_rebalance_band(
+    weights: np.ndarray,
+    w_prev: np.ndarray,
+    effective_caps: np.ndarray,
+    tickers: list[str],
+    cash_idx: int,
+    params: PortfolioParams,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Hold every name whose move is inside the no-trade band; cash absorbs it.
+
+    v1 parity row 17 (`optimizer_shadow._compute_trade_deltas`,
+    ``rebalance_band_pct``). v1 dropped the small TRADE and let its target
+    weight stand, so the book it reported and the book it held disagreed. Here
+    the band edits the target itself, so the weights a session returns are the
+    weights it trades, and the S grade walks the same banded book the trader
+    holds.
+
+    Never banded: cash (the residual), a move to zero (an exit is not drift --
+    an ineligibility pin, a forced exit and the dust floor all land here), and
+    a held weight above its effective cap (the trim is mandatory). The band only
+    ever SHRINKS a move, so the one-way turnover it returns is never above the
+    solve's, and the turnover budget the solve satisfied still holds.
+
+    The cash it leaves is never below the cash the solve chose: if the banded
+    sells would have funded more than the banded buys freed, the largest banded
+    sells are restored until cash is whole again. Gross exposure therefore
+    never exceeds the solve's, so the band cannot put the book on margin.
+
+    The block it returns is recorded on EVERY solve, empty or not: an empty list
+    is a band that ran and found nothing, an absent key is a band nobody can
+    show ran (v1 alpha-engine-config-I7346 -- a deleted entry once rendered
+    identically to a quiet day).
+    """
+    band = params.rebalance_band_pct
+    meta: dict[str, object] = {"band": band, "held": [], "restored_sells": []}
+    if band is None:
+        return weights, meta
+    out = np.asarray(weights, dtype=float).copy()
+    prev = np.asarray(w_prev, dtype=float)
+    caps = np.asarray(effective_caps, dtype=float)
+    delta = out - prev
+    banded = (
+        (np.abs(delta) < float(band))
+        & (np.abs(delta) >= _BAND_DUST_DELTA)
+        & (out > 0.0)
+        & (prev <= caps + _BAND_DUST_DELTA)
+    )
+    banded[cash_idx] = False
+    solved_cash = float(out[cash_idx])
+    out[banded] = prev[banded]
+    out[cash_idx] = solved_cash + float(np.sum(delta[banded]))
+    restored: list[int] = []
+    if out[cash_idx] < solved_cash - _BAND_DUST_DELTA:
+        # Banded sells whose proceeds the buys were counting on: restore the
+        # largest first until cash is back to what the solve chose.
+        for i in sorted(np.where(banded & (delta < 0.0))[0], key=lambda j: (delta[j], j)):
+            out[i] = weights[i]
+            out[cash_idx] += float(delta[i]) * -1.0
+            banded[i] = False
+            restored.append(int(i))
+            if out[cash_idx] >= solved_cash - _BAND_DUST_DELTA:
+                break
+    meta["held"] = [
+        {
+            "ticker": tickers[i],
+            "target_weight": round(float(weights[i]), 6),
+            "held_weight": round(float(prev[i]), 6),
+            "delta": round(float(delta[i]), 6),
+            "is_new_position": bool(prev[i] == 0.0),
+        }
+        for i in np.where(banded)[0]
+    ]
+    meta["restored_sells"] = sorted(tickers[i] for i in restored)
+    meta["cash_absorbed"] = round(float(out[cash_idx]) - solved_cash, 8)
+    return out, meta
 
 
 def _build_diagnostics(
