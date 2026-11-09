@@ -1549,13 +1549,42 @@ class TestSectorCapIsAForcedSellDown:
         u["alpha_hat"][:4] = 0.05
         u["stance_caps"][:4] = 1.0
         u["w_prev"] = np.array([0.30, 0.22, 0.0, 0.0, 0.45, 0.03])
-        u["params"] = _params(max_sector_pct=0.25, max_daily_turnover=0.05)
+        u["params"] = _params(max_sector_pct=0.25, max_daily_turnover=0.05, sector_cap_mode="full")
         result = _solve(u)
         assert result.diagnostics["status"] != "infeasible_fallback"
         assert result.weights[:3].sum() <= 0.25 + 1e-4
         by_cause = result.diagnostics["turnover_mandatory_floor_by_cause"]
         assert by_cause["sector_cap"] == pytest.approx(0.135, abs=1e-6)
         assert result.diagnostics["turnover_mandatory_floor"] == pytest.approx(0.27, abs=1e-6)
+
+    @pytest.mark.parametrize("mode", [None, "buys_only"])
+    def test_buys_only_never_forces_a_sale_and_never_lets_the_sector_grow(self, mode):
+        u = _baseline_universe(n_active=4, sector_labels=["tech", "tech", "tech", "energy"])
+        u["alpha_hat"][:4] = 0.05
+        u["stance_caps"][:4] = 1.0
+        u["w_prev"] = np.array([0.30, 0.22, 0.0, 0.0, 0.45, 0.03])
+        u["params"] = _params(max_sector_pct=0.25, max_daily_turnover=0.05, sector_cap_mode=mode)
+        result = _solve(u)
+        w = result.weights
+        assert result.diagnostics["status"] != "infeasible_fallback"
+        assert result.diagnostics["sector_cap_mode"] == "buys_only"
+        assert result.diagnostics["sectors_held_over_cap"] == ["tech"]
+        # No name in the over-cap sector grows, the unheld one is not bought,
+        # and nothing is forced: the floor carries no sector term.
+        assert np.all(w[:3] <= u["w_prev"][:3] + 1e-6)
+        assert w[2] == pytest.approx(0.0, abs=1e-6)
+        assert result.diagnostics["turnover_mandatory_floor_by_cause"]["sector_cap"] == 0.0
+        assert result.diagnostics["turnover_mandatory_floor"] == pytest.approx(0.0, abs=1e-9)
+
+    def test_buys_only_still_caps_a_sector_held_under_the_cap(self):
+        u = _baseline_universe(n_active=5, sector_labels=["tech"] * 5)
+        u["alpha_hat"][:5] = 0.05
+        u["params"] = _params(max_sector_pct=0.20, sector_cap_mode="buys_only")
+        assert _solve(u).weights[:5].sum() <= 0.20 + 1e-4
+
+    def test_an_unknown_sector_cap_mode_is_refused(self):
+        with pytest.raises(PortfolioParamsError, match="sector_cap_mode"):
+            _params(sector_cap_mode="sometimes")
 
     def test_the_unclassified_bucket_is_capped_like_any_sector(self):
         # Names with no sector share one bucket; it is not a free pass.

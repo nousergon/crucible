@@ -13806,14 +13806,6 @@
                 }
             },
             {
-                "code": "reportUnknownMemberType",
-                "range": {
-                    "startColumn": 27,
-                    "endColumn": 33,
-                    "lineCount": 1
-                }
-            },
-            {
                 "code": "reportUnknownVariableType",
                 "range": {
                     "startColumn": 4,

@@ -449,6 +449,7 @@ PORTFOLIO_PARAM_FIELDS: dict[str, str] = {
     "book_notional_usd": "number",
     "max_position_pct": "number-or-null",
     "ineligible_held_exit": "string",
+    "sector_cap_mode": "string-or-null",
 }
 
 #: ROLLOUT ONLY (alpha-engine-config-I13305): the two fields added on
@@ -463,7 +464,14 @@ PORTFOLIO_PARAM_FIELDS: dict[str, str] = {
 _ROLLOUT_ABSENT: Mapping[str, float | str | None] = {
     "max_position_pct": None,
     "ineligible_held_exit": "forced",
+    # `alpha-engine-config-I12024`: absent (or null) is `buys_only` -- the cap
+    # never forces a sale, which is the safe reading for a file written before
+    # sectors existed.
+    "sector_cap_mode": None,
 }
+
+#: The values `PortfolioParams.sector_cap_mode` admits; null reads as the first.
+SECTOR_CAP_MODES: tuple[str, ...] = ("buys_only", "full")
 
 #: The values `PortfolioParams.ineligible_held_exit` admits.
 INELIGIBLE_HELD_EXITS: frozenset[str] = frozenset({"forced", "discretionary"})
@@ -537,6 +545,18 @@ class PortfolioParams:
     #: never adds to it: a name falling one rank out of the cut is not sold
     #: whole the day after it was bought (2026-11-06, SNDK).
     ineligible_held_exit: str
+    #: How `max_sector_pct` treats a sector the book already HOLDS above it
+    #: (`alpha-engine-config-I12024`). ``buys_only`` (also null and absent):
+    #: the cap never forces a sale -- no name in that sector may grow, so it
+    #: only shrinks through discretionary turnover and natural exits, and its
+    #: excess is not in the mandatory turnover floor. ``full``: the excess is
+    #: a forced sell-down, outside the turnover budget. A sector held at or
+    #: under the cap is bounded by it identically in both.
+    sector_cap_mode: str | None
+
+    @property
+    def sector_cap_forces_sales(self) -> bool:
+        return self.sector_cap_mode == "full"
 
     def __post_init__(self) -> None:
         if self.max_position_pct is not None and not 0.0 < self.max_position_pct <= 1.0:
@@ -547,6 +567,11 @@ class PortfolioParams:
             raise PortfolioParamsError(
                 f"ineligible_held_exit must be one of {sorted(INELIGIBLE_HELD_EXITS)}; got "
                 f"{self.ineligible_held_exit!r}"
+            )
+        if self.sector_cap_mode is not None and self.sector_cap_mode not in SECTOR_CAP_MODES:
+            raise PortfolioParamsError(
+                f"sector_cap_mode must be one of {list(SECTOR_CAP_MODES)} or null; got "
+                f"{self.sector_cap_mode!r}"
             )
         if self.covariance_shrinkage in _ESTIMATORS_NOT_CARRIED:
             raise PortfolioParamsError(
@@ -636,7 +661,7 @@ class PortfolioParams:
                     )
                 values[name] = None
                 continue
-            if kind == "string":
+            if kind.startswith("string"):
                 values[name] = str(raw)
             elif kind == "boolean":
                 if not isinstance(raw, bool):
@@ -928,9 +953,15 @@ def solve_target_weights(
     if ineligible_idx.size > 0:
         constraints.append(w[ineligible_idx] == 0)
 
+    held_over_cap = _sectors_held_over_cap(w_prev, sectors, params)
     for sector_label in _real_sectors(sectors):
         idx = [i for i, s in enumerate(sectors) if s == sector_label]
-        constraints.append(cp.sum(w[idx]) <= params.max_sector_pct)
+        if sector_label in held_over_cap and not params.sector_cap_forces_sales:
+            # `buys_only`: the sector may not grow and no name in it may be
+            # bought, but nothing in it is forced out.
+            constraints.append(w[idx] <= w_prev[idx])
+        else:
+            constraints.append(cp.sum(w[idx]) <= params.max_sector_pct)  # pyright: ignore[reportUnknownMemberType]  # cvxpy ships no complete stubs
 
     adv_cap_meta = _apply_max_pct_adv_constraint(
         w,
@@ -954,8 +985,12 @@ def solve_target_weights(
         alpha_hat=alpha_hat,
         alpha_uncertainty=alpha_uncertainty,
         benchmark_idx=benchmark_idx,
-        sectors=sectors,
+        sectors=sectors if params.sector_cap_forces_sales else None,
     )
+    sector_meta: dict[str, str | list[str]] = {
+        "sector_cap_mode": params.sector_cap_mode or SECTOR_CAP_MODES[0],
+        "sectors_held_over_cap": sorted(held_over_cap),
+    }
 
     problem = cp.Problem(objective, constraints)
     weights, status, solver_notes = _solve_with_fallback(problem, w)
@@ -977,6 +1012,8 @@ def solve_target_weights(
         diagnostics.update(tcost.diagnostics)
         diagnostics.update(adv_cap_meta)
         diagnostics.update(_turnover_diagnostics(weights, w_prev, turnover_meta))
+        diagnostics["sector_cap_mode"] = sector_meta["sector_cap_mode"]
+        diagnostics["sectors_held_over_cap"] = sector_meta["sectors_held_over_cap"]
         diagnostics["solver_attempts"] = solver_notes
         diagnostics["cost_model"] = cost_model.record()
         return OptimizerResult(weights=weights, diagnostics=diagnostics)
@@ -1004,6 +1041,8 @@ def solve_target_weights(
     diagnostics.update(governor)
     diagnostics.update(tcost.diagnostics)
     diagnostics.update(adv_cap_meta)
+    diagnostics["sector_cap_mode"] = sector_meta["sector_cap_mode"]
+    diagnostics["sectors_held_over_cap"] = sector_meta["sectors_held_over_cap"]
     diagnostics["solver_attempts"] = solver_notes
     # `alpha-engine-config-I10503`: the model in force, on EVERY solve, on the
     # infeasible path too. A cost model recorded only when the solve succeeded
@@ -1425,6 +1464,20 @@ def _estimate_covariance(returns_panel: np.ndarray, params: PortfolioParams) -> 
     one-day risk against a multi-day alpha.
     """
     return params.sigma_horizon_days * _estimate_covariance_daily(returns_panel, params)
+
+
+def _sectors_held_over_cap(
+    w_prev: np.ndarray, sectors: Sequence[str], params: PortfolioParams
+) -> set[str]:
+    """The real sectors ``w_prev`` already holds above `max_sector_pct`."""
+    labels = list(sectors)
+    cap = float(params.max_sector_pct)
+    out: set[str] = set()
+    for label in _real_sectors(labels):
+        held = float(sum(w_prev[i] for i, s in enumerate(labels) if s == label))
+        if held > cap + 1e-9:
+            out.add(label)
+    return out
 
 
 def _real_sectors(sectors: list[str]) -> set[str]:
