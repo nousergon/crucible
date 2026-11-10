@@ -132,6 +132,7 @@ def _solve(
     w_prev: np.ndarray | None = None,
     alpha: np.ndarray | None = None,
     eligibility: np.ndarray | None = None,
+    held_sessions: np.ndarray | None = None,
     **overrides: object,
 ):
     rows, cash_prev = _REPLAY[day]
@@ -158,6 +159,7 @@ def _solve(
         _COST,
         covariance=_covariance(n, bench, cash),
         portfolio_notional=1_000_000.0,
+        held_sessions=held_sessions,
     )
     return tickers, w_prev, result
 
@@ -224,10 +226,13 @@ class TestReplayOfTheCvltRoundTrip:
             lo, hi = sorted((float(w_prev[i]), float(target)))
             assert lo - 1e-6 <= on.weights[i] <= hi + 1e-6, ticker
 
-    def test_the_book_is_whole_and_the_sleeve_pinned(self) -> None:
-        tickers, _w, on = _solve("2026-11-09", aim_adjustment_rate=0.5)
+    def test_the_book_is_whole_and_the_sleeve_steps_toward_its_pin(self) -> None:
+        tickers, w_prev, on = _solve("2026-11-09", aim_adjustment_rate=0.5)
+        cash = tickers.index("__CASH__")
         assert on.weights.sum() == pytest.approx(1.0, abs=1e-9)
-        assert on.weights[tickers.index("__CASH__")] == pytest.approx(0.03, abs=1e-6)
+        assert on.weights[cash] == pytest.approx(
+            w_prev[cash] + 0.5 * (0.03 - w_prev[cash]), abs=1e-6
+        )
         assert np.all(on.weights >= -1e-12)
         assert np.all(on.weights[:-2] <= 0.25 + 1e-6)
 
@@ -275,12 +280,6 @@ class TestStepsNeverDelayAHigherTierExit:
         )
         assert w_prev[cvlt] > 0.10
         assert on.weights[cvlt] == pytest.approx(0.0, abs=1e-9)
-
-    def test_the_cash_sleeve_pin_is_not_stepped(self) -> None:
-        """11-06: 48% idle cash. The sleeve is an equality pin, so it is deployed
-        in full — the engine's existing mandatory-turnover treatment."""
-        tickers, _w, on = _solve("2026-11-06", aim_adjustment_rate=0.5)
-        assert on.weights[tickers.index("__CASH__")] == pytest.approx(0.03, abs=1e-6)
 
 
 class TestFinishTheExitAndDeferTheEntry:
@@ -338,3 +337,169 @@ class TestTheBudgetStillCapsTheDay:
         assert on.diagnostics["status"] == "infeasible_fallback"
         assert on.diagnostics["aim_weights"] is None
         assert on.diagnostics["aim_adjustment"]["reason"] == "infeasible_fallback"
+
+
+class TestIdleCashIsPacedToo:
+    """Brian 2026-11-10, "Pace cash too": idle cash deploys at the same pace as
+    every other move toward the aim, except at inception."""
+
+    def test_the_11_06_cash_deploys_k_of_the_gap_not_all_of_it(self) -> None:
+        """11-06 carried 47.9% cash against a 3% sleeve. Off, the whole ~45
+        points deploys in one session; at k = 1/2 about half of it does."""
+        tickers, w_prev, off = _solve("2026-11-06")
+        _t, _w, on = _solve("2026-11-06", aim_adjustment_rate=0.5)
+        cash = tickers.index("__CASH__")
+        gap = float(w_prev[cash]) - 0.03
+        assert gap > 0.44
+        assert float(w_prev[cash] - off.weights[cash]) == pytest.approx(gap, abs=1e-6)
+        deployed = float(w_prev[cash] - on.weights[cash])
+        assert deployed == pytest.approx(0.5 * gap, abs=1e-6)
+        meta = on.diagnostics["aim_adjustment"]
+        assert meta["cash_paced"] is True
+        assert meta["cash_aim"] == pytest.approx(0.03, abs=1e-6)
+        assert on.diagnostics["aim_weights"]["__CASH__"] == pytest.approx(0.03, abs=1e-6)
+        assert on.weights.sum() == pytest.approx(1.0, abs=1e-9)
+
+    def test_a_forced_trim_is_still_taken_in_full_while_cash_is_paced(self) -> None:
+        tickers, _w, on = _solve("2026-11-06", aim_adjustment_rate=0.25)
+        assert on.weights[tickers.index("SNDK")] <= 0.25 + 1e-6
+        assert "SNDK" in on.diagnostics["aim_adjustment"]["forced_moves"]
+
+    def test_a_first_build_is_never_paced(self) -> None:
+        """Inception: a book holding nothing builds the whole aim in one session."""
+        rows, _cash = _REPLAY["2026-11-06"]
+        w_prev = np.zeros(len(rows) + 2)
+        w_prev[-1] = 1.0
+        tickers, _w, on = _solve("2026-11-06", w_prev=w_prev, aim_adjustment_rate=0.25)
+        aim = on.diagnostics["aim_weights"]
+        meta = on.diagnostics["aim_adjustment"]
+        assert meta["cash_paced"] is False
+        assert on.weights[tickers.index("__CASH__")] == pytest.approx(0.03, abs=1e-6)
+        for i, ticker in enumerate(tickers):
+            assert on.weights[i] == pytest.approx(aim.get(ticker, 0.0), abs=1e-6), ticker
+
+
+class TestHardRiskIsNotPaced:
+    def test_a_negative_alpha_holding_sells_to_its_aim_in_full(self) -> None:
+        """Precedence: hard risk > timing. A held name whose alpha turned
+        negative is not wound down at the pace."""
+        rows, _cash = _REPLAY["2026-11-09"]
+        alpha = np.array([r[1] for r in rows] + [0.0, -1e-6])
+        cvlt = [r[0] for r in rows].index("CVLT")
+        alpha[cvlt] = -0.02
+        tickers, w_prev, on = _solve("2026-11-09", alpha=alpha, aim_adjustment_rate=0.25)
+        assert w_prev[cvlt] > 0.10
+        assert on.diagnostics["aim_weights"]["CVLT"] == pytest.approx(0.0, abs=1e-6)
+        assert on.weights[cvlt] == pytest.approx(0.0, abs=1e-6)
+        assert "CVLT" in on.diagnostics["aim_adjustment"]["hard_risk_exits"]
+
+
+def _held_sessions(w_prev: np.ndarray, age: int) -> np.ndarray:
+    return np.where(w_prev > 0.0, float(age), 0.0)
+
+
+class TestComposesWithTheChurnControls:
+    """crucible#499's minimum hold and exit hysteresis bind under the pace: the
+    aim is solved under their floors and no step goes below them."""
+
+    def test_a_name_inside_its_minimum_hold_is_never_stepped_down(self) -> None:
+        """11-09: CVLT, held one session, would be halved by the pace alone."""
+        rows, cash = _REPLAY["2026-11-09"]
+        w_prev = np.array([r[3] for r in rows] + [0.0, cash])
+        tickers, _w, paced = _solve("2026-11-09", aim_adjustment_rate=0.5)
+        cvlt = tickers.index("CVLT")
+        assert paced.weights[cvlt] < w_prev[cvlt] - 0.03
+
+        _t, _w, on = _solve(
+            "2026-11-09",
+            aim_adjustment_rate=0.5,
+            min_hold_days=3,
+            held_sessions=_held_sessions(w_prev, 1),
+        )
+        churn = on.diagnostics["churn_controls"]
+        floors = {row["ticker"]: row["floor"] for row in churn["protected"]}
+        assert "CVLT" in floors
+        assert "CVLT" in on.diagnostics["aim_adjustment"]["floor_protected"]
+        for ticker, floor in floors.items():
+            i = tickers.index(ticker)
+            assert on.weights[i] >= floor - 1e-6, ticker
+            assert on.diagnostics["aim_weights"][ticker] >= floor - 1e-6, ticker
+        assert on.weights[cvlt] >= w_prev[cvlt] - 1e-6
+        assert on.weights.sum() == pytest.approx(1.0, abs=1e-9)
+        assert np.all(on.weights >= -1e-12)
+
+    def test_an_aged_out_name_is_stepped_as_usual(self) -> None:
+        rows, cash = _REPLAY["2026-11-09"]
+        w_prev = np.array([r[3] for r in rows] + [0.0, cash])
+        tickers, _w, off = _solve("2026-11-09", aim_adjustment_rate=0.5)
+        _t, _w, on = _solve(
+            "2026-11-09",
+            aim_adjustment_rate=0.5,
+            min_hold_days=3,
+            held_sessions=_held_sessions(w_prev, 5),
+        )
+        assert on.diagnostics["churn_controls"]["protected"] == []
+        np.testing.assert_allclose(on.weights, off.weights, atol=1e-9)
+
+    def test_the_rank_buffer_floor_binds_under_the_pace(self) -> None:
+        tickers, w_prev, on = _solve("2026-11-09", aim_adjustment_rate=0.5, exit_rank_buffer=6)
+        cvlt = tickers.index("CVLT")
+        protected = {row["ticker"] for row in on.diagnostics["churn_controls"]["protected"]}
+        assert "CVLT" in protected
+        assert on.weights[cvlt] >= w_prev[cvlt] - 1e-6
+
+    def test_a_released_name_is_still_paced(self) -> None:
+        """An ineligible held name is released by #499 (eligibility outranks
+        timing) and, under ``discretionary``, stepped like any other."""
+        rows, cash = _REPLAY["2026-11-09"]
+        w_prev = np.array([r[3] for r in rows] + [0.0, cash])
+        tickers, _w, on = _solve(
+            "2026-11-09",
+            aim_adjustment_rate=0.5,
+            min_hold_days=3,
+            held_sessions=_held_sessions(w_prev, 1),
+        )
+        released = {row["ticker"] for row in on.diagnostics["churn_controls"]["released"]}
+        assert {"SNDK", "PLTR"} <= released
+
+
+class TestTheBandAppliesAfterTheStep:
+    """The no-trade band edits the STEPPED book: a stepped move under the band
+    is held, a move to zero and a forced trim are not."""
+
+    def test_small_stepped_moves_are_held_and_cash_absorbs_them(self) -> None:
+        tickers, w_prev, unbanded = _solve("2026-11-09", aim_adjustment_rate=0.1)
+        _t, _w, banded = _solve("2026-11-09", aim_adjustment_rate=0.1, rebalance_band_pct=0.01)
+        cash = tickers.index("__CASH__")
+        held = {row["ticker"] for row in banded.diagnostics["rebalance_band"]["held"]}
+        assert held, "a slow pace must produce at least one sub-band move"
+        restored = set(banded.diagnostics["rebalance_band"]["restored_sells"])
+        for i, ticker in enumerate(tickers):
+            if i == cash:
+                continue
+            step = float(unbanded.weights[i] - w_prev[i])
+            if ticker in held:
+                assert abs(step) < 0.01
+                assert banded.weights[i] == pytest.approx(w_prev[i], abs=1e-12), ticker
+            elif ticker not in restored:
+                assert banded.weights[i] == pytest.approx(unbanded.weights[i], abs=1e-12), ticker
+        assert banded.weights.sum() == pytest.approx(1.0, abs=1e-9)
+        assert _turnover(banded.weights, w_prev) <= _turnover(unbanded.weights, w_prev) + 1e-12
+        assert banded.diagnostics["aim_adjustment"]["applied"] is True
+
+    def test_band_and_minimum_hold_and_pace_together(self) -> None:
+        rows, cash = _REPLAY["2026-11-09"]
+        w_prev = np.array([r[3] for r in rows] + [0.0, cash])
+        tickers, _w, on = _solve(
+            "2026-11-09",
+            aim_adjustment_rate=0.5,
+            min_hold_days=3,
+            held_sessions=_held_sessions(w_prev, 1),
+            rebalance_band_pct=0.01,
+        )
+        for row in on.diagnostics["churn_controls"]["protected"]:
+            i = tickers.index(row["ticker"])
+            assert on.weights[i] >= row["floor"] - 1e-6
+        moved = np.abs(on.weights - w_prev)[:-1]
+        assert np.all((moved < 1e-6) | (moved >= 0.01 - 1e-9) | (on.weights[:-1] == 0.0))
+        assert on.weights.sum() == pytest.approx(1.0, abs=1e-9)

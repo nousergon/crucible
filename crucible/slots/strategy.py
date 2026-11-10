@@ -961,6 +961,7 @@ def construct_book(
     sessions: Sequence[SessionInputs],
     portfolio_notional: float,
     w_initial: np.ndarray,
+    held_sessions: Mapping[str, int] | None = None,
 ) -> ConstructedBook:
     """Walk ``sessions``, solving the portfolio each one, and reduce to a Book.
 
@@ -978,6 +979,14 @@ def construct_book(
 
     Raises rather than degrading on every input the named cost model cannot
     price. Grading is offline and the caller owns every input.
+
+    ``held_sessions`` is, by ticker, how many consecutive decision sessions
+    each name ``w_initial`` holds has been held into (1 = entered by the
+    previous session's book) -- the minimum hold's clock
+    (``PortfolioParams.min_hold_days``, alpha-engine-config-I12024). Only a
+    caller that starts from a held book needs it: a walk from all cash knows
+    every age, and the walk advances the clock itself from session to session
+    (a name the solved book holds ages by one; one it does not hold resets).
     """
     if not sessions:
         raise ValueError(
@@ -994,6 +1003,20 @@ def construct_book(
     w_prev = np.asarray(w_initial, dtype=np.float64).ravel()
     if w_prev.shape != (n_names,):
         raise ValueError(f"w_initial shape {w_prev.shape} != ({n_names},)")
+    unknown = sorted(set(held_sessions or {}) - set(universe.tickers))
+    if unknown:
+        raise ValueError(
+            f"held_sessions names {unknown}, which the universe does not contain; an age "
+            "for a name the book cannot hold is an input describing some other book"
+        )
+    ages: np.ndarray | None = (
+        None
+        if held_sessions is None
+        else np.array([float(held_sessions.get(t, 0)) for t in universe.tickers])
+    )
+    if ages is None and not np.any(np.delete(w_prev, [universe.benchmark_idx, universe.cash_idx])):
+        # A walk from a book with no positions knows every age: zero.
+        ages = np.zeros(n_names)
 
     dates: list[str] = []
     portfolio_returns: list[float] = []
@@ -1025,6 +1048,7 @@ def construct_book(
             adv_usd=session.adv_usd,
             portfolio_notional=portfolio_notional,
             name_sigma=session.name_sigma,
+            held_sessions=ages,
         )
         weights = np.asarray(result.weights, dtype=np.float64)
         delta = weights - w_prev
@@ -1050,6 +1074,8 @@ def construct_book(
         all_weights.append(tuple(float(x) for x in weights))
         all_diagnostics.append(result.diagnostics)
         w_prev = weights
+        if ages is not None:
+            ages = np.where(weights > 0.0, ages + 1.0, 0.0)
 
     book = Book(
         dates=tuple(dates),
