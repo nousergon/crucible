@@ -83,7 +83,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import yaml
@@ -449,6 +449,7 @@ PORTFOLIO_PARAM_FIELDS: dict[str, str] = {
     "book_notional_usd": "number",
     "max_position_pct": "number-or-null",
     "ineligible_held_exit": "string",
+    "aim_adjustment_rate": "number-or-null",
 }
 
 #: ROLLOUT ONLY (alpha-engine-config-I13305): the two fields added on
@@ -463,6 +464,10 @@ PORTFOLIO_PARAM_FIELDS: dict[str, str] = {
 _ROLLOUT_ABSENT: Mapping[str, float | str | None] = {
     "max_position_pct": None,
     "ineligible_held_exit": "forced",
+    # ROLLOUT ONLY, same two-reader reasoning (alpha-engine-config-I12024, the
+    # aim book + partial adjustment Brian approved 2026-11-10). Absent reads as
+    # OFF: the session's solve is the session's book, as before the field.
+    "aim_adjustment_rate": None,
 }
 
 #: The values `PortfolioParams.ineligible_held_exit` admits.
@@ -536,8 +541,25 @@ class PortfolioParams:
     #: never adds to it: a name falling one rank out of the cut is not sold
     #: whole the day after it was bought (2026-11-06, SNDK).
     ineligible_held_exit: str
+    #: The pace ``k`` at which the held book moves toward the AIM book
+    #: (alpha-engine-config-I12024; Garleanu-Pedersen partial adjustment).
+    #: ``null`` disables it and the session's constrained solve is the book, as
+    #: before. When set, the aim is the same program solved WITHOUT the daily
+    #: turnover constraint -- the book the slot would hold if trading were free
+    #: -- and the session trades ``k`` of the way from the held weights toward
+    #: it. Forced movement (a held name above its effective cap, which includes
+    #: every ineligibility and hard-risk pin to zero, and the cash sleeve) is
+    #: never stepped. The turnover budget, conviction gate included, still caps
+    #: the day: when the step would exceed it, the step shrinks. See
+    #: :func:`_step_toward_aim`.
+    aim_adjustment_rate: float | None
 
     def __post_init__(self) -> None:
+        if self.aim_adjustment_rate is not None and not 0.0 < self.aim_adjustment_rate <= 1.0:
+            raise PortfolioParamsError(
+                f"aim_adjustment_rate must be in (0, 1] or null; got {self.aim_adjustment_rate}. "
+                "Zero would never trade toward the aim and is spelled null."
+            )
         if self.max_position_pct is not None and not 0.0 < self.max_position_pct <= 1.0:
             raise PortfolioParamsError(
                 f"max_position_pct must be in (0, 1] or null; got {self.max_position_pct}"
@@ -941,11 +963,15 @@ def solve_target_weights(
         cash_idx,
         params,
     )
-    turnover_meta = _apply_turnover_constraint(
+    # Under an aim book the solve IS the aim, so the daily budget is computed
+    # (its cap, floor and conviction gate) but not imposed on the program; it
+    # is enforced on the step instead (`_step_toward_aim`).
+    aim_rate = params.aim_adjustment_rate
+    turnover_meta: dict[str, object] = _apply_turnover_constraint(
         cp,
         w,
         w_prev,
-        constraints,
+        constraints if aim_rate is None else [],
         effective_caps,
         cash_idx,
         params,
@@ -977,9 +1003,27 @@ def solve_target_weights(
         diagnostics.update(_turnover_diagnostics(weights, w_prev, turnover_meta))
         diagnostics["solver_attempts"] = solver_notes
         diagnostics["cost_model"] = cost_model.record()
+        diagnostics["aim_weights"] = None
+        diagnostics["aim_adjustment"] = _aim_off_meta(aim_rate, "infeasible_fallback")
         return OptimizerResult(weights=weights, diagnostics=diagnostics)
 
     weights, clip_mass_zeroed = _clip_and_renormalize(weights, effective_caps, cash_idx, params)
+    aim_weights: dict[str, float] | None = None
+    aim_meta = _aim_off_meta(aim_rate, "aim_adjustment_rate_null")
+    if aim_rate is not None:
+        aim = weights
+        aim_weights = {
+            tickers[i]: float(aim[i]) for i in range(N) if aim[i] > 0.0 or w_prev[i] > 0.0
+        }
+        weights, clip_mass_zeroed, aim_meta = _step_toward_aim(
+            aim,
+            w_prev,
+            effective_caps,
+            cash_idx,
+            tickers,
+            params,
+            budget=_optional_float(turnover_meta, "turnover_constraint_cap"),
+        )
     weights, governor = _apply_turnover_governor(
         weights,
         w_prev,
@@ -1003,6 +1047,8 @@ def solve_target_weights(
     diagnostics.update(tcost.diagnostics)
     diagnostics.update(adv_cap_meta)
     diagnostics["solver_attempts"] = solver_notes
+    diagnostics["aim_weights"] = aim_weights
+    diagnostics["aim_adjustment"] = aim_meta
     # `alpha-engine-config-I10503`: the model in force, on EVERY solve, on the
     # infeasible path too. A cost model recorded only when the solve succeeded
     # is a cost model absent from exactly the artifacts an investigation reads.
@@ -1530,6 +1576,171 @@ def _name_caps(
         effective = np.where(kept, np.minimum(np.asarray(w_prev, dtype=float), caps), effective)
         eligible = eligible | kept
     return effective, eligible
+
+
+#: A held weight this far above its effective cap is a FORCED move, not drift.
+_FORCED_MOVE_TOL = 1e-9
+
+#: Bisection steps on the pace when the full step would exceed the day's
+#: turnover budget. 50 halvings resolve the rate far below a basis point.
+_AIM_BISECTION_STEPS = 50
+
+
+def _optional_float(meta: Mapping[str, object], key: str) -> float | None:
+    value = meta.get(key)
+    return None if value is None else float(cast("float", value))
+
+
+def _aim_off_meta(rate: float | None, reason: str) -> dict[str, object]:
+    """The aim block when no step was taken, recorded on every solve regardless."""
+    return {
+        "applied": False,
+        "reason": reason,
+        "rate_configured": rate,
+        "rate_applied": None,
+    }
+
+
+def _spread(
+    w: np.ndarray, amount: float, room: np.ndarray, eligible: np.ndarray
+) -> tuple[np.ndarray, float]:
+    """Add ``amount`` (>= 0) over ``eligible`` names in proportion to ``room``,
+    never past it. Returns the new vector and what could not be placed."""
+    capacity = np.where(eligible, np.maximum(room, 0.0), 0.0)
+    total = float(capacity.sum())
+    if amount <= 0.0 or total <= 0.0:
+        return w, amount
+    placed = min(amount, total)
+    return w + capacity * (placed / total), amount - placed
+
+
+def _aim_step(
+    rate: float,
+    aim: np.ndarray,
+    prev: np.ndarray,
+    caps: np.ndarray,
+    forced: np.ndarray,
+    cash_idx: int,
+    min_position: float,
+) -> tuple[np.ndarray, np.ndarray, float, float]:
+    """One candidate book at pace ``rate``: ``(weights, zeroed, mass_zeroed, unplaced)``.
+
+    In order, which is the decision precedence:
+
+    1. **Forced moves in full.** A name above its effective cap (an
+       ineligibility or hard-risk pin to zero, or a cap trim) goes at least to
+       its cap; the cash sleeve goes to the aim's sleeve. Never slowed.
+    2. **Discretionary names step** ``rate`` of the way from held to aim.
+    3. **Finish the exit / defer the entry.** A name whose stepped weight lands
+       below ``min_position_pct`` goes to zero: a sale does not linger as a
+       sub-floor stub, and an entry too small to hold waits for a later step.
+    4. **The residual** (the book must sum to one with the sleeve pinned) is
+       placed on the discretionary names still moving toward the aim, in
+       proportion to their remaining gap, so no name passes its aim; only if
+       that room is exhausted does it spill toward the caps.
+    """
+    n = len(prev)
+    idx = np.arange(n)
+    is_cash = idx == cash_idx
+    w = prev + rate * (aim - prev)
+    w = np.where(forced, np.minimum(w, caps), w)
+    w[cash_idx] = aim[cash_idx]
+    zeroed = (~is_cash) & (w > 0.0) & (w < min_position)
+    mass_zeroed = float(np.sum(w[zeroed]))
+    w = np.where(zeroed, 0.0, w)
+    moving = (~is_cash) & (~forced) & (~zeroed)
+    residual = 1.0 - float(w.sum())
+    unplaced = 0.0
+    if residual > 0.0:
+        w, left = _spread(w, residual, aim - w, moving)
+        w, left = _spread(w, left, caps - w, moving & (aim > 0.0))
+        w, unplaced = _spread(w, left, caps - w, moving)
+    elif residual < 0.0:
+        w_neg, left = _spread(-w, -residual, w - aim, moving)
+        w_neg, unplaced = _spread(w_neg, left, w_neg * -1.0, moving)
+        w = -w_neg
+    return w, zeroed, mass_zeroed, unplaced
+
+
+def _names(tickers: list[str], mask: np.ndarray) -> list[str]:
+    return sorted(tickers[int(i)] for i in np.flatnonzero(mask))
+
+
+def _step_toward_aim(
+    aim: np.ndarray,
+    w_prev: np.ndarray,
+    effective_caps: np.ndarray,
+    cash_idx: int,
+    tickers: list[str],
+    params: PortfolioParams,
+    *,
+    budget: float | None,
+) -> tuple[np.ndarray, float, dict[str, object]]:
+    """Move the held book ``k`` of the way toward the aim book (alpha-engine-config-I12024).
+
+    Brian's ruling of 2026-11-10: "a longer-term portfolio managed daily with
+    small adjustments, not rebuilt daily". The single-period solve re-draws the
+    whole book from a 21-day forecast that is itself re-drawn every day, and a
+    rank shuffle at the margin pays for its own one-time cost on paper (11-09:
+    CVLT bought, then sold the next session on a rank 3 to 5 move worth 0.4
+    points of forecast against an 11-point model error bar). Garleanu-Pedersen
+    partial adjustment trades toward the target at a pace instead: the target
+    is the aim, recorded every session, and the book closes ``k`` of the gap.
+
+    **The turnover budget still caps the day.** If the step at ``k`` would trade
+    more one-way than the budget's effective right-hand side (the conviction
+    gate's discretionary budget, raised to the mandatory floor), the pace is
+    bisected down until it fits. Forced moves are inside the mandatory floor,
+    so a throttled day never starves them.
+
+    Returns ``(weights, mass_zeroed, meta)``. ``mass_zeroed`` is the weight the
+    finish-the-exit rule removed, which the post-solve governor admits as
+    tolerance exactly as it admits the dust floor's.
+    """
+    rate = float(params.aim_adjustment_rate or 0.0)
+    prev = np.asarray(w_prev, dtype=float)
+    caps = np.asarray(effective_caps, dtype=float)
+    forced = prev > caps + _FORCED_MOVE_TOL
+    forced[cash_idx] = False
+    min_position = float(params.min_position_pct)
+
+    def turnover(vec: np.ndarray) -> float:
+        return float(np.sum(np.abs(vec - prev)) / 2.0)
+
+    def fits(step: tuple[np.ndarray, np.ndarray, float, float]) -> bool:
+        # The same allowance the post-solve governor makes: the weight the
+        # finish-the-exit rule zeroed may legitimately add turnover.
+        return budget is None or turnover(step[0]) <= float(budget) + step[2]
+
+    applied = rate
+    step = _aim_step(rate, aim, prev, caps, forced, cash_idx, min_position)
+    limited = not fits(step)
+    if limited:
+        lo, hi = 0.0, rate
+        step = _aim_step(0.0, aim, prev, caps, forced, cash_idx, min_position)
+        for _ in range(_AIM_BISECTION_STEPS):
+            mid = (lo + hi) / 2.0
+            candidate = _aim_step(mid, aim, prev, caps, forced, cash_idx, min_position)
+            if fits(candidate):
+                lo, step = mid, candidate
+            else:
+                hi = mid
+        applied = lo
+    weights, zeroed, mass_zeroed, unplaced = step
+    meta: dict[str, object] = {
+        "applied": True,
+        "reason": "budget_limited_step" if limited else "stepped_at_configured_rate",
+        "rate_configured": rate,
+        "rate_applied": applied,
+        "aim_turnover_one_way": turnover(aim),
+        "stepped_turnover_one_way": turnover(weights),
+        "turnover_budget_cap": None if budget is None else float(budget),
+        "forced_moves": _names(tickers, forced),
+        "exits_finished": _names(tickers, zeroed & (prev > 0.0)),
+        "entries_deferred": _names(tickers, zeroed & (prev <= 0.0)),
+        "residual_unplaced": unplaced,
+    }
+    return weights, mass_zeroed, meta
 
 
 def _mandatory_turnover_floor(
