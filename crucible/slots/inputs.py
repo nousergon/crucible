@@ -103,6 +103,7 @@ from crucible.documents import load_document_bytes
 from crucible.keys import arm_predictions_key
 
 if TYPE_CHECKING:
+    from crucible.runner import RunContext
     from crucible.slots.model import FeaturePanel
     from crucible.slots.strategy import BookUniverse, ResolvedSession, SessionInputs
     from crucible.store import Store
@@ -139,6 +140,7 @@ __all__ = [
     "partition_producible",
     "prediction_column",
     "read_arm_predictions",
+    "read_arm_predictions_with_uncertainty",
     "resolve_declared_inputs",
     "resolve_strategy_sessions",
     "StrategySessionInputs",
@@ -843,7 +845,65 @@ def read_arm_predictions(
     Recorded as a manifest input when a ``ctx`` is given, which is what
     `crucible explain` walks: a stacked arm's verdict reaches back to the
     exact base-arm vintage that fed each of its columns (plan §10.8).
+
+    The alpha cross-section alone; :func:`read_arm_predictions_with_uncertainty`
+    is the same guarded read returning the document's predictive std as well.
     """
+    document = _read_arm_predictions_document(
+        store, arm_id=arm_id, trading_day=trading_day, ctx=ctx
+    )
+    return {str(k): float(v) for k, v in document["predicted_alpha"].items()}
+
+
+def read_arm_predictions_with_uncertainty(
+    store: Store,
+    *,
+    arm_id: str,
+    trading_day: str,
+    ctx: RunContext | None = None,
+) -> tuple[dict[str, float], PredictionUncertainty | None]:
+    """The alpha cross-section AND its predictive std, from one guarded read.
+
+    The S slot's conviction gate (`crucible.portfolio.
+    compute_conviction_budget_multiplier`) needs the model's own error bar on
+    each forecast, and the M feed has carried it since
+    `alpha-engine-config-I11791`. It is read here, from the SAME bytes and
+    under the SAME point-in-time and identity checks as the alpha, so the std
+    can never belong to a different document than the forecast it qualifies.
+
+    The uncertainty is ``None`` for a document that predates the field (it
+    declares no ``predicted_alpha_std_method``); a document declaring
+    :data:`UNCERTAINTY_OMITTED` returns a record whose maps are all ``None``.
+    """
+    document = _read_arm_predictions_document(
+        store, arm_id=arm_id, trading_day=trading_day, ctx=ctx
+    )
+    alpha = {str(k): float(v) for k, v in document["predicted_alpha"].items()}
+    method = document.get("predicted_alpha_std_method")
+    if method is None:
+        return alpha, None
+    maps: list[dict[str, float] | None] = []
+    for field_name in PREDICTION_STD_FIELDS:
+        values = document.get(field_name)
+        maps.append(None if values is None else {str(k): float(v) for k, v in values.items()})
+    uncertainty = PredictionUncertainty(
+        method=str(method),
+        note=str(document.get("predicted_alpha_std_note") or ""),
+        std=maps[0],
+        aleatoric=maps[1],
+        epistemic=maps[2],
+    )
+    return alpha, uncertainty
+
+
+def _read_arm_predictions_document(
+    store: Store,
+    *,
+    arm_id: str,
+    trading_day: str,
+    ctx: RunContext | None = None,
+) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny] - a raw JSON document, schema-validated
+    """The guarded read both public readers share (see :func:`read_arm_predictions`)."""
     key = arm_predictions_key(arm_id, trading_day)
     payload = store.get_bytes(key)  # raises KeyError when absent; never None
     document = load_document_bytes(key, payload)  # the bytes recorded below decide
@@ -863,7 +923,7 @@ def read_arm_predictions(
         )
     if ctx is not None:
         ctx.record_input(key, payload, schema_version=ARM_PREDICTIONS_SCHEMA_VERSION)
-    return {str(k): float(v) for k, v in document["predicted_alpha"].items()}
+    return document
 
 
 #: The metric name a stacked arm's base coverage is filed under on the run
