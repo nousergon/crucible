@@ -75,7 +75,7 @@ from crucible.portfolio import (
     solve_target_weights,
 )
 from crucible.slots.arms import SupersededArmUndeclaredError, resolve_declared_lineage
-from crucible.slots.inputs import InputRefusal, SlotUnservableError
+from crucible.slots.inputs import InputRefusal, PredictionUncertainty, SlotUnservableError
 from crucible.slots.vocab import refuse_unknown_keys
 
 __all__ = [
@@ -978,6 +978,7 @@ def construct_book(
     sessions: Sequence[SessionInputs],
     portfolio_notional: float,
     w_initial: np.ndarray,
+    held_sessions: Mapping[str, int] | None = None,
 ) -> ConstructedBook:
     """Walk ``sessions``, solving the portfolio each one, and reduce to a Book.
 
@@ -995,6 +996,14 @@ def construct_book(
 
     Raises rather than degrading on every input the named cost model cannot
     price. Grading is offline and the caller owns every input.
+
+    ``held_sessions`` is, by ticker, how many consecutive decision sessions
+    each name ``w_initial`` holds has been held into (1 = entered by the
+    previous session's book) -- the minimum hold's clock
+    (``PortfolioParams.min_hold_days``, alpha-engine-config-I12024). Only a
+    caller that starts from a held book needs it: a walk from all cash knows
+    every age, and the walk advances the clock itself from session to session
+    (a name the solved book holds ages by one; one it does not hold resets).
     """
     if not sessions:
         raise ValueError(
@@ -1011,6 +1020,20 @@ def construct_book(
     w_prev = np.asarray(w_initial, dtype=np.float64).ravel()
     if w_prev.shape != (n_names,):
         raise ValueError(f"w_initial shape {w_prev.shape} != ({n_names},)")
+    unknown = sorted(set(held_sessions or {}) - set(universe.tickers))
+    if unknown:
+        raise ValueError(
+            f"held_sessions names {unknown}, which the universe does not contain; an age "
+            "for a name the book cannot hold is an input describing some other book"
+        )
+    ages: np.ndarray | None = (
+        None
+        if held_sessions is None
+        else np.array([float(held_sessions.get(t, 0)) for t in universe.tickers])
+    )
+    if ages is None and not np.any(np.delete(w_prev, [universe.benchmark_idx, universe.cash_idx])):
+        # A walk from a book with no positions knows every age: zero.
+        ages = np.zeros(n_names)
 
     dates: list[str] = []
     portfolio_returns: list[float] = []
@@ -1044,6 +1067,7 @@ def construct_book(
             name_sigma=session.name_sigma,
             hard_exit=session.hard_exit,
             buy_multiplier=session.buy_multiplier,
+            held_sessions=ages,
         )
         weights = np.asarray(result.weights, dtype=np.float64)
         delta = weights - w_prev
@@ -1069,6 +1093,8 @@ def construct_book(
         all_weights.append(tuple(float(x) for x in weights))
         all_diagnostics.append(result.diagnostics)
         w_prev = weights
+        if ages is not None:
+            ages = np.where(weights > 0.0, ages + 1.0, 0.0)
 
     book = Book(
         dates=tuple(dates),
@@ -1373,6 +1399,17 @@ def grade_arm(
 SLOT = "s"
 
 #: The point-in-time construction inputs artifact, one per (arm, session).
+#:
+#: **The std fields are an ADDITIVE, OPTIONAL extension of v1, not a v2**
+#: (`alpha-engine-config-I12024`). The producer runs on `releases/current`
+#: from the moment a merge deploys, while the trader reads these documents
+#: through the crucible release its pin names — which moves later, on its own
+#: evening. `ResolvedSession.from_dict` refuses any version it does not name,
+#: so a bump would have stopped the pinned trader constructing a book on the
+#: first session recorded after the merge. Optional keys are ignored by that
+#: older reader, which then runs exactly as it does today (gate inert), and
+#: every document already in the store stays valid as written — nothing is
+#: backfilled. A REQUIRED field would still need a new version.
 SESSION_INPUTS_SCHEMA_VERSION = "session_inputs.v1"
 
 #: The synthetic rows every constructed book carries beside the real names.
@@ -1858,6 +1895,17 @@ class ResolvedSession:
     eligibility_source: str
     sectors_source: str
     stance_caps_source: str
+    #: The M champion's own predictive std per name, aligned with ``tickers``:
+    #: the TOTAL (`predicted_alpha_std`, the conviction gate's input) and the
+    #: EPISTEMIC component (the only vector the GUW penalty may be built from).
+    #: ``None`` when the feed carried no such map, and on every document
+    #: recorded before these fields existed. ADDITIVE and optional within
+    #: `session_inputs.v1` — see :data:`SESSION_INPUTS_SCHEMA_VERSION`.
+    alpha_uncertainty: tuple[float, ...] | None = None
+    alpha_uncertainty_epistemic: tuple[float, ...] | None = None
+    #: Where the std came from and how it was produced, as a sentence. ``None``
+    #: only on a document recorded before the field existed.
+    alpha_uncertainty_source: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1876,6 +1924,9 @@ class ResolvedSession:
             "eligibility_source": self.eligibility_source,
             "sectors_source": self.sectors_source,
             "stance_caps_source": self.stance_caps_source,
+            "alpha_uncertainty": _floats_or_none(self.alpha_uncertainty),
+            "alpha_uncertainty_epistemic": _floats_or_none(self.alpha_uncertainty_epistemic),
+            "alpha_uncertainty_source": self.alpha_uncertainty_source,
         }
 
     @classmethod
@@ -1897,7 +1948,25 @@ class ResolvedSession:
             eligibility_source=str(document["eligibility_source"]),
             sectors_source=str(document["sectors_source"]),
             stance_caps_source=str(document["stance_caps_source"]),
+            # Optional: absent on every document recorded before
+            # `alpha-engine-config-I12024`'s gate wiring, which then reads as
+            # "no std recorded" and leaves the gate inert, exactly as it ran.
+            alpha_uncertainty=_tuple_or_none(document.get("alpha_uncertainty")),
+            alpha_uncertainty_epistemic=_tuple_or_none(document.get("alpha_uncertainty_epistemic")),
+            alpha_uncertainty_source=(
+                None
+                if document.get("alpha_uncertainty_source") is None
+                else str(document["alpha_uncertainty_source"])
+            ),
         )
+
+
+def _floats_or_none(values: tuple[float, ...] | None) -> list[float] | None:
+    return None if values is None else [float(v) for v in values]
+
+
+def _tuple_or_none(values: Iterable[float] | None) -> tuple[float, ...] | None:
+    return None if values is None else tuple(float(v) for v in values)
 
 
 # ---------------------------------------------------------------------------
@@ -2157,7 +2226,9 @@ def resolve_session(store: Any, *, trading_day: str, ctx: Any = None) -> Resolve
         universe_members_key,
     )
     from crucible.slots.cycle import MissingArtifactError  # noqa: PLC0415 - avoids a cycle
-    from crucible.slots.inputs import read_arm_predictions  # noqa: PLC0415 - avoids a cycle
+    from crucible.slots.inputs import (  # noqa: PLC0415 - avoids a cycle
+        read_arm_predictions_with_uncertainty,
+    )
 
     m_pointer = champion_key("m")
     champion = (
@@ -2172,7 +2243,9 @@ def resolve_session(store: Any, *, trading_day: str, ctx: Any = None) -> Resolve
             "is meaningless while every artifact around it looks well-formed. Promote an "
             "M arm first; the S slot's book is constructed on its predictions."
         )
-    predicted = read_arm_predictions(store, arm_id=champion, trading_day=trading_day, ctx=ctx)
+    predicted, uncertainty = read_arm_predictions_with_uncertainty(
+        store, arm_id=champion, trading_day=trading_day, ctx=ctx
+    )
     alpha_source = arm_predictions_key(champion, trading_day)
     bench = active_bench(store, ALPHA_SLOT, trading_day)
     if bench is not None:
@@ -2232,6 +2305,8 @@ def resolve_session(store: Any, *, trading_day: str, ctx: Any = None) -> Resolve
         cut=cut,
         alpha_source=alpha_source,
         eligibility_source=eligibility_source,
+        uncertainty=uncertainty,
+        uncertainty_key=arm_predictions_key(champion, trading_day),
     )
 
 
@@ -2242,6 +2317,8 @@ def _resolved_session(
     cut: set[str] | None,
     alpha_source: str,
     eligibility_source: str,
+    uncertainty: PredictionUncertainty | None = None,
+    uncertainty_key: str | None = None,
 ) -> ResolvedSession:
     """A :class:`ResolvedSession` from an alpha cross-section and an eligibility cut.
 
@@ -2252,6 +2329,7 @@ def _resolved_session(
     """
     tickers = tuple(sorted(predicted))
     eligibility = tuple(True if cut is None else t in cut for t in tickers)
+    std, epistemic, std_source = _session_uncertainty(tickers, uncertainty, uncertainty_key)
     return ResolvedSession(
         trading_day=trading_day,
         tickers=tickers,
@@ -2274,7 +2352,50 @@ def _resolved_session(
             "recorded absence: the binding per-name constraints this cycle are "
             "`min_position_pct`, `max_sector_pct` and the optimizer's own."
         ),
+        alpha_uncertainty=std,
+        alpha_uncertainty_epistemic=epistemic,
+        alpha_uncertainty_source=std_source,
     )
+
+
+def _session_uncertainty(
+    tickers: tuple[str, ...],
+    uncertainty: PredictionUncertainty | None,
+    key: str | None,
+) -> tuple[tuple[float, ...] | None, tuple[float, ...] | None, str]:
+    """The M feed's predictive std, aligned to ``tickers``, and a sentence saying whence.
+
+    `alpha-engine-config-I12024`. The conviction gate scales the S slot's
+    discretionary turnover budget by the alpha vector's spread over the model's
+    own error bar. With no error bar handed in it returns
+    ``no_alpha_uncertainty_vector`` and the full budget — which is how the gate
+    stood switched on and inert. The arm-predictions contract requires every std
+    map to cover exactly the scored names, so alignment here is total.
+
+    Under a ruled M bench the alpha is zero by ruling, but the std is still the
+    champion's own: the gate then measures a zero spread and sits at its floor,
+    which is the correct reading of "no conviction today".
+    """
+    if uncertainty is None:
+        return (
+            None,
+            None,
+            f"{_ABSENT_SOURCE_PREFIX}{key} declares no `predicted_alpha_std_method`, so no "
+            "predictive std was recorded and the conviction gate cannot evaluate this session.",
+        )
+    total = uncertainty.std
+    epistemic = uncertainty.epistemic
+    std = None if total is None else tuple(float(total[t]) for t in tickers)
+    epi = None if epistemic is None else tuple(float(epistemic[t]) for t in tickers)
+    if std is None:
+        source = (
+            f"{_ABSENT_SOURCE_PREFIX}{key} declares `{uncertainty.method}` and carries no "
+            f"`predicted_alpha_std` ({uncertainty.note}); the conviction gate cannot "
+            "evaluate this session."
+        )
+    else:
+        source = f"{key} (`{uncertainty.method}`)"
+    return std, epi, source
 
 
 #: How :func:`resolve_session` spells "no U champion, no cut" in
@@ -2326,7 +2447,9 @@ def re_resolve_session(store: Any, *, recorded: ResolvedSession) -> ResolvedSess
         universe_members_key,
     )
     from crucible.slots.cycle import MissingArtifactError  # noqa: PLC0415 - avoids a cycle
-    from crucible.slots.inputs import read_arm_predictions  # noqa: PLC0415 - avoids a cycle
+    from crucible.slots.inputs import (  # noqa: PLC0415 - avoids a cycle
+        read_arm_predictions_with_uncertainty,
+    )
 
     day = recorded.trading_day
     alpha_source = recorded.alpha_source
@@ -2338,9 +2461,11 @@ def re_resolve_session(store: Any, *, recorded: ResolvedSession) -> ResolvedSess
                 "at that key covers the session any more; the attestation cannot re-read a "
                 "ruling that is no longer filed."
             )
-        predicted = dict.fromkeys(
-            read_arm_predictions(store, arm_id=bench.champion_at_bench, trading_day=day), 0.0
+        priced, uncertainty = read_arm_predictions_with_uncertainty(
+            store, arm_id=bench.champion_at_bench, trading_day=day
         )
+        predicted = dict.fromkeys(priced, 0.0)
+        uncertainty_key = arm_predictions_key(bench.champion_at_bench, day)
     else:
         segment = alpha_source.removeprefix(ARM_PREDICTIONS_PREFIX).removesuffix(f"/{day}.json")
         m_arm = arm_id_from_segment(segment) if segment and "/" not in segment else None
@@ -2350,7 +2475,10 @@ def re_resolve_session(store: Any, *, recorded: ResolvedSession) -> ResolvedSess
                 "arm-predictions key for that session; the attestation cannot re-read a "
                 "source it cannot name."
             )
-        predicted = read_arm_predictions(store, arm_id=m_arm, trading_day=day)
+        predicted, uncertainty = read_arm_predictions_with_uncertainty(
+            store, arm_id=m_arm, trading_day=day
+        )
+        uncertainty_key = alpha_source
 
     eligibility_source = recorded.eligibility_source
     cut: set[str] | None
@@ -2381,13 +2509,26 @@ def re_resolve_session(store: Any, *, recorded: ResolvedSession) -> ResolvedSess
             f"session {day} recorded eligibility_source {eligibility_source!r}, which this "
             "reader does not recognise; the attestation cannot re-read it."
         )
-    return _resolved_session(
+    again = _resolved_session(
         trading_day=day,
         predicted=predicted,
         cut=cut,
         alpha_source=alpha_source,
         eligibility_source=eligibility_source,
+        uncertainty=uncertainty,
+        uncertainty_key=uncertainty_key,
     )
+    if recorded.alpha_uncertainty_source is None:
+        # Recorded before the std fields existed: the decision-date pass ran
+        # with no std, so the re-read must too, or the attestation would
+        # measure the gate's arrival rather than any revision of an input.
+        again = replace(
+            again,
+            alpha_uncertainty=None,
+            alpha_uncertainty_epistemic=None,
+            alpha_uncertainty_source=None,
+        )
+    return again
 
 
 def _load_slot(ctx: Any, *, settings: Any) -> SlotStrategies:
@@ -2918,6 +3059,14 @@ def _build_sessions(
     M feed prices the benchmark ticker (it is in ``session.tickers``), and each
     priced name enters as its excess over the mean of the names the session
     priced. The recorded ``ResolvedSession`` keeps the feed's raw values.
+
+    ``alpha_uncertainty`` / ``alpha_uncertainty_epistemic`` carry the session's
+    recorded predictive std onto the same index (`alpha-engine-config-I12024`):
+    the conviction gate's input and the GUW penalty's. A name the session did
+    not price, and both sentinels, are NaN — which the gate and the penalty
+    both read as "no usable std" for that entry. A session that recorded no std
+    passes ``None``, and the gate says ``no_alpha_uncertainty_vector``. The std
+    is a scale and is never demeaned.
     """
     n = len(universe.tickers)
     index = {ticker: i for i, ticker in enumerate(universe.tickers)}
@@ -2947,6 +3096,13 @@ def _build_sessions(
                 # happened to dislike (alpha-engine-config-I12121).
                 continue
             alpha[i], eligible[i], caps[i] = a, e, c
+        alpha_std = _uncertainty_vector(session.tickers, session.alpha_uncertainty, index, n)
+        alpha_std_epistemic = _uncertainty_vector(
+            session.tickers, session.alpha_uncertainty_epistemic, index, n
+        )
+        for vector in (alpha_std, alpha_std_epistemic):
+            if vector is not None:
+                vector[list(sentinels)] = np.nan
         # The solver reads alpha as DEVIATION from the benchmark, and an M arm
         # predicts a raw forward return, whose level is the market's drift.
         # Against a benchmark pinned at 0.0 that level is conviction nobody
@@ -3000,8 +3156,25 @@ def _build_sessions(
                 benchmark_return=float(returns.loc[settle, benchmark]),
                 returns_panel=panel_matrix,
                 adv_usd=adv,
+                alpha_uncertainty=alpha_std,
+                alpha_uncertainty_epistemic=alpha_std_epistemic,
             )
         )
+    return out
+
+
+def _uncertainty_vector(
+    tickers: Sequence[str],
+    values: Sequence[float] | None,
+    index: Mapping[str, int],
+    n: int,
+) -> np.ndarray | None:
+    """A recorded per-ticker std on the universe's index, NaN where unrecorded."""
+    if values is None:
+        return None
+    out = np.full(n, np.nan)
+    for ticker, value in zip(tickers, values, strict=True):
+        out[index[ticker]] = float(value)
     return out
 
 
