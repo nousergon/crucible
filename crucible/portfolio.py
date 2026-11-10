@@ -450,6 +450,8 @@ PORTFOLIO_PARAM_FIELDS: dict[str, str] = {
     "max_position_pct": "number-or-null",
     "ineligible_held_exit": "string",
     "rebalance_band_pct": "number-or-null",
+    "min_hold_days": "integer-or-null",
+    "exit_rank_buffer": "integer-or-null",
 }
 
 #: ROLLOUT ONLY (alpha-engine-config-I13305): the two fields added on
@@ -468,6 +470,12 @@ _ROLLOUT_ABSENT: Mapping[str, float | str | None] = {
     # audit 2026-11-09, row 17). Absent reads as OFF -- every delta trades, the
     # behaviour before the field existed.
     "rebalance_band_pct": None,
+    # ROLLOUT ONLY, same reasoning: the two churn controls Brian approved on
+    # 2026-11-10 (alpha-engine-config-I12024). Absent reads as OFF -- a held
+    # name is protected by nothing but the optimizer, the behaviour before the
+    # fields existed.
+    "min_hold_days": None,
+    "exit_rank_buffer": None,
 }
 
 #: The values `PortfolioParams.ineligible_held_exit` admits.
@@ -549,8 +557,33 @@ class PortfolioParams:
     #: a cap-forced trim are never banded -- an exit is not drift. ``null``
     #: disables the band. See :func:`_apply_rebalance_band`.
     rebalance_band_pct: float | None
+    #: Minimum hold (Brian 2026-11-10, alpha-engine-config-I12024): a name the
+    #: book entered stays held until it has been held this many sessions, so
+    #: a one-rank slip the day after a buy is not a sale (CVLT, bought 11-09,
+    #: sold 11-10 on rank 3 to 5). Counted in decision sessions the name has
+    #: been held into (``held_sessions``; see :func:`solve_target_weights`).
+    #: Negative alpha and ineligibility still exit a held name: precedence is
+    #: hard risk > eligibility > optimizer > timing. ``null`` disables it.
+    #: See :func:`_churn_floors`.
+    min_hold_days: int | None
+    #: Exit hysteresis (same ruling): a held name keeps a position while its
+    #: alpha rank among the eligible names is within this many, even when the
+    #: optimizer's own target would drop it. It is exited when it falls out of
+    #: that rank, not when it falls out of the optimizer's target set. Same
+    #: precedence as ``min_hold_days``. ``null`` disables it.
+    exit_rank_buffer: int | None
 
     def __post_init__(self) -> None:
+        if self.min_hold_days is not None and self.min_hold_days < 1:
+            raise PortfolioParamsError(
+                f"min_hold_days must be >= 1 session or null; got {self.min_hold_days}. "
+                "Zero is spelled null."
+            )
+        if self.exit_rank_buffer is not None and self.exit_rank_buffer < 1:
+            raise PortfolioParamsError(
+                f"exit_rank_buffer must be >= 1 or null; got {self.exit_rank_buffer}. "
+                "Zero is spelled null."
+            )
         if self.rebalance_band_pct is not None and not 0.0 < self.rebalance_band_pct < 1.0:
             raise PortfolioParamsError(
                 f"rebalance_band_pct must be in (0, 1) or null; got {self.rebalance_band_pct}. "
@@ -662,7 +695,7 @@ class PortfolioParams:
                         "string switches a guardrail on for a reason nobody wrote down."
                     )
                 values[name] = raw
-            elif kind == "integer":
+            elif kind in ("integer", "integer-or-null"):
                 if isinstance(raw, bool) or not isinstance(raw, int):
                     raise PortfolioParamsError(
                         f"{source}: {name!r} must be an integer; got {raw!r}"
@@ -816,6 +849,7 @@ def solve_target_weights(
     adv_usd: np.ndarray | None = None,
     portfolio_notional: float | None = None,
     name_sigma: np.ndarray | None = None,
+    held_sessions: np.ndarray | None = None,
 ) -> OptimizerResult:
     """Solve the constrained MVO and return target weights plus diagnostics.
 
@@ -857,6 +891,13 @@ def solve_target_weights(
         name_sigma: optional shape (N,) per-name return volatility, used to
             scale the impact term by σᵢ/refσ where refσ is the cross-sectional
             median.
+        held_sessions: optional shape (N,) count of consecutive decision
+            sessions each name has been held into -- 1 for a name the
+            previous session's book entered. Read only for names ``w_prev``
+            holds, and only when ``params.min_hold_days`` is set; then it is
+            REQUIRED, because a hold that cannot see a name's age cannot hold
+            it, and treating an unknown age as "aged out" would switch the
+            rule off for exactly the book that did not supply it.
 
     Returns:
         :class:`OptimizerResult`. On infeasibility the weights are the
@@ -923,14 +964,27 @@ def solve_target_weights(
         )
     objective = cp.Maximize(sum(objective_terms))
 
+    cut_eligibility = np.asarray(eligibility, dtype=bool)
     effective_caps, eligibility = _name_caps(
         stance_caps, eligibility, w_prev, benchmark_idx, cash_idx, params
     )
     ineligible_idx = np.where(~eligibility)[0]
+    floors, churn_meta = _churn_floors(
+        tickers,
+        alpha_hat,
+        w_prev,
+        sectors,
+        cut_eligibility,
+        effective_caps,
+        benchmark_idx,
+        cash_idx,
+        params,
+        held_sessions=held_sessions,
+    )
 
     constraints = [
         cp.sum(w) == 1.0,
-        w >= 0,
+        w >= floors,
         w <= effective_caps,
         w[cash_idx] == params.cash_sleeve_pct,
     ]
@@ -994,10 +1048,13 @@ def solve_target_weights(
         diagnostics.update(adv_cap_meta)
         diagnostics.update(_turnover_diagnostics(weights, w_prev, turnover_meta))
         diagnostics["solver_attempts"] = solver_notes
+        diagnostics["churn_controls"] = churn_meta
         diagnostics["cost_model"] = cost_model.record()
         return OptimizerResult(weights=weights, diagnostics=diagnostics)
 
-    weights, clip_mass_zeroed = _clip_and_renormalize(weights, effective_caps, cash_idx, params)
+    weights, clip_mass_zeroed = _clip_and_renormalize(
+        weights, effective_caps, cash_idx, params, keep=floors > 0.0
+    )
     weights, governor = _apply_turnover_governor(
         weights,
         w_prev,
@@ -1022,6 +1079,7 @@ def solve_target_weights(
     )
     diagnostics.update(governor)
     diagnostics["rebalance_band"] = band_meta
+    diagnostics["churn_controls"] = churn_meta
     diagnostics.update(tcost.diagnostics)
     diagnostics.update(adv_cap_meta)
     diagnostics["solver_attempts"] = solver_notes
@@ -1501,8 +1559,14 @@ def _clip_and_renormalize(
     effective_caps: np.ndarray,
     cash_idx: int,
     params: PortfolioParams,
+    *,
+    keep: np.ndarray | None = None,
 ) -> tuple[np.ndarray, float]:
     """Clip to the box, drop sub-``min_position_pct`` dust, renormalize.
+
+    ``keep`` marks names a churn control protects (:func:`_churn_floors`):
+    never dust, because the floor that keeps them held is a decision, and a
+    floor the dust rule could undo would hold nothing.
 
     Returns ``(weights, mass_zeroed)``. ``mass_zeroed`` is not bookkeeping: it
     is the exact budget by which this post-solve step may legitimately push the
@@ -1515,6 +1579,8 @@ def _clip_and_renormalize(
     weights = np.maximum(weights, 0.0)
     weights = np.minimum(weights, effective_caps + 1e-8)
     small = (weights < params.min_position_pct) & (np.arange(len(weights)) != cash_idx)
+    if keep is not None:
+        small &= ~np.asarray(keep, dtype=bool)
     mass_zeroed = float(np.sum(weights[small]))
     weights = np.where(small, 0.0, weights)
     total = weights.sum()
@@ -1552,6 +1618,167 @@ def _name_caps(
         effective = np.where(kept, np.minimum(np.asarray(w_prev, dtype=float), caps), effective)
         eligible = eligible | kept
     return effective, eligible
+
+
+#: Headroom the scaled churn floors leave under the sleeve and sector budgets,
+#: so the program's feasible set is never pinned to a single point.
+_FLOOR_SLACK = 1e-6
+
+
+def alpha_ranks(
+    alpha_hat: np.ndarray, eligibility: np.ndarray, benchmark_idx: int, cash_idx: int
+) -> np.ndarray:
+    """Each name's alpha rank among the eligible names; 0 for every other.
+
+    1 is the highest alpha. Ties share the better rank (competition ranking:
+    1 plus the number of eligible names with a strictly higher alpha), so no
+    rank depends on how two equal forecasts happen to sort -- under a benched
+    M slot every alpha is 0.0 and every eligible name is rank 1. Where alphas
+    differ this is the ``alpha_rank`` the trader's order book prints.
+    """
+    alpha = np.asarray(alpha_hat, dtype=float)
+    ranked = np.asarray(eligibility, dtype=bool).copy()
+    ranked[[benchmark_idx, cash_idx]] = False
+    pool = alpha[ranked]
+    ranks = np.zeros(alpha.shape, dtype=int)
+    for i in np.where(ranked)[0]:
+        ranks[i] = 1 + int(np.count_nonzero(pool > float(alpha[i])))
+    return ranks
+
+
+def _churn_floors(
+    tickers: list[str],
+    alpha_hat: np.ndarray,
+    w_prev: np.ndarray,
+    sectors: list[str],
+    cut_eligibility: np.ndarray,
+    effective_caps: np.ndarray,
+    benchmark_idx: int,
+    cash_idx: int,
+    params: PortfolioParams,
+    *,
+    held_sessions: np.ndarray | None,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Per-name lower bounds that keep a protected held name held.
+
+    Brian's 2026-11-10 ruling (alpha-engine-config-I12024): the book should
+    carry a plan longer than one session. Two rules protect a HELD name from
+    the optimizer's day-to-day revisions:
+
+    * ``min_hold_days`` -- held fewer sessions than this;
+    * ``exit_rank_buffer`` -- alpha rank among the eligible names within this.
+
+    **Precedence: hard risk > eligibility > optimizer > timing.** A held name
+    with NEGATIVE alpha (hard risk) or dropped by the cut (eligibility) is
+    RELEASED -- never protected -- and the cap still bounds every floor, so a
+    cap-forced trim is never resisted. Only then does a protection constrain
+    the optimizer.
+
+    **A protected name's floor is its held weight** (bounded by its effective
+    cap). The optimizer re-optimizes it and may ADD to it; it may not sell it
+    below that. The lower alternatives were measured against the ruling and
+    rejected: a stub floor (``min_position_pct``) lets the optimizer sell all
+    but a sliver of CVLT the day after buying it -- an exit in all but name --
+    and then sell the sliver when the name finally drops out, which is two
+    trades where one was churn. Freezing the weight after the solve instead
+    would forbid adding to a strengthening name and would edit the solved
+    vector outside the program, where the sleeve, sector and turnover
+    constraints no longer hold; as a bound INSIDE the program every one of
+    them still does.
+
+    Floors are scaled down, in proportion, when together they would leave the
+    sleeve pin or a sector cap no room (a book that drifted below its sleeve):
+    a protection is never allowed to make the program infeasible.
+
+    Returns ``(floors, meta)``. ``meta`` is recorded on EVERY solve, the
+    controls off included: an absent block is a control nobody can show ran.
+    """
+    n = len(tickers)
+    floors = np.zeros(n, dtype=float)
+    meta: dict[str, object] = {
+        "min_hold_days": params.min_hold_days,
+        "exit_rank_buffer": params.exit_rank_buffer,
+        "protected": [],
+        "released": [],
+        "floors_scaled": False,
+    }
+    if params.min_hold_days is None and params.exit_rank_buffer is None:
+        return floors, meta
+    prev = np.asarray(w_prev, dtype=float)
+    alpha = np.asarray(alpha_hat, dtype=float)
+    eligible = np.asarray(cut_eligibility, dtype=bool)
+    caps = np.asarray(effective_caps, dtype=float)
+    held = prev > 0.0
+    held[[benchmark_idx, cash_idx]] = False
+    ages: np.ndarray | None = None
+    if params.min_hold_days is not None and np.any(held):
+        if held_sessions is None:
+            raise ValueError(
+                f"min_hold_days is {params.min_hold_days}, but no held_sessions were given "
+                f"for the held book {sorted(tickers[i] for i in np.where(held)[0])}. A hold "
+                "that cannot see how long a name has been held cannot hold it; supply each "
+                "held name's session count (1 = entered by the previous session's book)."
+            )
+        ages = np.asarray(held_sessions, dtype=float)
+        if ages.shape != (n,):
+            raise ValueError(f"held_sessions shape {ages.shape} != ({n},)")
+        bad = sorted(
+            tickers[i] for i in np.where(held)[0] if not (ages[i] >= 1 and ages[i] == int(ages[i]))
+        )
+        if bad:
+            raise ValueError(
+                f"held_sessions for held name(s) {bad} must be whole sessions >= 1; a held "
+                "name has been held into at least the session that entered it."
+            )
+    ranks = alpha_ranks(alpha, eligible, benchmark_idx, cash_idx)
+    protected: list[dict[str, object]] = []
+    released: list[dict[str, object]] = []
+    for i in np.where(held)[0]:
+        age = None if ages is None else int(ages[i])
+        row: dict[str, object] = {
+            "ticker": tickers[i],
+            "held_weight": round(float(prev[i]), 6),
+            "alpha_rank": int(ranks[i]) or None,
+            "held_sessions": age,
+        }
+        # Hard risk first, then eligibility: each is an exit the timing rules
+        # never resist. A name the cut dropped has no rank to be inside.
+        if alpha[i] < 0.0:
+            released.append({**row, "reason": "negative_alpha"})
+            continue
+        if not eligible[i]:
+            released.append({**row, "reason": "ineligible"})
+            continue
+        reasons: list[str] = []
+        if params.min_hold_days is not None and age is not None and age < params.min_hold_days:
+            reasons.append("min_hold")
+        if params.exit_rank_buffer is not None and ranks[i] <= params.exit_rank_buffer:
+            reasons.append("rank_buffer")
+        if not reasons:
+            continue
+        floors[i] = min(float(prev[i]), float(caps[i]))
+        protected.append({**row, "reasons": reasons})
+
+    # Room for the floors: the sleeve is an equality pin and the book sums to
+    # one, so together they may claim at most the equity budget; within a real
+    # sector, at most its cap.
+    scaled = False
+    budget = (1.0 - float(params.cash_sleeve_pct)) * (1.0 - _FLOOR_SLACK)
+    if floors.sum() > budget:
+        floors *= budget / floors.sum()
+        scaled = True
+    for sector_label in _real_sectors(sectors):
+        idx = [i for i, s in enumerate(sectors) if s == sector_label]
+        room = float(params.max_sector_pct) * (1.0 - _FLOOR_SLACK)
+        if floors[idx].sum() > room:
+            floors[idx] *= room / floors[idx].sum()
+            scaled = True
+    for row in protected:
+        row["floor"] = round(float(floors[tickers.index(str(row["ticker"]))]), 6)
+    meta["protected"] = protected
+    meta["released"] = released
+    meta["floors_scaled"] = scaled
+    return floors, meta
 
 
 def _mandatory_turnover_floor(
