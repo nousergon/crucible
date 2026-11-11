@@ -35,7 +35,8 @@ name: Trader pin
 # (infrastructure/cloudformation/crucible-v2.yaml), NOT by this repository. It
 # may read what `release.pin_trader` reads, write exactly
 # `trader/pin_request.json`, `trader/release_pin` and its own two manifest
-# prefixes, and call `states:ListExecutions` on the post-close state machine.
+# prefixes, and call `states:ListExecutions` on the post-close state machine
+# (v2's `ne-postclose-reconcile-pipeline`, alpha-engine-config-I12024).
 # It is not the deploy role (which moves `releases/current`, never the
 # trader's pin) and not the trader's own role (the running trader must never
 # be able to pin its own release). nous-ergon-ops applies that stack on merge
@@ -45,20 +46,26 @@ name: Trader pin
 #
 # ── Why the evening, and why a deadline ───────────────────────────────────
 #
-# 23:15 UTC is 19:15 EDT / 18:15 EST: after the post-close pipeline has
-# stopped the executor box (measured 17:10-17:50 New York time), and far from
-# the 05:00 ET start of the pin blackout even with this account's measured
-# GitHub Actions delivery lag (up to ~5h). `release.pin_apply` writes a
-# manifest every session whether or not anything was queued, and its
+# 02:45 UTC Tuesday-Saturday is 22:45 EDT / 21:45 EST Monday-Friday: after
+# v2's post-close reconcile has finished (it starts ~20:30 New York time and
+# succeeds in ~2 minutes, measured 2026-10-12..11-10), and 30 minutes after
+# its own 02:15 UTC backstop, so a backstop redrive is read finished rather
+# than RUNNING. The cron used to be 23:15 UTC, which was BEFORE the v2
+# reconcile starts whenever GitHub delivered it on time
+# (alpha-engine-config-I12024). Even with this account's measured GitHub
+# Actions delivery lag (up to ~5h) the latest run lands by 03:49 EDT / 02:49
+# EST, clear of the 05:00 ET start of the pin blackout. `release.pin_apply`
+# writes a manifest every session whether or not anything was queued, and its
 # components.yaml row carries a deadline, so a cron GitHub silently dropped is
 # an ABSENCE page, never a queued request that quietly never moves.
 
 on:
   schedule:
-    # Weekdays on CALENDAR time; the guard resolves the NYSE session and
-    # skips a holiday (§4.12: the scheduler runs on calendar time, the job
-    # resolves the trading day).
-    - cron: '15 23 * * 1-5'
+    # Monday-Friday New York evenings, which are Tuesday-Saturday in UTC, on
+    # CALENDAR time; the guard maps the run back to the evening it belongs
+    # to, resolves the NYSE session and skips a holiday (§4.12: the scheduler
+    # runs on calendar time, the job resolves the trading day).
+    - cron: '45 2 * * 2-6'
   workflow_dispatch:
     inputs:
       sha:
@@ -78,13 +85,20 @@ env:
   AWS_REGION: us-east-1
   # No infrastructure literals in this public tree (crucible AGENTS.md,
   # Visibility; tests/test_no_infra_literals.py): the account id, the role
-  # prefix, the store and the post-close state machine's NAME all come from
-  # repository variables.
+  # prefix and the store come from repository variables.
+  #
+  # The post-close state machine's NAME is a literal, deliberately
+  # (alpha-engine-config-I12024). It used to be the repository variable
+  # CRUCIBLE_POSTCLOSE_STATE_MACHINE, which still named v1's
+  # `ne-postclose-trading-pipeline` (last run 2026-10-30) after v2's cutover,
+  # so every evening read "unclean" and no queued pin could ever apply - and
+  # nothing in this tree could show it. The name carries no account and grants
+  # nothing; the ARN is still built from vars.AWS_ACCOUNT_ID below.
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
   TRADER_PIN_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.CRUCIBLE_ROLE_PREFIX }}-trader-pin
   BOARD_ROLE_NAME: ${{ vars.CRUCIBLE_ROLE_PREFIX }}-board
   STORE_URI: ${{ vars.CRUCIBLE_STORE_URI }}
-  POSTCLOSE_STATE_MACHINE: ${{ vars.CRUCIBLE_POSTCLOSE_STATE_MACHINE }}
+  POSTCLOSE_STATE_MACHINE: ne-postclose-reconcile-pipeline
   # ── every value the package refuses to run without ─────────────────────
   # Both jobs run crucible with `--run-mode live`, which
   # tests/test_workflow_required_env.py reads as "reaches the production
@@ -199,10 +213,6 @@ jobs:
             echo "::error::repository variable CRUCIBLE_STORE_URI is not set — set it with: gh variable set CRUCIBLE_STORE_URI --repo nousergon/crucible --body '<s3-uri-of-the-crucible-v2-store>'"
             missing=1
           fi
-          if [ -z "$POSTCLOSE_STATE_MACHINE" ]; then
-            echo "::error::repository variable CRUCIBLE_POSTCLOSE_STATE_MACHINE is not set, so the guard cannot read whether tonight's post-close finished — set it with: gh variable set CRUCIBLE_POSTCLOSE_STATE_MACHINE --repo nousergon/crucible --body '<name-of-the-post-close-state-machine>'"
-            missing=1
-          fi
           exit "$missing"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -238,7 +248,7 @@ jobs:
       - name: Read tonight's post-close
         id: guard
         env:
-          POSTCLOSE_STATE_MACHINE_ARN: arn:aws:states:${{ env.AWS_REGION }}:${{ vars.AWS_ACCOUNT_ID }}:stateMachine:${{ vars.CRUCIBLE_POSTCLOSE_STATE_MACHINE }}
+          POSTCLOSE_STATE_MACHINE_ARN: arn:aws:states:${{ env.AWS_REGION }}:${{ vars.AWS_ACCOUNT_ID }}:stateMachine:${{ env.POSTCLOSE_STATE_MACHINE }}
         run: uv run python scripts/trader_pin_guard.py
 
       # A rehearsal first: the same reads and gates, every write captured and

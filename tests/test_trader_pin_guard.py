@@ -1,8 +1,10 @@
 """`scripts/trader_pin_guard.py`: "was tonight's post-close clean", against a
 fake `states:ListExecutions` (alpha-engine-config-I11545).
 
-Fixed date literals only. Tuesday 2026-09-08 is the session; Monday
+Fixed date literals only. Tuesday 2026-09-08 is the session (EDT); Monday
 2026-09-07 is Labor Day, the holiday a `weekday() < 5` check gets wrong.
+Tuesday 2026-11-10 is the EST session, with the v2 reconcile execution as it
+was measured that evening (alpha-engine-config-I12024).
 """
 
 from __future__ import annotations
@@ -23,10 +25,15 @@ _spec.loader.exec_module(guard)
 
 ET = ZoneInfo("America/New_York")
 SESSION = dt.date(2026, 9, 8)
-#: The cron's own instant on the session: 23:15 UTC = 19:15 EDT.
-ON_TIME = dt.datetime(2026, 9, 8, 23, 15, tzinfo=dt.UTC)
-#: The same cron delivered five hours late: 00:15 EDT the next calendar day.
-LATE = dt.datetime(2026, 9, 9, 4, 15, tzinfo=dt.UTC)
+#: The cron's own instant for the session: 02:45 UTC the next calendar day
+#: (`45 2 * * 2-6`) = 22:45 EDT on the session.
+ON_TIME = dt.datetime(2026, 9, 9, 2, 45, tzinfo=dt.UTC)
+#: The same cron delivered at the measured worst lag, +304 minutes: 03:49 EDT
+#: the next calendar day.
+LATE = ON_TIME + dt.timedelta(minutes=304)
+#: The cron's own instant from the trader-pin workflow, read from the YAML so
+#: these tests move when it does.
+_WORKFLOW = pathlib.Path(__file__).resolve().parents[1] / ".github" / "workflows" / "trader-pin.yml"
 
 
 def _execution(status: str, start_et: dt.datetime, name: str = "x") -> dict:
@@ -54,6 +61,50 @@ class TestNominalDay:
 
     def test_a_run_delivered_after_midnight_is_still_the_previous_evening(self) -> None:
         assert guard.nominal_day(LATE) == SESSION
+
+
+class TestTheCronAgainstTheCalendar:
+    """The cron is UTC and the session is New York: check both offsets."""
+
+    @staticmethod
+    def _cron() -> tuple[int, int, str]:
+        import yaml  # noqa: PLC0415 - only this class reads the workflow
+
+        raw = yaml.safe_load(_WORKFLOW.read_text(encoding="utf-8"))
+        triggers = raw.get(True, raw.get("on"))
+        minute, hour, _, _, weekdays = triggers["schedule"][0]["cron"].split()
+        return int(minute), int(hour), weekdays
+
+    @pytest.mark.parametrize(
+        ("session", "fired"),
+        [
+            # EDT: Tuesday 2026-09-08 evening, cron fires Wednesday 02:45Z.
+            (dt.date(2026, 9, 8), dt.date(2026, 9, 9)),
+            # EST: Tuesday 2026-11-10 evening, cron fires Wednesday 02:45Z.
+            (dt.date(2026, 11, 10), dt.date(2026, 11, 11)),
+            # EST Friday: the Saturday UTC run is Friday's evening.
+            (dt.date(2026, 11, 6), dt.date(2026, 11, 7)),
+        ],
+    )
+    def test_on_time_and_worst_late_runs_read_the_evening_and_miss_the_blackout(
+        self, session: dt.date, fired: dt.date
+    ) -> None:
+        from crucible.release import trader_pin_window_refusal  # noqa: PLC0415
+
+        minute, hour, weekdays = self._cron()
+        assert weekdays == "2-6", "Tuesday-Saturday UTC is Monday-Friday New York evenings"
+        on_time = dt.datetime(fired.year, fired.month, fired.day, hour, minute, tzinfo=dt.UTC)
+        for run in (on_time, on_time + dt.timedelta(minutes=304)):
+            assert guard.nominal_day(run) == session, run
+            assert trader_pin_window_refusal(run) is None, run
+
+    def test_the_on_time_run_is_after_the_reconcile_and_its_backstop(self) -> None:
+        """v2's reconcile starts ~20:30 ET; its backstop fires at 02:15 UTC."""
+        minute, hour, _ = self._cron()
+        assert (hour, minute) > (2, 15)
+        for fired in (dt.date(2026, 9, 9), dt.date(2026, 11, 11)):
+            on_time = dt.datetime(fired.year, fired.month, fired.day, hour, minute, tzinfo=dt.UTC)
+            assert on_time.astimezone(ET).time() >= dt.time(21, 0), on_time
 
 
 class TestReading:
@@ -120,15 +171,31 @@ class TestReading:
 
     def test_a_holiday_is_a_skip_and_never_lists_anything(self) -> None:
         pages, calls = _pages([_execution("SUCCEEDED", _at(dt.date(2026, 9, 7), 16))])
-        labor_day = dt.datetime(2026, 9, 7, 23, 15, tzinfo=dt.UTC)
+        labor_day = dt.datetime(2026, 9, 8, 2, 45, tzinfo=dt.UTC)
         reading = guard.read(labor_day, pages)
         assert (reading.session, reading.postclose) == (None, "skip")
         assert calls == []
 
+    def test_the_measured_est_evening_reads_clean(self) -> None:
+        """2026-11-10: `eod-reconcile-2026-11-10-*` started 01:37Z on the 11th
+        (20:37 EST) and SUCCEEDED; the cron's 02:45Z run reads it clean."""
+        reconcile = {
+            "name": "eod-reconcile-2026-11-10",
+            "status": "SUCCEEDED",
+            "startDate": dt.datetime(2026, 11, 11, 1, 37, 49, tzinfo=dt.UTC),
+        }
+        pages, _ = _pages([reconcile])
+        for run in (
+            dt.datetime(2026, 11, 11, 2, 45, tzinfo=dt.UTC),
+            dt.datetime(2026, 11, 11, 7, 49, tzinfo=dt.UTC),
+        ):
+            reading = guard.read(run, pages)
+            assert (reading.session, reading.postclose) == (dt.date(2026, 11, 10), "clean")
+
     def test_a_naive_instant_is_refused(self) -> None:
         pages, _ = _pages([])
         with pytest.raises(ValueError, match="naive"):
-            guard.read(dt.datetime(2026, 9, 8, 23, 15), pages)
+            guard.read(dt.datetime(2026, 9, 9, 2, 45), pages)
 
 
 class _FakeStates:
@@ -175,7 +242,7 @@ class TestMain:
         output = tmp_path / "out"
         monkeypatch.setenv("GITHUB_OUTPUT", str(output))
         monkeypatch.setenv(guard.STATE_MACHINE_ARN_VAR, self.ARN)
-        labor_day = dt.datetime(2026, 9, 7, 23, 15, tzinfo=dt.UTC)
+        labor_day = dt.datetime(2026, 9, 8, 2, 45, tzinfo=dt.UTC)
         assert guard.main([], now=labor_day, client=_FakeStates([])) == 0
         assert output.read_text() == "session=\npostclose=skip\n"
 
