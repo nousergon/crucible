@@ -87,6 +87,8 @@ def _solve(
     *,
     held: dict[int, int] | None = None,
     eligibility: np.ndarray | None = None,
+    hard_exit: np.ndarray | None = None,
+    buy_multiplier: float = 1.0,
 ):
     ages = None
     if held is not None:
@@ -106,6 +108,8 @@ def _solve(
         params,
         _flat_model(),
         held_sessions=ages,
+        hard_exit=hard_exit,
+        buy_multiplier=buy_multiplier,
     )
 
 
@@ -198,6 +202,47 @@ class TestHigherTiersStillWin:
         )
         assert result.weights[CVLT] == 0.0
         assert _released(result)["T2"] == "ineligible"
+
+    def test_a_hard_risk_exit_overrides_the_hold(self, entry_book) -> None:
+        """A loss-floor breach, drawdown cut or lockout (`crucible.hard_risk`) of a
+        name the hold protects: the hold releases it and the solve exits it."""
+        hard_exit = np.zeros(len(TICKERS), dtype=bool)
+        hard_exit[CVLT] = True
+        result = _solve(
+            ALPHA_RANK_5,
+            entry_book,
+            _params(**RULED),
+            held={0: 1, 1: 1, 2: 1, 3: 1},
+            hard_exit=hard_exit,
+        )
+        assert result.weights[CVLT] == 0.0
+        assert _released(result)["T2"] == "hard_risk"
+
+    def test_the_negative_alpha_exit_threshold_overrides_the_hold(self, entry_book) -> None:
+        alpha = list(ALPHA_RANK_5)
+        alpha[CVLT] = -0.03
+        result = _solve(
+            alpha,
+            entry_book,
+            _params(**RULED, negative_alpha_exit_below=-0.02),
+            held={0: 1, 1: 1, 2: 1, 3: 1},
+        )
+        assert result.weights[CVLT] == 0.0
+        assert _released(result)["T2"] == "hard_risk"
+
+    def test_at_the_drawdown_breaker_a_held_name_is_neither_grown_nor_sold(
+        self, entry_book
+    ) -> None:
+        """The hold keeps CVLT; the breaker forbids any name to grow. Both hold."""
+        result = _solve(
+            ALPHA_RANK_5,
+            entry_book,
+            _params(**RULED),
+            held={0: 1, 1: 1, 2: 1, 3: 1},
+            buy_multiplier=0.0,
+        )
+        assert result.weights[CVLT] == pytest.approx(entry_book[CVLT], abs=1e-4)
+        assert np.all(result.weights[:N_NAMES] <= entry_book[:N_NAMES] + 1e-4)
 
     def test_the_per_name_cap_bounds_the_floor(self, entry_book) -> None:
         result = _solve(

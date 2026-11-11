@@ -133,6 +133,8 @@ def _solve(
     alpha: np.ndarray | None = None,
     eligibility: np.ndarray | None = None,
     held_sessions: np.ndarray | None = None,
+    hard_exit: np.ndarray | None = None,
+    buy_multiplier: float = 1.0,
     **overrides: object,
 ):
     rows, cash_prev = _REPLAY[day]
@@ -160,6 +162,8 @@ def _solve(
         covariance=_covariance(n, bench, cash),
         portfolio_notional=1_000_000.0,
         held_sessions=held_sessions,
+        hard_exit=hard_exit,
+        buy_multiplier=buy_multiplier,
     )
     return tickers, w_prev, result
 
@@ -503,3 +507,147 @@ class TestTheBandAppliesAfterTheStep:
         moved = np.abs(on.weights - w_prev)[:-1]
         assert np.all((moved < 1e-6) | (moved >= 0.01 - 1e-9) | (on.weights[:-1] == 0.0))
         assert on.weights.sum() == pytest.approx(1.0, abs=1e-9)
+
+
+def _mask(tickers: list[str], names: set[str]) -> np.ndarray:
+    return np.array([t in names for t in tickers])
+
+
+class TestComposesWithTheHardRiskLayer:
+    """crucible#496's hard-risk layer outranks the pace (hard risk > eligibility
+    > optimizer > timing): a forced exit leaves in full at any ``k``, past any
+    churn floor, and the drawdown throttle bounds the STEPPED book."""
+
+    def test_a_hard_exit_leaves_in_full_under_the_pace_and_a_minimum_hold(self) -> None:
+        """MU: held 24.9%, eligible, positive alpha, one session old under a
+        three-session minimum hold -- every timing rule would keep it. A
+        caller hard exit (loss floor, drawdown exit, lockout) sells it whole."""
+        rows, cash = _REPLAY["2026-11-09"]
+        tickers = [r[0] for r in rows] + ["SPY", "__CASH__"]
+        w_prev = np.array([r[3] for r in rows] + [0.0, cash])
+        mu = tickers.index("MU")
+        for rate in (0.1, 0.5):
+            _t, _w, on = _solve(
+                "2026-11-09",
+                aim_adjustment_rate=rate,
+                min_hold_days=3,
+                held_sessions=_held_sessions(w_prev, 1),
+                hard_exit=_mask(tickers, {"MU"}),
+            )
+            assert w_prev[mu] > 0.2
+            assert on.weights[mu] == pytest.approx(0.0, abs=1e-9), rate
+            assert on.diagnostics["aim_weights"]["MU"] == pytest.approx(0.0, abs=1e-9)
+            aim = on.diagnostics["aim_adjustment"]
+            assert aim["applied"] is True
+            assert "MU" in aim["forced_moves"]
+            assert aim["hard_risk_forced_exits"] == ["MU"]
+            assert "MU" not in aim["floor_protected"]
+            released = {
+                row["ticker"]: row["reason"] for row in on.diagnostics["churn_controls"]["released"]
+            }
+            assert released["MU"] == "hard_risk"
+            assert on.diagnostics["hard_risk"]["hard_exit_held_exits"] == ["MU"]
+            assert on.weights.sum() == pytest.approx(1.0, abs=1e-9)
+            assert np.all(on.weights >= -1e-12)
+
+    def test_a_budget_limited_step_still_takes_the_hard_exit_in_full(self) -> None:
+        """A 2% day: the pace is bisected down to fit, the forced exit is not."""
+        tickers, w_prev, on = _solve(
+            "2026-11-09",
+            aim_adjustment_rate=1.0,
+            max_daily_turnover=0.02,
+            conviction_budget_gate_enabled=False,
+        )
+        anf = tickers.index("ANF")
+        _t, _w, forced = _solve(
+            "2026-11-09",
+            aim_adjustment_rate=1.0,
+            max_daily_turnover=0.02,
+            conviction_budget_gate_enabled=False,
+            hard_exit=_mask(tickers, {"ANF"}),
+        )
+        aim = forced.diagnostics["aim_adjustment"]
+        assert aim["reason"] == "budget_limited_step"
+        assert aim["rate_applied"] < 1.0
+        assert forced.weights[anf] == pytest.approx(0.0, abs=1e-9)
+        assert w_prev[anf] > 0.1
+        assert on.weights[anf] > 0.0
+
+    def test_a_negative_alpha_floor_exit_leaves_in_full_under_the_pace(self) -> None:
+        """``negative_alpha_exit_below``: CVLT at -3% against a -2% floor."""
+        rows, _cash = _REPLAY["2026-11-09"]
+        alpha = np.array([r[1] for r in rows] + [0.0, -1e-6])
+        cvlt = [r[0] for r in rows].index("CVLT")
+        alpha[cvlt] = -0.03
+        tickers, w_prev, on = _solve(
+            "2026-11-09",
+            alpha=alpha,
+            aim_adjustment_rate=0.25,
+            negative_alpha_exit_below=-0.02,
+        )
+        assert w_prev[cvlt] > 0.10
+        assert on.weights[cvlt] == pytest.approx(0.0, abs=1e-9)
+        assert on.diagnostics["hard_risk"]["negative_alpha_held_exits"] == ["CVLT"]
+        assert on.diagnostics["aim_adjustment"]["hard_risk_forced_exits"] == ["CVLT"]
+
+    def test_at_the_breaker_the_stepped_book_grows_nothing(self) -> None:
+        """11-06: 48% idle cash that the pace would deploy k of the way. At the
+        circuit breaker no name may grow, so the cash stays cash."""
+        tickers, w_prev, free = _solve("2026-11-06", aim_adjustment_rate=0.5)
+        cash = tickers.index("__CASH__")
+        assert np.any(free.weights[:cash] > w_prev[:cash] + 0.01), "the pace must buy unthrottled"
+        _t, _w, on = _solve("2026-11-06", aim_adjustment_rate=0.5, buy_multiplier=0.0)
+        assert np.all(on.weights[:cash] <= w_prev[:cash] + 1e-9)
+        assert on.weights.sum() == pytest.approx(1.0, abs=1e-9)
+        assert on.weights[cash] >= w_prev[cash] - 1e-9
+        assert on.diagnostics["aim_adjustment"]["cash_absorbs_residual"] is True
+        assert on.diagnostics["hard_risk"]["cash_sleeve_is_floor"] is True
+
+    def test_at_the_breaker_a_protected_name_is_held_and_a_hard_exit_stays_cash(self) -> None:
+        rows, cash_prev = _REPLAY["2026-11-09"]
+        tickers = [r[0] for r in rows] + ["SPY", "__CASH__"]
+        w_prev = np.array([r[3] for r in rows] + [0.0, cash_prev])
+        cash = tickers.index("__CASH__")
+        mu, cvlt = tickers.index("MU"), tickers.index("CVLT")
+        _t, _w, on = _solve(
+            "2026-11-09",
+            aim_adjustment_rate=0.5,
+            min_hold_days=3,
+            held_sessions=_held_sessions(w_prev, 1),
+            hard_exit=_mask(tickers, {"MU"}),
+            buy_multiplier=0.0,
+        )
+        assert on.weights[mu] == pytest.approx(0.0, abs=1e-9)
+        assert np.all(on.weights[:cash] <= w_prev[:cash] + 1e-9)
+        # CVLT is inside its minimum hold: held, not grown.
+        assert on.weights[cvlt] == pytest.approx(w_prev[cvlt], abs=1e-6)
+        # MU's proceeds are not redeployed: cash holds at least what it freed.
+        assert on.weights[cash] >= cash_prev + w_prev[mu] - 1e-6
+        assert on.weights.sum() == pytest.approx(1.0, abs=1e-9)
+
+    def test_at_half_size_no_stepped_name_grows_past_half_its_room(self) -> None:
+        tickers, w_prev, on = _solve("2026-11-06", aim_adjustment_rate=1.0, buy_multiplier=0.5)
+        cash = tickers.index("__CASH__")
+        cap = 0.25  # _PARAMS["max_position_pct"]; every replay name is unsectored
+        for i in range(cash):
+            room = max(cap - w_prev[i], 0.0)
+            assert on.weights[i] <= w_prev[i] + 0.5 * room + 1e-6, tickers[i]
+        assert on.weights.sum() == pytest.approx(1.0, abs=1e-9)
+
+
+def test_what_the_throttled_caps_cannot_take_stays_cash() -> None:
+    """``_aim_step`` under the drawdown ladder: a deferred entry's weight that
+    no cap has room for is left in cash, never lost from the book."""
+    from crucible.portfolio import _aim_step
+
+    prev = np.array([0.0, 0.0, 1.0])
+    aim = np.array([0.006, 0.006, 0.988])
+    caps = np.array([0.006, 0.006, 1.0])
+    none = np.zeros(3, dtype=bool)
+    args = (0.5, aim, prev, caps, np.zeros(3), none, none, 2, 0.005)
+    w, zeroed, _mass, unplaced = _aim_step(*args, pace_cash=False, cash_absorbs=True)
+    assert zeroed.tolist() == [True, True, False]
+    assert unplaced == 0.0
+    assert w.tolist() == pytest.approx([0.0, 0.0, 1.0])
+    _w, _z, _m, lost = _aim_step(*args, pace_cash=False, cash_absorbs=False)
+    assert lost > 0.0

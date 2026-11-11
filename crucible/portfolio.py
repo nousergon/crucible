@@ -105,12 +105,15 @@ __all__ = [
     "CostModel",
     "CostModelError",
     "CostModelInputError",
+    "DRAWDOWN_LADDER_FIELDS",
     "OptimizerResult",
     "PortfolioParams",
     "PortfolioParamsError",
     "TurnoverBudgetError",
     "compute_conviction_budget_multiplier",
+    "forced_exit_mask",
     "cost_model_from_mapping",
+    "declared_value",
     "load_portfolio_params",
     "load_portfolio_params_from_store",
     "make_cash_sentinel_returns",
@@ -449,6 +452,16 @@ PORTFOLIO_PARAM_FIELDS: dict[str, str] = {
     "book_notional_usd": "number",
     "max_position_pct": "number-or-null",
     "ineligible_held_exit": "string",
+    # The hard-risk layer (`alpha-engine-config-I12024` v1 parity rows 3, 4, 6,
+    # 7). `crucible.hard_risk` documents each; no value lives here.
+    "negative_alpha_exit_below": "number-or-null",
+    "position_loss_floor_pct": "number-or-null",
+    "hard_risk_reentry_lockout_sessions": "integer-or-null",
+    "drawdown_half_size_at": "number-or-null",
+    "drawdown_quarter_size_at": "number-or-null",
+    "drawdown_circuit_breaker_at": "number-or-null",
+    "drawdown_forced_exits_at_half": "integer-or-null",
+    "drawdown_forced_exits_at_quarter": "integer-or-null",
     "rebalance_band_pct": "number-or-null",
     "min_hold_days": "integer-or-null",
     "exit_rank_buffer": "integer-or-null",
@@ -467,6 +480,19 @@ PORTFOLIO_PARAM_FIELDS: dict[str, str] = {
 _ROLLOUT_ABSENT: Mapping[str, float | str | None] = {
     "max_position_pct": None,
     "ineligible_held_exit": "forced",
+    # ROLLOUT ONLY, same two-reader reasoning (the hard-risk layer, v1 parity
+    # audit 2026-11-09). Absent reads as OFF -- the behaviour before the layer
+    # existed -- because the values are strategy edge and this repository
+    # carries none; `strategy/slots/s.yaml` turns the layer on by declaring
+    # them once both readers carry these fields, and then this block empties.
+    "negative_alpha_exit_below": None,
+    "position_loss_floor_pct": None,
+    "hard_risk_reentry_lockout_sessions": None,
+    "drawdown_half_size_at": None,
+    "drawdown_quarter_size_at": None,
+    "drawdown_circuit_breaker_at": None,
+    "drawdown_forced_exits_at_half": None,
+    "drawdown_forced_exits_at_quarter": None,
     # ROLLOUT ONLY, same two-reader reasoning: the v1 no-trade band (parity
     # audit 2026-11-09, row 17). Absent reads as OFF -- every delta trades, the
     # behaviour before the field existed.
@@ -483,6 +509,17 @@ _ROLLOUT_ABSENT: Mapping[str, float | str | None] = {
     "aim_adjustment_rate": None,
 }
 
+#: The drawdown ladder's fields. All five are declared or all five are null:
+#: half a ladder is a throttle with no floor under it, or a floor with no
+#: throttle in front of it, and neither is a ladder anyone chose.
+DRAWDOWN_LADDER_FIELDS: tuple[str, ...] = (
+    "drawdown_half_size_at",
+    "drawdown_quarter_size_at",
+    "drawdown_circuit_breaker_at",
+    "drawdown_forced_exits_at_half",
+    "drawdown_forced_exits_at_quarter",
+)
+
 #: The values `PortfolioParams.ineligible_held_exit` admits.
 INELIGIBLE_HELD_EXITS: frozenset[str] = frozenset({"forced", "discretionary"})
 
@@ -493,6 +530,17 @@ _NULLABLE_PARAMS: frozenset[str] = frozenset(
 
 class PortfolioParamsError(ValueError):
     """A portfolio parameter set is absent, short a field, or carries an unknown one."""
+
+
+def declared_value(value: float | None) -> float:
+    """A nullable parameter the caller has already established is declared.
+
+    Raises rather than defaulting: reaching here with ``None`` is a defect in
+    the caller's own all-or-none check, never a value to make up.
+    """
+    if value is None:
+        raise PortfolioParamsError("a parameter read as declared is null")
+    return float(value)
 
 
 @dataclass(frozen=True)
@@ -554,6 +602,29 @@ class PortfolioParams:
     #: never adds to it: a name falling one rank out of the cut is not sold
     #: whole the day after it was bought (2026-11-06, SNDK).
     ineligible_held_exit: str
+    #: A name whose predicted alpha is below this is pinned to zero, HELD NAMES
+    #: INCLUDED, as a forced exit outside the turnover budget and outside
+    #: ``ineligible_held_exit: discretionary``. ``null`` disables it. The
+    #: benchmark fill and the cash sentinel are exempt. v1 parity row 6.
+    negative_alpha_exit_below: float | None
+    #: A held name whose loss from its average cost is at or below this (a
+    #: negative fraction) is a forced exit. Applied by the trader, which alone
+    #: knows average cost (`crucible.hard_risk.loss_floor_breaches`). ``null``
+    #: disables it. v1 parity row 3.
+    position_loss_floor_pct: float | None
+    #: Sessions a name a hard-risk exit cut may not be bought, after the exit
+    #: session itself. ``null`` disables the lockout. v1 parity row 7.
+    hard_risk_reentry_lockout_sessions: int | None
+    #: The drawdown ladder (v1 parity row 4): NAV below its peak by at least
+    #: each threshold (negative fractions, strictly descending) halves, then
+    #: quarters, the room any name may grow by this session; at the breaker no
+    #: name may grow at all. Each tier also forces out the declared count of
+    #: the lowest-conviction held names. All five null disables the ladder.
+    drawdown_half_size_at: float | None
+    drawdown_quarter_size_at: float | None
+    drawdown_circuit_breaker_at: float | None
+    drawdown_forced_exits_at_half: int | None
+    drawdown_forced_exits_at_quarter: int | None
     #: The no-trade band (v1 parity audit 2026-11-09, row 17; v1
     #: `optimizer_shadow._compute_trade_deltas`). After the solve, a name whose
     #: weight would move by less than this fraction of the book keeps its held
@@ -596,6 +667,7 @@ class PortfolioParams:
     aim_adjustment_rate: float | None
 
     def __post_init__(self) -> None:
+        self._validate_hard_risk()
         if self.aim_adjustment_rate is not None and not 0.0 < self.aim_adjustment_rate <= 1.0:
             raise PortfolioParamsError(
                 f"aim_adjustment_rate must be in (0, 1] or null; got {self.aim_adjustment_rate}. "
@@ -672,6 +744,50 @@ class PortfolioParams:
                 "deltas become trade sizes only against a positive book size, and a "
                 "non-positive one is not a smaller book — it is not a book."
             )
+
+    def _validate_hard_risk(self) -> None:
+        if self.negative_alpha_exit_below is not None and self.negative_alpha_exit_below > 0.0:
+            raise PortfolioParamsError(
+                "negative_alpha_exit_below must be <= 0 or null; got "
+                f"{self.negative_alpha_exit_below}. A positive threshold would force out "
+                "names the model expects to beat the benchmark."
+            )
+        if self.position_loss_floor_pct is not None and not (
+            -1.0 < self.position_loss_floor_pct < 0.0
+        ):
+            raise PortfolioParamsError(
+                f"position_loss_floor_pct must be in (-1, 0) or null; got "
+                f"{self.position_loss_floor_pct}"
+            )
+        if (
+            self.hard_risk_reentry_lockout_sessions is not None
+            and self.hard_risk_reentry_lockout_sessions < 1
+        ):
+            raise PortfolioParamsError(
+                "hard_risk_reentry_lockout_sessions must be >= 1 or null; got "
+                f"{self.hard_risk_reentry_lockout_sessions}. Zero is spelled null."
+            )
+        ladder = {name: getattr(self, name) for name in DRAWDOWN_LADDER_FIELDS}
+        declared = sorted(name for name, value in ladder.items() if value is not None)
+        if not declared:
+            return
+        if len(declared) != len(DRAWDOWN_LADDER_FIELDS):
+            raise PortfolioParamsError(
+                f"the drawdown ladder declares {declared} but not "
+                f"{sorted(set(DRAWDOWN_LADDER_FIELDS) - set(declared))}. All five are "
+                "declared or all five are null."
+            )
+        half = declared_value(self.drawdown_half_size_at)
+        quarter = declared_value(self.drawdown_quarter_size_at)
+        breaker = declared_value(self.drawdown_circuit_breaker_at)
+        if not 0.0 > half > quarter > breaker > -1.0:
+            raise PortfolioParamsError(
+                "the drawdown ladder must satisfy 0 > half > quarter > breaker > -1; got "
+                f"half={half}, quarter={quarter}, breaker={breaker}"
+            )
+        for name in ("drawdown_forced_exits_at_half", "drawdown_forced_exits_at_quarter"):
+            if int(getattr(self, name)) < 0:
+                raise PortfolioParamsError(f"{name} must be >= 0; got {getattr(self, name)}")
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any], *, source: str) -> PortfolioParams:
@@ -876,6 +992,8 @@ def solve_target_weights(
     adv_usd: np.ndarray | None = None,
     portfolio_notional: float | None = None,
     name_sigma: np.ndarray | None = None,
+    hard_exit: np.ndarray | None = None,
+    buy_multiplier: float = 1.0,
     held_sessions: np.ndarray | None = None,
 ) -> OptimizerResult:
     """Solve the constrained MVO and return target weights plus diagnostics.
@@ -918,6 +1036,17 @@ def solve_target_weights(
         name_sigma: optional shape (N,) per-name return volatility, used to
             scale the impact term by σᵢ/refσ where refσ is the cross-sectional
             median.
+        hard_exit: optional shape (N,) bool. True pins the name to zero as a
+            FORCED exit -- above eligibility, above
+            ``ineligible_held_exit: discretionary``, and inside the mandatory
+            turnover floor, so no budget can starve it. The caller's hard-risk
+            layer (`crucible.hard_risk`): a loss-floor breach, a drawdown
+            forced exit, a re-entry lockout. The sentinels must be False.
+        buy_multiplier: the drawdown ladder's sizing multiplier in [0, 1].
+            Below 1, every name's room to GROW this session is scaled by it
+            (at 0, the circuit breaker, no name may grow) and the cash sleeve
+            becomes a floor rather than an equality pin, so the cash a forced
+            exit frees may stay cash rather than be redeployed.
         held_sessions: optional shape (N,) count of consecutive decision
             sessions each name has been held into -- 1 for a name the
             previous session's book entered. Read only for names ``w_prev``
@@ -991,11 +1120,26 @@ def solve_target_weights(
         )
     objective = cp.Maximize(sum(objective_terms))
 
+    if not 0.0 <= float(buy_multiplier) <= 1.0:
+        raise ValueError(f"buy_multiplier must be in [0, 1]; got {buy_multiplier!r}")
+    forced = forced_exit_mask(alpha_hat, hard_exit, benchmark_idx, cash_idx, params)
+    # The cut, before the hard-risk layer re-reads it in `_name_caps`.
     cut_eligibility = np.asarray(eligibility, dtype=bool)
     effective_caps, eligibility = _name_caps(
-        stance_caps, eligibility, w_prev, benchmark_idx, cash_idx, params
+        stance_caps,
+        eligibility,
+        w_prev,
+        benchmark_idx,
+        cash_idx,
+        params,
+        forced=forced,
+        buy_multiplier=float(buy_multiplier),
     )
     ineligible_idx = np.where(~eligibility)[0]
+    cash_floor_only = float(buy_multiplier) < 1.0
+    hard_risk_meta = _hard_risk_diagnostics(
+        tickers, alpha_hat, hard_exit, forced, w_prev, params, float(buy_multiplier)
+    )
     floors, churn_meta = _churn_floors(
         tickers,
         alpha_hat,
@@ -1007,13 +1151,18 @@ def solve_target_weights(
         cash_idx,
         params,
         held_sessions=held_sessions,
+        forced=forced,
     )
 
     constraints = [
         cp.sum(w) == 1.0,
         w >= floors,
         w <= effective_caps,
-        w[cash_idx] == params.cash_sleeve_pct,
+        (
+            w[cash_idx] >= params.cash_sleeve_pct
+            if cash_floor_only
+            else w[cash_idx] == params.cash_sleeve_pct
+        ),
     ]
     if params.vol_target_annual is not None:
         # Σ is at horizon H. Under i.i.d. log-returns Var_ann = Var_H · (252/H),
@@ -1056,13 +1205,14 @@ def solve_target_weights(
         alpha_hat=alpha_hat,
         alpha_uncertainty=alpha_uncertainty,
         benchmark_idx=benchmark_idx,
+        cash_floor_only=cash_floor_only,
     )
 
     problem = cp.Problem(objective, constraints)
     weights, status, solver_notes = _solve_with_fallback(problem, w)
 
     if weights is None:
-        weights = _fallback_weights(w_prev, cash_idx, params.cash_sleeve_pct)
+        weights = _fallback_weights(w_prev, cash_idx, params.cash_sleeve_pct, forced=forced)
         diagnostics = _build_diagnostics(
             weights,
             w_prev,
@@ -1083,10 +1233,16 @@ def solve_target_weights(
         diagnostics["cost_model"] = cost_model.record()
         diagnostics["aim_weights"] = None
         diagnostics["aim_adjustment"] = _aim_off_meta(aim_rate, "infeasible_fallback")
+        diagnostics["hard_risk"] = hard_risk_meta
         return OptimizerResult(weights=weights, diagnostics=diagnostics)
 
     weights, clip_mass_zeroed = _clip_and_renormalize(
-        weights, effective_caps, cash_idx, params, keep=floors > 0.0
+        weights,
+        effective_caps,
+        cash_idx,
+        params,
+        dust_to_cash=cash_floor_only,
+        keep=floors > 0.0,
     )
     aim_weights: dict[str, float] | None = None
     aim_meta = _aim_off_meta(aim_rate, "aim_adjustment_rate_null")
@@ -1106,6 +1262,8 @@ def solve_target_weights(
             tickers,
             params,
             budget=_optional_float(turnover_meta, "turnover_constraint_cap"),
+            hard_exit=forced,
+            cash_floor_only=cash_floor_only,
         )
     weights, governor = _apply_turnover_governor(
         weights,
@@ -1141,7 +1299,81 @@ def solve_target_weights(
     # infeasible path too. A cost model recorded only when the solve succeeded
     # is a cost model absent from exactly the artifacts an investigation reads.
     diagnostics["cost_model"] = cost_model.record()
+    diagnostics["hard_risk"] = hard_risk_meta
     return OptimizerResult(weights=weights, diagnostics=diagnostics)
+
+
+def forced_exit_mask(
+    alpha_hat: np.ndarray,
+    hard_exit: np.ndarray | None,
+    benchmark_idx: int,
+    cash_idx: int,
+    params: PortfolioParams,
+) -> np.ndarray:
+    """Names pinned to zero as a FORCED exit, whatever the cut and the budget say.
+
+    The union of the caller's ``hard_exit`` mask (the trader's hard-risk layer:
+    loss floor, drawdown forced exit, re-entry lockout) and every name whose
+    alpha is below ``negative_alpha_exit_below``. Precedence, highest first:
+    hard risk > eligibility > optimizer -- so a name in this mask is pinned
+    even when ``ineligible_held_exit: discretionary`` would have kept it, and
+    the mandatory turnover floor carries its sale. The benchmark fill and the
+    cash sentinel are never forced: one is the passive leg, the other carries
+    a deliberately negative alpha by convention.
+    """
+    alpha = np.asarray(alpha_hat, dtype=float)
+    forced = np.zeros(alpha.shape, dtype=bool)
+    if hard_exit is not None:
+        mask = np.asarray(hard_exit, dtype=bool)
+        if mask.shape != alpha.shape:
+            raise ValueError(f"hard_exit shape {mask.shape} != alpha shape {alpha.shape}")
+        if mask[benchmark_idx] or mask[cash_idx]:
+            raise ValueError(
+                "hard_exit names the benchmark fill or the cash sentinel; neither is a "
+                "position a hard-risk rule can exit"
+            )
+        forced |= mask
+    threshold = params.negative_alpha_exit_below
+    if threshold is not None:
+        forced |= np.isfinite(alpha) & (alpha < float(threshold))
+    forced[[benchmark_idx, cash_idx]] = False
+    return forced
+
+
+def _hard_risk_diagnostics(
+    tickers: list[str],
+    alpha_hat: np.ndarray,
+    hard_exit: np.ndarray | None,
+    forced: np.ndarray,
+    w_prev: np.ndarray,
+    params: PortfolioParams,
+    buy_multiplier: float,
+) -> dict[str, object]:
+    """What the hard-risk layer pinned this solve, by cause, on every solve.
+
+    Emitted when nothing engaged too: an empty list recorded is a rule that
+    ran and found nothing, an absent key is a rule nobody can show ran.
+    """
+    alpha = np.asarray(alpha_hat, dtype=float)
+    caller = (
+        np.zeros(len(tickers), dtype=bool) if hard_exit is None else np.asarray(hard_exit, bool)
+    )
+    threshold = params.negative_alpha_exit_below
+    negative = (
+        forced & ~caller & np.isfinite(alpha) & (alpha < float(threshold))
+        if threshold is not None
+        else np.zeros(len(tickers), dtype=bool)
+    )
+    held = np.asarray(w_prev, dtype=float) > 0.0
+    return {
+        "negative_alpha_exit_below": threshold,
+        "negative_alpha_pinned": sorted(tickers[i] for i in np.where(negative)[0]),
+        "negative_alpha_held_exits": sorted(tickers[i] for i in np.where(negative & held)[0]),
+        "hard_exit_pinned": sorted(tickers[i] for i in np.where(caller)[0]),
+        "hard_exit_held_exits": sorted(tickers[i] for i in np.where(caller & held)[0]),
+        "buy_multiplier": float(buy_multiplier),
+        "cash_sleeve_is_floor": bool(buy_multiplier < 1.0),
+    }
 
 
 def _resolve_alpha_uncertainty(
@@ -1596,15 +1828,31 @@ def _fallback_weights(
     w_prev: np.ndarray,
     cash_idx: int,
     cash_sleeve_pct: float,
+    *,
+    forced: np.ndarray | None = None,
 ) -> np.ndarray:
-    """The held book with cash absorbing the residual — the infeasible path."""
+    """The held book with cash absorbing the residual — the infeasible path.
+
+    A FORCED exit (:func:`forced_exit_mask`) survives the fallback: its weight
+    goes to cash, above the sleeve, never to the names still held. Holding a
+    name the hard-risk layer cut because some other constraint made the
+    program infeasible would let any infeasibility override the guard.
+    """
     weights = np.maximum(w_prev.copy(), 0.0)
     weights[cash_idx] = 0.0
-    equity_sum = weights.sum()
+    freed = 0.0
+    if forced is not None:
+        mask = np.asarray(forced, dtype=bool).copy()
+        mask[cash_idx] = False
+        freed = float(weights[mask].sum())
+        weights[mask] = 0.0
+    equity_sum = weights.sum() + freed
     target_equity = 1.0 - cash_sleeve_pct
     if equity_sum > 0:
-        weights *= target_equity / equity_sum
-    weights[cash_idx] = cash_sleeve_pct
+        scale = target_equity / equity_sum
+        weights *= scale
+        freed *= scale
+    weights[cash_idx] = cash_sleeve_pct + freed
     return weights
 
 
@@ -1614,9 +1862,14 @@ def _clip_and_renormalize(
     cash_idx: int,
     params: PortfolioParams,
     *,
+    dust_to_cash: bool = False,
     keep: np.ndarray | None = None,
 ) -> tuple[np.ndarray, float]:
     """Clip to the box, drop sub-``min_position_pct`` dust, renormalize.
+
+    With ``dust_to_cash`` (the drawdown ladder engaged) the dropped mass goes
+    to cash instead of scaling every survivor up, so the post-solve step can
+    never turn a name the throttle held at its weight into a buy.
 
     ``keep`` marks names a churn control protects (:func:`_churn_floors`):
     never dust, because the floor that keeps them held is a decision, and a
@@ -1637,6 +1890,8 @@ def _clip_and_renormalize(
         small &= ~np.asarray(keep, dtype=bool)
     mass_zeroed = float(np.sum(weights[small]))
     weights = np.where(small, 0.0, weights)
+    if dust_to_cash:
+        weights[cash_idx] += 1.0 - float(weights.sum())
     total = weights.sum()
     if total > 0:
         weights = weights / total
@@ -1650,6 +1905,9 @@ def _name_caps(
     benchmark_idx: int,
     cash_idx: int,
     params: PortfolioParams,
+    *,
+    forced: np.ndarray | None = None,
+    buy_multiplier: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """``(effective_caps, eligibility)``: each name's upper bound and whether it may be held.
 
@@ -1659,6 +1917,12 @@ def _name_caps(
     its current weight (and the cap), so selling it is the optimizer's choice
     inside the turnover budget, never a forced exit; it can only shrink. An
     ineligible name not held is pinned to zero as before.
+
+    The hard-risk layer is applied LAST, so it outranks both: a ``forced``
+    name is pinned to zero (ineligible, cap 0) whatever the cut or the
+    discretionary policy said, and below a ``buy_multiplier`` of 1 every
+    name's room above its held weight is scaled by it -- the benchmark fill
+    included, since at the breaker "no new buys" means none.
     """
     caps = np.asarray(stance_caps, dtype=float).copy()
     if params.max_position_pct is not None:
@@ -1671,6 +1935,16 @@ def _name_caps(
         kept = ~eligible & (np.asarray(w_prev, dtype=float) > 0.0)
         effective = np.where(kept, np.minimum(np.asarray(w_prev, dtype=float), caps), effective)
         eligible = eligible | kept
+    if forced is not None:
+        pinned = np.asarray(forced, dtype=bool)
+        effective = np.where(pinned, 0.0, effective)
+        eligible = eligible & ~pinned
+    if buy_multiplier < 1.0:
+        held = np.maximum(np.asarray(w_prev, dtype=float), 0.0)
+        room = np.maximum(effective - held, 0.0)
+        throttled = np.minimum(effective, np.minimum(held, effective) + buy_multiplier * room)
+        throttled[cash_idx] = effective[cash_idx]
+        effective = throttled
     return effective, eligible
 
 
@@ -1712,6 +1986,7 @@ def _churn_floors(
     params: PortfolioParams,
     *,
     held_sessions: np.ndarray | None,
+    forced: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Per-name lower bounds that keep a protected held name held.
 
@@ -1723,10 +1998,11 @@ def _churn_floors(
     * ``exit_rank_buffer`` -- alpha rank among the eligible names within this.
 
     **Precedence: hard risk > eligibility > optimizer > timing.** A held name
-    with NEGATIVE alpha (hard risk) or dropped by the cut (eligibility) is
-    RELEASED -- never protected -- and the cap still bounds every floor, so a
-    cap-forced trim is never resisted. Only then does a protection constrain
-    the optimizer.
+    the hard-risk layer forces out (``forced``: :func:`forced_exit_mask`), one
+    with NEGATIVE alpha, or one dropped by the cut (eligibility) is RELEASED --
+    never protected -- and the cap still bounds every floor, so a cap-forced
+    trim, and a drawdown throttle, is never resisted. Only then does a
+    protection constrain the optimizer.
 
     **A protected name's floor is its held weight** (bounded by its effective
     cap). The optimizer re-optimizes it and may ADD to it; it may not sell it
@@ -1762,6 +2038,7 @@ def _churn_floors(
     alpha = np.asarray(alpha_hat, dtype=float)
     eligible = np.asarray(cut_eligibility, dtype=bool)
     caps = np.asarray(effective_caps, dtype=float)
+    hard = np.zeros(n, dtype=bool) if forced is None else np.asarray(forced, dtype=bool)
     held = prev > 0.0
     held[[benchmark_idx, cash_idx]] = False
     ages: np.ndarray | None = None
@@ -1797,6 +2074,9 @@ def _churn_floors(
         }
         # Hard risk first, then eligibility: each is an exit the timing rules
         # never resist. A name the cut dropped has no rank to be inside.
+        if hard[i]:
+            released.append({**row, "reason": "hard_risk"})
+            continue
         if alpha[i] < 0.0:
             released.append({**row, "reason": "negative_alpha"})
             continue
@@ -1883,6 +2163,7 @@ def _aim_step(
     min_position: float,
     *,
     pace_cash: bool,
+    cash_absorbs: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, float, float]:
     """One candidate book at pace ``rate``: ``(weights, zeroed, mass_zeroed, unplaced)``.
 
@@ -1911,7 +2192,10 @@ def _aim_step(
        first. Only then does it spill toward the caps, or down to the churn
        floors: no name is ever stepped below the floor :func:`_churn_floors`
        set, because the aim already respects it and the step is a convex
-       combination of two books that both do.
+       combination of two books that both do. Under the drawdown ladder
+       (``cash_absorbs``: the sleeve is a floor, not a pin) whatever the caps
+       cannot take stays cash, so the residual never grows a name past the
+       throttled room :func:`_name_caps` allowed.
     """
     n = len(prev)
     idx = np.arange(n)
@@ -1935,6 +2219,9 @@ def _aim_step(
             left = 0.0
         w, left = _spread(w, left, caps - w, moving & (aim > 0.0))
         w, unplaced = _spread(w, left, caps - w, moving)
+        if cash_absorbs and unplaced > 0.0:
+            w[cash_idx] += unplaced
+            unplaced = 0.0
     elif residual < 0.0:
         w_neg, left = _spread(-w, -residual, w - aim, moving)
         if pace_cash:
@@ -1962,6 +2249,8 @@ def _step_toward_aim(
     params: PortfolioParams,
     *,
     budget: float | None,
+    hard_exit: np.ndarray | None = None,
+    cash_floor_only: bool = False,
 ) -> tuple[np.ndarray, float, dict[str, object]]:
     """Move the held book ``k`` of the way toward the aim book (alpha-engine-config-I12024).
 
@@ -1991,6 +2280,16 @@ def _step_toward_aim(
     bisected down until it fits. Forced moves are inside the mandatory floor,
     so a throttled day never starves them.
 
+    **The hard-risk layer outranks the pace** (crucible#496). ``hard_exit`` is
+    :func:`forced_exit_mask` -- a loss-floor breach, a drawdown forced exit, a
+    lockout, ``negative_alpha_exit_below`` -- and every such name is a forced
+    move: it leaves in full this session at any ``k``, at any bisected pace
+    (pace 0 included), and no churn floor holds it, because
+    :func:`_churn_floors` released it before the aim was solved. Under the
+    drawdown ladder (``cash_floor_only``) the throttled caps bound the step and
+    its residual, and what they cannot take stays cash: the stepped book never
+    grows a name past what the throttle allows, and at the breaker grows none.
+
     Returns ``(weights, mass_zeroed, meta)``. ``mass_zeroed`` is the weight the
     finish-the-exit rule removed, which the post-solve governor admits as
     tolerance exactly as it admits the dust floor's.
@@ -1999,7 +2298,8 @@ def _step_toward_aim(
     prev = np.asarray(w_prev, dtype=float)
     caps = np.asarray(effective_caps, dtype=float)
     lows = np.asarray(floors, dtype=float)
-    forced = prev > caps + _FORCED_MOVE_TOL
+    hard = np.zeros(len(prev), dtype=bool) if hard_exit is None else np.asarray(hard_exit, bool)
+    forced = (prev > caps + _FORCED_MOVE_TOL) | hard
     forced[cash_idx] = False
     positions = prev > 0.0
     positions[[benchmark_idx, cash_idx]] = False
@@ -2022,6 +2322,7 @@ def _step_toward_aim(
             cash_idx,
             min_position,
             pace_cash=not inception,
+            cash_absorbs=cash_floor_only,
         )
 
     def fits(step: tuple[np.ndarray, np.ndarray, float, float]) -> bool:
@@ -2057,6 +2358,8 @@ def _step_toward_aim(
         "cash_aim": float(aim[cash_idx]),
         "cash_stepped": float(weights[cash_idx]),
         "forced_moves": _names(tickers, forced),
+        "hard_risk_forced_exits": _names(tickers, hard & (prev > 0.0)),
+        "cash_absorbs_residual": cash_floor_only,
         "hard_risk_exits": _names(tickers, hard_risk),
         "floor_protected": _names(tickers, lows > 0.0),
         "exits_finished": _names(tickers, zeroed & (prev > 0.0)),
@@ -2071,6 +2374,8 @@ def _mandatory_turnover_floor(
     effective_caps: np.ndarray,
     cash_idx: int,
     params: PortfolioParams,
+    *,
+    cash_floor_only: bool = False,
 ) -> float:
     """One-way turnover the OTHER constraints force, regardless of alpha.
 
@@ -2093,12 +2398,16 @@ def _mandatory_turnover_floor(
 
     ``(Σd + |r|)/2`` is therefore an attainable one-way turnover for a point
     satisfying the box, the sleeve pin and the budget identity.
+
+    Under the drawdown ladder (``cash_floor_only``) the sleeve is a floor and
+    cash has room up to the whole book, so the residual a forced exit leaves
+    is absorbable by cash when no name may grow.
     """
     lower = np.zeros_like(w_prev)
     upper = np.array(effective_caps, dtype=float)
     sleeve = float(params.cash_sleeve_pct)
     lower[cash_idx] = sleeve
-    upper[cash_idx] = sleeve
+    upper[cash_idx] = 1.0 if cash_floor_only else sleeve
     projected = np.clip(w_prev, lower, upper)
     forced_l1 = float(np.sum(np.abs(projected - w_prev)))
     residual = abs(1.0 - float(projected.sum()))
@@ -2111,6 +2420,8 @@ def _decompose_mandatory_turnover(
     eligibility: np.ndarray,
     cash_idx: int,
     params: PortfolioParams,
+    *,
+    cash_floor_only: bool = False,
 ) -> dict:
     """Which constraint forced each unit of the mandatory floor.
 
@@ -2132,7 +2443,7 @@ def _decompose_mandatory_turnover(
     lower = np.zeros_like(w_prev)
     upper = np.array(effective_caps, dtype=float)
     lower[cash_idx] = sleeve
-    upper[cash_idx] = sleeve
+    upper[cash_idx] = 1.0 if cash_floor_only else sleeve
     projected = np.clip(w_prev, lower, upper)
     per_name = np.abs(projected - w_prev)
 
@@ -2285,6 +2596,7 @@ def _apply_turnover_constraint(
     alpha_hat: np.ndarray | None = None,
     alpha_uncertainty: np.ndarray | None = None,
     benchmark_idx: int | None = None,
+    cash_floor_only: bool = False,
 ) -> dict:
     """Append the L1 daily-turnover budget to ``constraints``.
 
@@ -2330,9 +2642,18 @@ def _apply_turnover_constraint(
     }
     if cap is None or cap <= 0:
         return meta
-    floor = _mandatory_turnover_floor(w_prev, effective_caps, cash_idx, params)
+    floor = _mandatory_turnover_floor(
+        w_prev, effective_caps, cash_idx, params, cash_floor_only=cash_floor_only
+    )
     by_cause = (
-        _decompose_mandatory_turnover(w_prev, effective_caps, eligibility, cash_idx, params)
+        _decompose_mandatory_turnover(
+            w_prev,
+            effective_caps,
+            eligibility,
+            cash_idx,
+            params,
+            cash_floor_only=cash_floor_only,
+        )
         if eligibility is not None
         else None
     )
