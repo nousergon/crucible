@@ -2117,6 +2117,9 @@ def _churn_floors(
 #: A held weight this far above its effective cap is a FORCED move, not drift.
 _FORCED_MOVE_TOL = 1e-9
 
+#: Float slack before a stepped book above one is refused rather than trimmed.
+_BOOK_OVER_ONE_TOL = 1e-9
+
 #: Bisection steps on the pace when the full step would exceed the day's
 #: turnover budget. 50 halvings resolve the rate far below a basis point.
 _AIM_BISECTION_STEPS = 50
@@ -2182,19 +2185,23 @@ def _aim_step(
        below ``min_position_pct`` goes to zero: a sale does not linger as a
        sub-floor stub, and an entry too small to hold waits for a later step.
        A name a churn control protects (``floors > 0``) is never zeroed.
-    4. **The residual** (the book must sum to one) is placed on the
-       discretionary names still moving toward the aim, in proportion to their
-       remaining gap, so no name passes its aim. Under a paced sleeve, what is
-       left goes to cash -- forced-sale proceeds are not deployed faster than
-       the pace -- and a shortfall is taken from cash down to the aim's sleeve
-       first. Only then does it spill toward the caps, or down to the churn
-       floors: no name is ever stepped below the floor :func:`_churn_floors`
-       set, because the aim already respects it and the step is a convex
-       combination of two books that both do. Whatever the caps still
-       cannot take goes to cash, in every case, so the stepped book always
-       sums to one: at inception a deferred sub-floor entry's weight waits in
-       cash, and under the drawdown ladder the residual never grows a name
-       past the throttled room :func:`_name_caps` allowed.
+    4. **A residual below one** is placed on the discretionary names still
+       moving toward the aim, in proportion to their remaining gap, so no name
+       passes its aim. Under a paced sleeve, what is left goes to cash --
+       forced-sale proceeds are not deployed faster than the pace. At
+       inception it may then spill toward the caps of names the AIM HOLDS;
+       it never spreads to a name whose aim weight is zero (Brian: conviction
+       in few names). Whatever is still left goes to cash, in every case, so
+       the stepped book always sums to one: a deferred sub-floor entry's
+       weight waits in cash, and under the drawdown ladder the residual never
+       grows a name past the throttled room :func:`_name_caps` allowed.
+    5. **A book above one** is brought back by taking from cash, down to zero,
+       first, then pro rata from every name above its churn floor, in
+       proportion to its excess over the floor. No name is ever stepped below
+       the floor :func:`_churn_floors` set. Floors that alone sum above one
+       RAISE: that is not a book, and :func:`solve_target_weights` never gets
+       here with one, because the aim program is infeasible under such floors
+       and takes the infeasible fallback before any step.
     """
     n = len(prev)
     idx = np.arange(n)
@@ -2217,17 +2224,22 @@ def _aim_step(
             w[cash_idx] += left
             left = 0.0
         w, left = _spread(w, left, caps - w, moving & (aim > 0.0))
-        w, unplaced = _spread(w, left, caps - w, moving)
-        w[cash_idx] += unplaced
-        unplaced = 0.0
+        w[cash_idx] += left
     elif residual < 0.0:
-        w_neg, left = _spread(-w, -residual, w - aim, moving)
-        if pace_cash:
-            take = min(left, max(float(-w_neg[cash_idx] - aim[cash_idx]), 0.0))
-            w_neg[cash_idx] += take
-            left -= take
-        w_neg, unplaced = _spread(w_neg, left, -w_neg - floors, moving)
+        excess = -residual
+        take = min(excess, max(float(w[cash_idx]), 0.0))
+        w[cash_idx] -= take
+        excess -= take
+        w_neg, unplaced = _spread(-w, excess, w - floors, ~is_cash)
         w = -w_neg
+        if unplaced > _BOOK_OVER_ONE_TOL:
+            raise ValueError(
+                f"the stepped aim book sums to {1.0 + unplaced:.12f} with cash at zero and "
+                "every name at its churn floor: the floors alone sum above one, which is "
+                "not a book. solve_target_weights routes such floors to the infeasible "
+                "fallback before any step."
+            )
+        unplaced = 0.0
     return w, zeroed, mass_zeroed, unplaced
 
 

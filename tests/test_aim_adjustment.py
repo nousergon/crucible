@@ -661,6 +661,34 @@ class TestTheSteppedBookAlwaysSumsToOne:
         assert on.weights.sum() == pytest.approx(1.0, abs=1e-9)
         assert np.all(on.weights >= -1e-12)
 
+    def test_the_inception_residual_never_buys_a_name_the_aim_does_not_hold(self) -> None:
+        """The same run. Before the fix the deferred weight was spread over the
+        caps of every eligible name -- nine names and SPY the aim holds at zero
+        were bought (~7.5% each, ~30% SPY) while cash sat at the 3% sleeve.
+        Conviction in few names: the deferred weight waits in cash."""
+        rows, _cash = _REPLAY["2026-11-06"]
+        n = len(rows) + 2
+        w_prev = np.zeros(n)
+        w_prev[-1] = 1.0
+        tickers, _w, on = _solve(
+            "2026-11-06",
+            w_prev=w_prev,
+            aim_adjustment_rate=0.1,
+            max_daily_turnover=None,
+            min_position_pct=0.03,
+        )
+        aim_weights = on.diagnostics["aim_weights"]
+        cash = tickers.index("__CASH__")
+        unaimed = [t for t in tickers if t != "__CASH__" and aim_weights.get(t, 0.0) <= 0.0]
+        assert len(unaimed) >= 10, "the case needs the names the old spill bought"
+        for ticker in unaimed:
+            assert on.weights[tickers.index(ticker)] == 0.0, ticker
+        deferred = on.diagnostics["aim_adjustment"]["entries_deferred"]
+        assert set(deferred) == {"ANF", "CVLT", "MU", "PLTR"}
+        deferred_weight = sum(aim_weights[t] for t in deferred)
+        assert on.weights[cash] == pytest.approx(aim_weights["__CASH__"] + deferred_weight)
+        assert on.weights[cash] == pytest.approx(1.0, abs=1e-9)
+
     def test_a_deferred_entry_no_cap_can_take_waits_in_cash(self) -> None:
         """``_aim_step`` at inception, no throttle: both entries step below the
         floor and are deferred, and no cap has room for their weight. Before
@@ -692,3 +720,72 @@ class TestTheSteppedBookAlwaysSumsToOne:
         )
         assert unplaced == 0.0
         assert float(w.sum()) == pytest.approx(1.0, abs=1e-12)
+
+
+class TestABookAboveOneIsTrimmed:
+    """A step that lands above one takes from cash down to zero first, then pro
+    rata from the names above their churn floor; floors alone above one raise."""
+
+    def test_cash_goes_first_down_to_zero(self) -> None:
+        from crucible.portfolio import _aim_step
+
+        prev = np.array([0.5, 0.3, 0.2])
+        aim = np.array([0.6, 0.4, 0.2])
+        none = np.zeros(3, dtype=bool)
+        w, _z, _m, unplaced = _aim_step(
+            1.0, aim, prev, np.ones(3), np.zeros(3), none, none, 2, 0.005, pace_cash=True
+        )
+        assert w.tolist() == pytest.approx([0.6, 0.4, 0.0])
+        assert unplaced == 0.0
+
+    def test_then_pro_rata_from_the_names_above_their_floor(self) -> None:
+        from crucible.portfolio import _aim_step
+
+        prev = np.array([0.6, 0.3, 0.1])
+        aim = np.array([0.7, 0.5, 0.1])
+        floors = np.array([0.6, 0.0, 0.0])
+        none = np.zeros(3, dtype=bool)
+        w, _z, _m, unplaced = _aim_step(
+            1.0, aim, prev, np.ones(3), floors, none, none, 2, 0.005, pace_cash=True
+        )
+        # 0.3 over: cash gives its 0.1, then 0.2 split 1:5 over excesses 0.1 and 0.5.
+        assert w.tolist() == pytest.approx([0.7 - 0.2 / 6, 0.5 - 1.0 / 6, 0.0])
+        assert float(w.sum()) == pytest.approx(1.0, abs=1e-12)
+        assert w[0] >= floors[0]
+        assert unplaced == 0.0
+
+    def test_floors_alone_above_one_raise(self) -> None:
+        from crucible.portfolio import _aim_step
+
+        prev = np.array([0.6, 0.3, 0.1])
+        aim = np.array([0.7, 0.5, 0.1])
+        floors = np.array([0.7, 0.5, 0.0])
+        none = np.zeros(3, dtype=bool)
+        with pytest.raises(ValueError, match="floors alone sum above one"):
+            _aim_step(1.0, aim, prev, np.ones(3), floors, none, none, 2, 0.005, pace_cash=True)
+
+    def test_a_solve_never_hands_the_step_floors_above_one(self) -> None:
+        """Four protected names at 25% each leave no room for the 3% sleeve.
+        :func:`_churn_floors` scales the floors down so the aim program stays
+        feasible, so the solve never reaches the raise: the step is taken, every
+        name stays at or above its scaled floor, and the book sums to one."""
+        rows, _cash = _REPLAY["2026-11-09"]
+        tickers = [r[0] for r in rows] + ["SPY", "__CASH__"]
+        w_prev = np.array([0.25 if t in {"MU", "FSLR", "ANF", "NTNX"} else 0.0 for t in tickers])
+        _t, _w, on = _solve(
+            "2026-11-09",
+            w_prev=w_prev,
+            aim_adjustment_rate=0.5,
+            min_hold_days=3,
+            held_sessions=_held_sessions(w_prev, 1),
+        )
+        churn = on.diagnostics["churn_controls"]
+        assert churn["floors_scaled"] is True
+        assert on.diagnostics["aim_adjustment"]["applied"] is True
+        floors = {row["ticker"]: row["floor"] for row in churn["protected"]}
+        assert set(floors) == {"MU", "FSLR", "ANF", "NTNX"}
+        assert sum(floors.values()) < 1.0
+        for ticker, floor in floors.items():
+            assert on.weights[tickers.index(ticker)] >= floor - 1e-6, ticker
+        assert on.weights.sum() == pytest.approx(1.0, abs=1e-9)
+        assert np.all(on.weights >= -1e-12)
