@@ -1263,7 +1263,6 @@ def solve_target_weights(
             params,
             budget=_optional_float(turnover_meta, "turnover_constraint_cap"),
             hard_exit=forced,
-            cash_floor_only=cash_floor_only,
         )
     weights, governor = _apply_turnover_governor(
         weights,
@@ -2163,7 +2162,6 @@ def _aim_step(
     min_position: float,
     *,
     pace_cash: bool,
-    cash_absorbs: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, float, float]:
     """One candidate book at pace ``rate``: ``(weights, zeroed, mass_zeroed, unplaced)``.
 
@@ -2192,10 +2190,11 @@ def _aim_step(
        first. Only then does it spill toward the caps, or down to the churn
        floors: no name is ever stepped below the floor :func:`_churn_floors`
        set, because the aim already respects it and the step is a convex
-       combination of two books that both do. Under the drawdown ladder
-       (``cash_absorbs``: the sleeve is a floor, not a pin) whatever the caps
-       cannot take stays cash, so the residual never grows a name past the
-       throttled room :func:`_name_caps` allowed.
+       combination of two books that both do. Whatever the caps still
+       cannot take goes to cash, in every case, so the stepped book always
+       sums to one: at inception a deferred sub-floor entry's weight waits in
+       cash, and under the drawdown ladder the residual never grows a name
+       past the throttled room :func:`_name_caps` allowed.
     """
     n = len(prev)
     idx = np.arange(n)
@@ -2219,9 +2218,8 @@ def _aim_step(
             left = 0.0
         w, left = _spread(w, left, caps - w, moving & (aim > 0.0))
         w, unplaced = _spread(w, left, caps - w, moving)
-        if cash_absorbs and unplaced > 0.0:
-            w[cash_idx] += unplaced
-            unplaced = 0.0
+        w[cash_idx] += unplaced
+        unplaced = 0.0
     elif residual < 0.0:
         w_neg, left = _spread(-w, -residual, w - aim, moving)
         if pace_cash:
@@ -2250,7 +2248,6 @@ def _step_toward_aim(
     *,
     budget: float | None,
     hard_exit: np.ndarray | None = None,
-    cash_floor_only: bool = False,
 ) -> tuple[np.ndarray, float, dict[str, object]]:
     """Move the held book ``k`` of the way toward the aim book (alpha-engine-config-I12024).
 
@@ -2286,8 +2283,8 @@ def _step_toward_aim(
     move: it leaves in full this session at any ``k``, at any bisected pace
     (pace 0 included), and no churn floor holds it, because
     :func:`_churn_floors` released it before the aim was solved. Under the
-    drawdown ladder (``cash_floor_only``) the throttled caps bound the step and
-    its residual, and what they cannot take stays cash: the stepped book never
+    drawdown ladder the throttled caps bound the step and its residual, and
+    what they cannot take stays cash: the stepped book never
     grows a name past what the throttle allows, and at the breaker grows none.
 
     Returns ``(weights, mass_zeroed, meta)``. ``mass_zeroed`` is the weight the
@@ -2322,7 +2319,6 @@ def _step_toward_aim(
             cash_idx,
             min_position,
             pace_cash=not inception,
-            cash_absorbs=cash_floor_only,
         )
 
     def fits(step: tuple[np.ndarray, np.ndarray, float, float]) -> bool:
@@ -2359,7 +2355,6 @@ def _step_toward_aim(
         "cash_stepped": float(weights[cash_idx]),
         "forced_moves": _names(tickers, forced),
         "hard_risk_forced_exits": _names(tickers, hard & (prev > 0.0)),
-        "cash_absorbs_residual": cash_floor_only,
         "hard_risk_exits": _names(tickers, hard_risk),
         "floor_protected": _names(tickers, lows > 0.0),
         "exits_finished": _names(tickers, zeroed & (prev > 0.0)),

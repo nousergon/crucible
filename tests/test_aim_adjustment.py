@@ -600,7 +600,7 @@ class TestComposesWithTheHardRiskLayer:
         assert np.all(on.weights[:cash] <= w_prev[:cash] + 1e-9)
         assert on.weights.sum() == pytest.approx(1.0, abs=1e-9)
         assert on.weights[cash] >= w_prev[cash] - 1e-9
-        assert on.diagnostics["aim_adjustment"]["cash_absorbs_residual"] is True
+        assert on.diagnostics["aim_adjustment"]["residual_unplaced"] == 0.0
         assert on.diagnostics["hard_risk"]["cash_sleeve_is_floor"] is True
 
     def test_at_the_breaker_a_protected_name_is_held_and_a_hard_exit_stays_cash(self) -> None:
@@ -635,19 +635,60 @@ class TestComposesWithTheHardRiskLayer:
         assert on.weights.sum() == pytest.approx(1.0, abs=1e-9)
 
 
-def test_what_the_throttled_caps_cannot_take_stays_cash() -> None:
-    """``_aim_step`` under the drawdown ladder: a deferred entry's weight that
-    no cap has room for is left in cash, never lost from the book."""
-    from crucible.portfolio import _aim_step
+class TestTheSteppedBookAlwaysSumsToOne:
+    """Whatever residual the step cannot place on a name goes to cash, throttle
+    or no throttle, so the stepped book always sums to one."""
 
-    prev = np.array([0.0, 0.0, 1.0])
-    aim = np.array([0.006, 0.006, 0.988])
-    caps = np.array([0.006, 0.006, 1.0])
-    none = np.zeros(3, dtype=bool)
-    args = (0.5, aim, prev, caps, np.zeros(3), none, none, 2, 0.005)
-    w, zeroed, _mass, unplaced = _aim_step(*args, pace_cash=False, cash_absorbs=True)
-    assert zeroed.tolist() == [True, True, False]
-    assert unplaced == 0.0
-    assert w.tolist() == pytest.approx([0.0, 0.0, 1.0])
-    _w, _z, _m, lost = _aim_step(*args, pace_cash=False, cash_absorbs=False)
-    assert lost > 0.0
+    def test_inception_with_every_entry_deferred_sums_to_one(self) -> None:
+        """A first build (all cash) at k=0.1 under a 3% floor: every aim entry
+        steps to below the floor and is deferred. No drawdown throttle."""
+        rows, _cash = _REPLAY["2026-11-06"]
+        n = len(rows) + 2
+        w_prev = np.zeros(n)
+        w_prev[-1] = 1.0
+        _t, _w, on = _solve(
+            "2026-11-06",
+            w_prev=w_prev,
+            aim_adjustment_rate=0.1,
+            max_daily_turnover=None,
+            min_position_pct=0.03,
+        )
+        aim = on.diagnostics["aim_adjustment"]
+        assert aim["cash_paced"] is False
+        assert aim["entries_deferred"], "the case needs at least one deferred entry"
+        assert aim["residual_unplaced"] == 0.0
+        assert on.diagnostics["hard_risk"]["buy_multiplier"] == 1.0
+        assert on.weights.sum() == pytest.approx(1.0, abs=1e-9)
+        assert np.all(on.weights >= -1e-12)
+
+    def test_a_deferred_entry_no_cap_can_take_waits_in_cash(self) -> None:
+        """``_aim_step`` at inception, no throttle: both entries step below the
+        floor and are deferred, and no cap has room for their weight. Before
+        the fix that weight was dropped and the book summed to 0.988."""
+        from crucible.portfolio import _aim_step
+
+        prev = np.array([0.0, 0.0, 1.0])
+        aim = np.array([0.006, 0.006, 0.988])
+        caps = np.array([0.006, 0.006, 1.0])
+        none = np.zeros(3, dtype=bool)
+        w, zeroed, _mass, unplaced = _aim_step(
+            0.5, aim, prev, caps, np.zeros(3), none, none, 2, 0.005, pace_cash=False
+        )
+        assert zeroed.tolist() == [True, True, False]
+        assert unplaced == 0.0
+        assert w.tolist() == pytest.approx([0.0, 0.0, 1.0])
+        assert float(w.sum()) == pytest.approx(1.0, abs=1e-12)
+
+    def test_a_paced_sleeve_also_takes_what_no_cap_can(self) -> None:
+        """Past inception (``pace_cash``) the same residual still lands in cash."""
+        from crucible.portfolio import _aim_step
+
+        prev = np.array([0.004, 0.0, 0.996])
+        aim = np.array([0.0, 0.006, 0.994])
+        caps = np.array([0.004, 0.006, 1.0])
+        none = np.zeros(3, dtype=bool)
+        w, _z, _m, unplaced = _aim_step(
+            0.5, aim, prev, caps, np.zeros(3), none, none, 2, 0.005, pace_cash=True
+        )
+        assert unplaced == 0.0
+        assert float(w.sum()) == pytest.approx(1.0, abs=1e-12)
