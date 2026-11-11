@@ -74,7 +74,7 @@ dependencies = [
     # on the SNS leg of alerts.publish and in email_sender.send_email.
     # 0.59.90 (alpha-engine-config-I13152, krepis-PR283): redaction also covers an
     # HTML-escaped `&amp;` separator, a percent-encoded value and the alert footer.
-    "krepis[openai]==0.59.90",
+    "krepis[openai]==0.59.96",
     # Run-manifest schema validation. The schema is the enforcement surface
     # for `status in {ok, failed}` (plan §4.2), so validation is a runtime
     # dependency, not a test-only one.
@@ -89,7 +89,7 @@ dependencies = [
     # plan §4.2): those are consumed by other repos and must not require a
     # Python import to read. Pydantic is the in-process reader, not a
     # replacement for them.
-    "pydantic>=2.14.2",
+    "pydantic>=2.14.3",
     "PyYAML>=6.0.3",
     # The M slot's linear estimators and the CPCV grader operate on a
     # (trading_day x name) panel. Pure-Python normal equations over ~450k
@@ -131,7 +131,7 @@ dependencies = [
     # flips on. Floored, not pinned: boto3 ships daily and the API surface
     # used here (put_object/head_object/get_paginator, IfMatch/IfNoneMatch)
     # is stable, so a pin would be a weekly Dependabot PR buying nothing.
-    "boto3>=1.43.123",
+    "boto3>=1.43.126",
     "lightgbm>=4.7.0",
 ]
 
@@ -156,9 +156,9 @@ dev = [
     "alembic>=1.16",
     "pytest>=9.2.0",
     "pytest-cov>=6.0",
-    "ruff>=0.17.3",
+    "ruff>=0.17.4",
     "basedpyright>=1.40",
-    "sqlalchemy>=2.0.40",
+    "sqlalchemy>=2.1.8",
 ]
 
 [build-system]
