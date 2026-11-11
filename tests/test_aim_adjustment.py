@@ -639,59 +639,86 @@ class TestTheSteppedBookAlwaysSumsToOne:
     """Whatever residual the step cannot place on a name goes to cash, throttle
     or no throttle, so the stepped book always sums to one."""
 
-    def test_inception_with_every_entry_deferred_sums_to_one(self) -> None:
-        """A first build (all cash) at k=0.1 under a 3% floor: every aim entry
-        steps to below the floor and is deferred. No drawdown throttle."""
+    @pytest.mark.parametrize("held", ["cash_only", "benchmark_only"])
+    def test_inception_at_a_slow_pace_builds_the_full_aim(self, held: str) -> None:
+        """Full solve. A book holding only cash, or only the benchmark fill, at
+        k=0.1 under a 3% minimum position and the default daily budget. Stepped
+        at k every entry would land at 2.5% and be deferred, and the book would
+        stay in cash forever; Brian's ruling builds a first book to the aim IN
+        FULL. No name the aim holds at zero is bought."""
         rows, _cash = _REPLAY["2026-11-06"]
         n = len(rows) + 2
         w_prev = np.zeros(n)
-        w_prev[-1] = 1.0
-        _t, _w, on = _solve(
-            "2026-11-06",
-            w_prev=w_prev,
-            aim_adjustment_rate=0.1,
-            max_daily_turnover=None,
-            min_position_pct=0.03,
-        )
-        aim = on.diagnostics["aim_adjustment"]
-        assert aim["cash_paced"] is False
-        assert aim["entries_deferred"], "the case needs at least one deferred entry"
-        assert aim["residual_unplaced"] == 0.0
-        assert on.diagnostics["hard_risk"]["buy_multiplier"] == 1.0
-        assert on.weights.sum() == pytest.approx(1.0, abs=1e-9)
-        assert np.all(on.weights >= -1e-12)
-
-    def test_the_inception_residual_never_buys_a_name_the_aim_does_not_hold(self) -> None:
-        """The same run. Before the fix the deferred weight was spread over the
-        caps of every eligible name -- nine names and SPY the aim holds at zero
-        were bought (~7.5% each, ~30% SPY) while cash sat at the 3% sleeve.
-        Conviction in few names: the deferred weight waits in cash."""
-        rows, _cash = _REPLAY["2026-11-06"]
-        n = len(rows) + 2
-        w_prev = np.zeros(n)
-        w_prev[-1] = 1.0
+        if held == "cash_only":
+            w_prev[-1] = 1.0
+        else:
+            w_prev[-2], w_prev[-1] = 0.97, 0.03
+        # The all-cash book runs under the default 20% budget: its idle cash is
+        # inside the mandatory floor. The benchmark-only book needs a budget
+        # that can carry the build (see the next test).
+        budget = 0.20 if held == "cash_only" else None
         tickers, _w, on = _solve(
             "2026-11-06",
             w_prev=w_prev,
             aim_adjustment_rate=0.1,
-            max_daily_turnover=None,
             min_position_pct=0.03,
+            max_daily_turnover=budget,
         )
-        aim_weights = on.diagnostics["aim_weights"]
-        cash = tickers.index("__CASH__")
-        unaimed = [t for t in tickers if t != "__CASH__" and aim_weights.get(t, 0.0) <= 0.0]
-        assert len(unaimed) >= 10, "the case needs the names the old spill bought"
-        for ticker in unaimed:
-            assert on.weights[tickers.index(ticker)] == 0.0, ticker
-        deferred = on.diagnostics["aim_adjustment"]["entries_deferred"]
-        assert set(deferred) == {"ANF", "CVLT", "MU", "PLTR"}
-        deferred_weight = sum(aim_weights[t] for t in deferred)
-        assert on.weights[cash] == pytest.approx(aim_weights["__CASH__"] + deferred_weight)
-        assert on.weights[cash] == pytest.approx(1.0, abs=1e-9)
+        meta = on.diagnostics["aim_adjustment"]
+        aim = on.diagnostics["aim_weights"]
+        assert meta["reason"] == "inception_built_in_full"
+        assert meta["rate_applied"] == 1.0
+        assert meta["cash_paced"] is False
+        assert meta["entries_deferred"] == []
+        assert meta["residual_unplaced"] == 0.0
+        assert sum(1 for t, v in aim.items() if t != "__CASH__" and v > 0.0) >= 4
+        for i, ticker in enumerate(tickers):
+            assert on.weights[i] == pytest.approx(aim.get(ticker, 0.0), abs=1e-6), ticker
+        assert on.weights.sum() == pytest.approx(1.0, abs=1e-9)
+
+    def test_a_benchmark_only_inception_is_still_capped_by_the_budget(self) -> None:
+        """The budget outranks the build: SPY swapped into the aim at most 20%
+        a day, as without k, and never into a name the aim holds at zero."""
+        rows, _cash = _REPLAY["2026-11-06"]
+        n = len(rows) + 2
+        w_prev = np.zeros(n)
+        w_prev[-2], w_prev[-1] = 0.97, 0.03
+        tickers, _w, on = _solve(
+            "2026-11-06", w_prev=w_prev, aim_adjustment_rate=0.1, min_position_pct=0.03
+        )
+        meta = on.diagnostics["aim_adjustment"]
+        aim = on.diagnostics["aim_weights"]
+        assert meta["reason"] == "budget_limited_step"
+        assert 0.0 < meta["rate_applied"] < 1.0
+        assert _turnover(on.weights, w_prev) <= meta["turnover_budget_cap"] + 1e-6
+        for i, ticker in enumerate(tickers):
+            if ticker not in {"SPY", "__CASH__"} and aim.get(ticker, 0.0) <= 0.0:
+                assert on.weights[i] == 0.0, ticker
+        assert on.weights.sum() == pytest.approx(1.0, abs=1e-9)
+
+    def test_the_residual_never_spills_onto_a_name_the_aim_does_not_hold(self) -> None:
+        """``_aim_step`` directly, unpaced sleeve (the inception branch of the
+        step; the full solve now builds inception at pace one and never takes
+        it with a deferral). The deferred entry's weight waits in cash; the
+        name with cap room but zero aim is not bought (Brian: conviction in
+        few names)."""
+        from crucible.portfolio import _aim_step
+
+        prev = np.array([0.0, 0.0, 1.0])
+        aim = np.array([0.04, 0.0, 0.96])
+        caps = np.array([0.25, 0.25, 1.0])
+        none = np.zeros(3, dtype=bool)
+        w, zeroed, _mass, unplaced = _aim_step(
+            0.1, aim, prev, caps, np.zeros(3), none, none, 2, 0.005, pace_cash=False
+        )
+        assert zeroed.tolist() == [True, False, False]
+        assert w[1] == 0.0
+        assert w.tolist() == pytest.approx([0.0, 0.0, 1.0])
+        assert unplaced == 0.0
 
     def test_a_deferred_entry_no_cap_can_take_waits_in_cash(self) -> None:
-        """``_aim_step`` at inception, no throttle: both entries step below the
-        floor and are deferred, and no cap has room for their weight. Before
+        """``_aim_step`` directly with an unpaced sleeve, no throttle: both
+        entries step below the floor and are deferred, and no cap has room for their weight. Before
         the fix that weight was dropped and the book summed to 0.988."""
         from crucible.portfolio import _aim_step
 

@@ -2275,8 +2275,9 @@ def _step_toward_aim(
     **Idle cash is paced too** (same day, "Pace cash too"): on 11-06 the book
     carried 48% cash against a 3% sleeve, and deploying all of it in one
     session is the rebuild the ruling forbids. The sleeve steps ``k`` of the
-    way like any name, except at inception: a book holding nothing is built in
-    full.
+    way like any name, except at inception: a book holding nothing but cash
+    or the benchmark fill is built to the aim in full -- every name, and the
+    sleeve, at pace one -- unless the day's budget cannot carry it.
 
     **The churn controls still bind** (:func:`_churn_floors`). The aim is
     solved under the floors, the held book satisfies them, and every step is
@@ -2338,11 +2339,19 @@ def _step_toward_aim(
         # finish-the-exit rule zeroed may legitimately add turnover.
         return budget is None or turnover(step[0]) <= float(budget) + step[2]
 
-    applied = rate
-    step = step_at(rate)
+    # Inception (a book holding only cash or the benchmark fill) is built to
+    # the aim IN FULL: Brian's ruling paces a held book, never a first build.
+    # Stepping it at ``k`` instead would put every entry at ``k`` of its aim,
+    # and an entry that lands below ``min_position_pct`` would be deferred --
+    # an all-cash book at k=0.1 under a 3% floor would never build at all.
+    # The day's budget still outranks the build: idle cash above the sleeve
+    # is inside the mandatory floor, so an all-cash book always fits, but a
+    # book held in the benchmark fill is built at the budget, as without k.
+    applied = 1.0 if inception else rate
+    step = step_at(applied)
     limited = not fits(step)
     if limited:
-        lo, hi = 0.0, rate
+        lo, hi = 0.0, applied
         step = step_at(0.0)
         for _ in range(_AIM_BISECTION_STEPS):
             mid = (lo + hi) / 2.0
@@ -2355,7 +2364,13 @@ def _step_toward_aim(
     weights, zeroed, mass_zeroed, unplaced = step
     meta: dict[str, object] = {
         "applied": True,
-        "reason": "budget_limited_step" if limited else "stepped_at_configured_rate",
+        "reason": (
+            "budget_limited_step"
+            if limited
+            else "inception_built_in_full"
+            if inception
+            else "stepped_at_configured_rate"
+        ),
         "rate_configured": rate,
         "rate_applied": applied,
         "aim_turnover_one_way": turnover(aim),
