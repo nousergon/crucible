@@ -33,10 +33,27 @@ def _runs(job: dict) -> list[str]:
 def test_the_triggers_are_a_weekday_evening_cron_and_a_sha_only_dispatch() -> None:
     triggers = _triggers(_workflow())
     assert set(triggers) == {"schedule", "workflow_dispatch"}
-    assert triggers["schedule"] == [{"cron": "15 23 * * 1-5"}]
+    # 02:45 UTC Tuesday-Saturday = Monday-Friday New York evenings, after v2's
+    # post-close reconcile and its 02:15 UTC backstop (alpha-engine-config-I12024).
+    assert triggers["schedule"] == [{"cron": "45 2 * * 2-6"}]
     inputs = triggers["workflow_dispatch"]["inputs"]
     assert set(inputs) == {"sha"}, "the dispatch takes the sha and nothing free-form"
     assert inputs["sha"]["required"] is True
+
+
+def test_the_guard_reads_v2s_post_close_reconcile() -> None:
+    """alpha-engine-config-I12024: the name came from a repository variable
+    that still named v1's retired post-close, so every evening read unclean.
+    It is a literal now, so the tree shows which pipeline the guard reads."""
+    workflow = _workflow()
+    assert workflow["env"]["POSTCLOSE_STATE_MACHINE"] == "ne-postclose-reconcile-pipeline"
+    steps = workflow["jobs"]["apply"]["steps"]
+    guard = next(s for s in steps if s.get("id") == "guard")
+    assert guard["env"]["POSTCLOSE_STATE_MACHINE_ARN"] == (
+        "arn:aws:states:${{ env.AWS_REGION }}:${{ vars.AWS_ACCOUNT_ID }}"
+        ":stateMachine:${{ env.POSTCLOSE_STATE_MACHINE }}"
+    )
+    assert "CRUCIBLE_POSTCLOSE_STATE_MACHINE }}" not in WORKFLOW.read_text(encoding="utf-8")
 
 
 def test_each_event_reaches_exactly_one_job() -> None:

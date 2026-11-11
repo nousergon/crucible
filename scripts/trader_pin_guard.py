@@ -10,13 +10,18 @@ which takes this reading as `--postclose`.
 
 **The session** is the last CLOSED NYSE session, `crucible.calendar.
 resolve_trading_day` — the same resolution every crucible job uses. The cron
-fires at 23:15 UTC on weekdays and GitHub delivers it up to ~5 hours late
-(`components.yaml`, `gate.close`), so a delivery after midnight New York time
-still belongs to the previous evening: the NOMINAL day is the New York date of
-the run, less one day before noon. When that nominal day was not a session (an
+fires at 02:45 UTC Tuesday-Saturday (22:45 EDT / 21:45 EST the previous New
+York evening) and GitHub delivers it up to ~5 hours late (`components.yaml`,
+`gate.close`), so every run lands after midnight UTC and often after midnight
+New York time, and still belongs to the previous evening: the NOMINAL day is
+the New York date of the run, less one day before noon. When that nominal day was not a session (an
 NYSE holiday), this prints `skip` and the workflow does nothing, green — the
 job's absence deadline is trading-calendar relative, so a holiday owes no
 manifest.
+
+**The post-close** is v2's `ne-postclose-reconcile-pipeline` (the workflow
+names it; alpha-engine-config-I12024). Its executions start ~20:30 New York
+time, so they carry the session's own New York date.
 
 **Clean** means: at least one execution of the post-close state machine that
 STARTED on the session's New York date SUCCEEDED, and none that started that
@@ -47,9 +52,10 @@ from crucible.calendar import is_trading_day, resolve_trading_day
 ET = ZoneInfo("America/New_York")
 
 #: Before this New York wall time the run is a late delivery of the PREVIOUS
-#: evening's cron. The cron is 23:15 UTC (19:15 EDT / 18:15 EST), and the
-#: measured delivery tail is ~5 hours, so every legitimate run lands between
-#: 18:15 and ~00:30 New York time; noon splits that band from nothing.
+#: evening's cron. The cron is 02:45 UTC Tuesday-Saturday (22:45 EDT / 21:45
+#: EST the evening before), and the measured delivery tail is ~5 hours, so
+#: every legitimate run lands between 21:45 and ~03:50 New York time; noon
+#: splits that band from nothing.
 NOMINAL_DAY_ROLLOVER_ET = dt.time(12, 0)
 
 STATE_MACHINE_ARN_VAR = "POSTCLOSE_STATE_MACHINE_ARN"

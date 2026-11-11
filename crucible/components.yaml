@@ -732,16 +732,19 @@ components:
     dispatch: github-actions
     dispatch_workflow: trader-pin.yml
     deadline:
-      # `close_plus 10` = 02:00 ET the next morning, from the cron at 23:15 UTC
-      # plus this account's measured GitHub Actions delivery envelope
+      # `close_plus 12.5` = 04:30 ET the next morning, from the cron at 02:45
+      # UTC plus this account's measured GitHub Actions delivery envelope
       # (chronically +240 to +304 minutes; the measurement recorded on
-      # `gate.close` above, alpha-engine-config-I9960, -I9966). 23:15Z + 304
-      # min is 04:19Z, 00:19 EDT, so this clears the worst measured delay while
-      # still paging before the trader's pre-open work. The pin itself refuses
-      # from 05:00 ET, so a run later than that could not pin anyway.
+      # `gate.close` above, alpha-engine-config-I9960, -I9966). 02:45Z + 304
+      # min is 07:49Z, 03:49 EDT / 02:49 EST, so this clears the worst
+      # measured delay in both offsets while still paging before the trader's
+      # pre-open work. The pin itself refuses from 05:00 ET, so a run later
+      # than that could not pin anyway. Was `close_plus 10` against a 23:15
+      # UTC cron, which fired before v2's post-close reconcile
+      # (alpha-engine-config-I12024).
       anchor: close_plus
       cadence: daily
-      offset_hours: 10
+      offset_hours: 12.5
 
   release.lock:
     description: >-
