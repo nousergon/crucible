@@ -1089,7 +1089,32 @@ class TestTheWorkflowItself:
             for name, job in workflow["jobs"].items()
             if (job.get("permissions") or {}).get("id-token") == "write"
         }
-        assert minting == {"release"}
+        assert minting == {"release", "release-staging"}
+
+    def test_the_staging_release_is_the_prod_release_against_the_staging_store(
+        self, workflow: dict
+    ) -> None:
+        """alpha-engine-config-I12518: `release-staging` runs the SAME steps as
+        `release` (publish, offline-install proof, capture, smoke, flip, record)
+        and differs only in which account, role and store it targets, all from
+        STAGING_* repository variables. It never gates prod: it needs only
+        `build`, and the failure notifier does not wait on it."""
+        jobs = workflow["jobs"]
+        prod, stg = jobs["release"], jobs["release-staging"]
+
+        def dump(steps: list[dict]) -> list[str]:
+            return [
+                json.dumps(x, sort_keys=True).replace("STAGING_AWS_ACCOUNT_ID", "AWS_ACCOUNT_ID")
+                for x in steps
+            ]
+
+        assert dump(stg["steps"]) == dump(prod["steps"])
+        assert stg["needs"] == ["build"]
+        assert set(stg["env"]) == {"AWS_ACCOUNT_ID", "DEPLOY_ROLE_ARN", "STORE_URI"}
+        assert all("vars.STAGING_" in v for v in stg["env"].values())
+        assert "vars.STAGING_CRUCIBLE_STORE_URI" in stg["if"]
+        assert "vars.STAGING_AWS_ACCOUNT_ID" in stg["if"]
+        assert "release-staging" not in jobs["notify-main-failure"]["needs"]
 
     def test_a_superseded_deploy_is_not_cancelled_mid_smoke(self, workflow: dict) -> None:
         """Cancelling mid-smoke leaves a release published with no verdict,

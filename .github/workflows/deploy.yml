@@ -468,6 +468,222 @@ jobs:
   # failed test it blocks nothing and is green to the next author, so nothing
   # announces it. Measured 2026-08-12: a router config sat undeployed for 16
   # hours behind exactly this gap (alpha-engine-config-I7169).
+  release-staging:
+    # STAGING TARGET (alpha-engine-config-I12518, staging S-30). The same
+    # publish, offline-install proof, smoke and flip as `release`, against the
+    # STAGING crucible store, as the staging account's own deploy role (the
+    # crucible-v2 stack creates it there with the same trust: this repo's main).
+    # Until 2026-11-12 nothing published a release to staging, so every staging
+    # box died at bootstrap on a missing `releases/current` and staging ran no
+    # job from 11-07 on. Runs beside `release`, never in front of it: a red
+    # staging deploy does not hold prod's. Skipped until both repository
+    # variables are set (they are not secrets, and this repo is public, so the
+    # account id stays out of the tree like `AWS_ACCOUNT_ID`).
+    name: publish, smoke, then flip (staging)
+    needs: [build]
+    if: ${{ vars.STAGING_AWS_ACCOUNT_ID != '' && vars.STAGING_CRUCIBLE_STORE_URI != '' }}
+    env:
+      AWS_ACCOUNT_ID: ${{ vars.STAGING_AWS_ACCOUNT_ID }}
+      DEPLOY_ROLE_ARN: arn:aws:iam::${{ vars.STAGING_AWS_ACCOUNT_ID }}:role/${{ vars.CRUCIBLE_ROLE_PREFIX }}-deploy
+      STORE_URI: ${{ vars.STAGING_CRUCIBLE_STORE_URI }}
+    runs-on: ubuntu-latest
+    # 25, not 10: the offline install proof runs in an amazonlinux:2023
+    # container and the smoke runs from a second offline install
+    # (alpha-engine-config-I10812).
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      id-token: write   # OIDC only; no long-lived AWS keys in this repository
+    steps:
+      # First step, before checkout: neither identity nor the store are
+      # reachable without these, and failing here names the exact operator
+      # command rather than dying deep inside `configure-aws-credentials`
+      # with an opaque OIDC/ARN error.
+      - name: Repository variables are set
+        run: |
+          missing=0
+          if [ -z "$AWS_ACCOUNT_ID" ]; then
+            echo "::error::repository variable AWS_ACCOUNT_ID is not set — set it with: gh variable set AWS_ACCOUNT_ID --repo nousergon/crucible --body '<12-digit-account-id>'"
+            missing=1
+          fi
+          if [ -z "$STORE_URI" ]; then
+            echo "::error::repository variable CRUCIBLE_STORE_URI is not set — set it with: gh variable set CRUCIBLE_STORE_URI --repo nousergon/crucible --body '<s3-uri-of-the-crucible-v2-store>'"
+            missing=1
+          fi
+          exit "$missing"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install
+        run: uv sync --frozen
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: release-${{ needs.build.outputs.sha }}
+          path: out
+
+      # This repo is public and its run logs are public; GitHub masks
+      # SECRETS, not repository VARIABLES. The identity assertion below
+      # prints an assumed-role ARN that embeds the account id — mask it
+      # before the credential step runs so nothing downstream can leak it.
+      # The assertion still works with masking on: it compares only the
+      # role-name segment (`*":assumed-role/${expected}/"*`), which the mask
+      # does not touch.
+      - name: Mask the account id in this public log
+        run: echo "::add-mask::${{ vars.STAGING_AWS_ACCOUNT_ID }}"
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd  # v6.3.0
+        with:
+          role-to-assume: ${{ env.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # The role check, read back from AWS rather than restated from `env`.
+      # Runs after the credential step (there is no identity to read before
+      # it) and before anything is written, so a wrong identity fails the
+      # deploy having touched no bucket.
+      - name: Confirm the identity this job actually assumed
+        run: |
+          assumed="$(aws sts get-caller-identity --query Arn --output text)"
+          expected="${DEPLOY_ROLE_ARN##*/}"
+          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}. It may act ONLY as the deploy identity: the research role (github-actions-lambda-deploy) writes a DIFFERENT bucket, and publishing v2 releases into the v1 prefix is silent until something installs one. If the v2 roles do not exist yet, apply nous-ergon-ops/infrastructure/cloudformation/crucible-v2.yaml (stack crucible-v2)."; exit 1 ;; esac
+
+      # Publish the IMMUTABLE half. Safe and repeatable; it promotes nothing.
+      - name: Publish the release artifacts
+        run: |
+          uv run python -m crucible.deploy publish --sha '${{ needs.build.outputs.sha }}' --wheel 'out/${{ needs.build.outputs.wheel_filename }}' --release-json out/release.json --provenance-json out/provenance.json --wheelhouse out/wheelhouse --store "$STORE_URI"
+
+      # alpha-engine-config-I10812 replaced this step's PyPI resolve with an
+      # OFFLINE install of the published wheelhouse, on the box platform
+      # (amazonlinux:2023, CPython 3.12, x86_64), with the container's network
+      # disconnected before pip runs. The history below is why the step exists
+      # at all and still holds.
+      #
+      # alpha-engine-config-I9908: the flip is gated on INSTALLABILITY, not
+      # only on the upload landing. Every wheel this pipeline published
+      # before this fix passed `Publish` and even `Smoke` while being
+      # pip-refused on every box that tried to install it — S3 read paths
+      # prove the bytes are THERE, never that pip accepts them. This
+      # downloads the object this deploy just published (not the local
+      # build artifact — proving what a box will actually fetch) and
+      # installs it into a throwaway venv on the runner, the same operation
+      # `nous-ergon-ops`'s spot-box bootstrap performs. A step failure here
+      # fails the job before `Flip` runs, so an unpip-installable wheel
+      # never reaches `releases/current`.
+      #
+      # The wheel keeps its PUBLISHED filename on disk. The first version of
+      # this step downloaded it as `/tmp/crucible-install-proof.whl`, and pip
+      # refused that name — the same defect I9908 fixed, re-created inside
+      # the step proving the fix (measured 2026-09-03, run 33778251060, on
+      # the first deploy after PR59 merged; the detector held and the pointer
+      # did not flip). pip validates the FILENAME against PEP 427/440, so any
+      # rename of a wheel is a different artifact as far as pip is concerned.
+      #
+      # alpha-engine-config-I10069: this step also proves the ONE dependency
+      # the data layer cannot run without — ArcticDB has no Linux aarch64
+      # wheel, so the smoke must prove the install and the import on the SAME
+      # architecture the box now uses (r6i.large, x86_64 — `ubuntu-latest` is
+      # x86_64 too, per `nous-ergon-ops-PR1054`). The extra name is read out
+      # of `pyproject.toml`'s own `[project.optional-dependencies]` rather
+      # than restated here (crucible/AGENTS.md: no suppression collections;
+      # the extra list belongs in ONE place), and the verified set is handed
+      # to the Smoke step below via `$GITHUB_ENV` so its manifest can record
+      # what was actually proven — `crucible.deploy._flip` refuses a smoke
+      # manifest that does not name every extra required here.
+      - name: Prove the published release installs offline on the box platform
+        shell: bash
+        run: |
+          proof=/tmp/crucible-install-proof
+          mkdir -p "${proof}/wheelhouse"
+          aws s3 cp "${STORE_URI}/releases/${SHA}/release.json" "${proof}/release.json"
+          aws s3 cp "${STORE_URI}/releases/${SHA}/${WHEEL_FILENAME}" "${proof}/${WHEEL_FILENAME}"
+          aws s3 cp --recursive --only-show-errors "${STORE_URI}/releases/${SHA}/wheelhouse/" "${proof}/wheelhouse/"
+          # Every object checked against the PUBLISHED record before pip sees
+          # it, as the box does: pip's hash check vouches for the lock, this
+          # vouches for the lock itself and the exact files.
+          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); w=r["wheelhouse"]; print("".join("%s  %s/wheelhouse/%s\n" % (x["sha256"], sys.argv[2], x["filename"]) for x in w["wheels"] + [{"sha256": w["lock_sha256"], "filename": w["lock_filename"]}]) + "%s  %s/%s" % (r["wheel_sha256"], sys.argv[2], r["wheel_filename"]))' "${proof}/release.json" "${proof}" > "${proof}/SHA256SUMS"
+          sha256sum --check --strict --quiet "${proof}/SHA256SUMS"
+          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); e=",".join(r["wheelhouse"]["extras"]); print("crucible%s @ file://%s/%s --hash=sha256:%s" % ("[%s]" % e if e else "", sys.argv[2], r["wheel_filename"], r["wheel_sha256"]))' "${proof}/release.json" "${proof}" > "${proof}/crucible.requirements.txt"
+          EXTRAS="$(python3 -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))["wheelhouse"]["extras"]))' "${proof}/release.json")"
+          DIGEST="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["wheelhouse"]["digest"])' "${proof}/release.json")"
+          # The box platform, with the network CUT before pip runs: dnf needs
+          # the network (libgomp stays a dnf package, I10695), pip must not.
+          # A wheel the wheelhouse lacks, or any attempt to reach an index,
+          # fails this step and the flip never runs.
+          docker run -d --name crucible-install-proof --platform linux/amd64 "${BOX_IMAGE}" sleep infinity
+          docker exec crucible-install-proof dnf install -y -q python3.12 python3.12-pip libgomp
+          docker network disconnect bridge crucible-install-proof
+          docker cp "${proof}" crucible-install-proof:"${proof}"
+          docker exec crucible-install-proof bash -euo pipefail -c "python3.12 -m venv /opt/crucible && /opt/crucible/bin/pip install --quiet --no-index --find-links ${proof}/wheelhouse --require-hashes -r ${proof}/wheelhouse/requirements.lock.txt -r ${proof}/crucible.requirements.txt && /opt/crucible/bin/pip check && /opt/crucible/bin/crucible --version && /opt/crucible/bin/python -c 'import crucible, nousergon_lib.arcticdb, arcticdb, lightgbm'"
+          docker rm -f crucible-install-proof
+          # The SAME wheelhouse, installed the same offline way on this
+          # runner, is what the smoke below runs from — so the smoke grades
+          # the dependency set a box installs, not this checkout's `uv sync`.
+          python3 -m venv /tmp/crucible-release-venv
+          /tmp/crucible-release-venv/bin/python --version | grep -q "^Python 3\.12\." || { echo "::error::the smoke venv is not CPython 3.12, the box's interpreter"; exit 1; }
+          /tmp/crucible-release-venv/bin/pip install --quiet --no-index --find-links "${proof}/wheelhouse" --require-hashes -r "${proof}/wheelhouse/requirements.lock.txt" -r "${proof}/crucible.requirements.txt"
+          /tmp/crucible-release-venv/bin/python -c "import nousergon_lib.arcticdb, arcticdb"
+          echo "CRUCIBLE_SMOKED_EXTRAS=${EXTRAS}" >> "$GITHUB_ENV"
+          echo "CRUCIBLE_WHEELHOUSE_DIGEST=${DIGEST}" >> "$GITHUB_ENV"
+        env:
+          SHA: ${{ needs.build.outputs.sha }}
+          WHEEL_FILENAME: ${{ needs.build.outputs.wheel_filename }}
+          BOX_IMAGE: amazonlinux:2023@sha256:181f98c48832fe926f8ca3b6ffeafcce128e96e77b93d08fbe9a9bc9403ce284
+
+      # The opening half of the pointer compare-and-swap, taken BEFORE the
+      # smoke so the swap covers the whole verification window. Reading the
+      # token after the smoke — as this workflow used to — leaves an interval
+      # microseconds wide, and an operator rollback (`crucible release.pin`)
+      # landing during the smoke is then silently undone by the flip.
+      - name: Capture the releases/current version token before the smoke
+        run: |
+          uv run python -m crucible.deploy capture --sha '${{ needs.build.outputs.sha }}' --store "$STORE_URI" --out pointer.token
+
+      # The gate. A REAL run against live S3 read paths, writing
+      # runs/smoke/{trading_day}/{calendar_day}-{run_id}/run.json (one manifest
+      # per invocation, alpha-engine-config-I11033; the flip selects the one
+      # for this sha) through the ordinary runner — so the
+      # gate produces the same telemetry every other job does, and a smoke that
+      # "ran and had nothing to do" is not expressible (§4.2). It reads the
+      # wheel and release.json for THIS sha out of the store and re-hashes the
+      # wheel against the record, so it cannot pass against a release that was
+      # never published.
+      - name: Smoke
+        id: smoke
+        run: |
+          /tmp/crucible-release-venv/bin/crucible smoke --run-mode live --release '${{ needs.build.outputs.sha }}' --store "$STORE_URI"
+        # The venv is a wheel install with no git checkout, exactly like a
+        # box, so the code sha is declared the way the box declares it
+        # (crucible.runner.CODE_SHA_ENV) rather than read off a working tree.
+        env:
+          CRUCIBLE_CODE_SHA: ${{ needs.build.outputs.sha }}
+          CRUCIBLE_RELEASE_SHA: ${{ needs.build.outputs.sha }}
+
+      # Reads the smoke MANIFEST, not this workflow's exit codes. A
+      # caller-supplied "it passed" is the shape that promotes a build whose
+      # smoke quietly did nothing. Swaps against the token captured before the
+      # smoke: if anything moved the pointer in between, this deploy FAILS
+      # rather than overwriting it.
+      - name: Flip releases/current on an ok smoke
+        run: |
+          uv run python -m crucible.deploy flip --sha '${{ needs.build.outputs.sha }}' --store "$STORE_URI" --expect-pointer-file pointer.token
+
+      # Written on BOTH paths, in the run-manifest schema, so §4.5's page shows
+      # deploys beside runs and a failed deploy is as visible as a failed job.
+      - name: Record the deploy manifest
+        if: always()
+        run: |
+          uv run python -m crucible.deploy record --run-mode live --sha '${{ needs.build.outputs.sha }}' --store "$STORE_URI" --outcome '${{ job.status }}' --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+  # A failed DEPLOY on main means live no longer matches main — and unlike a
+  # failed test it blocks nothing and is green to the next author, so nothing
+  # announces it. Measured 2026-08-12: a router config sat undeployed for 16
+  # hours behind exactly this gap (alpha-engine-config-I7169).
   notify-main-failure:
     needs: [build, release]
     # `alpha-engine-config-I11448`: a job killed at `timeout-minutes` concludes
