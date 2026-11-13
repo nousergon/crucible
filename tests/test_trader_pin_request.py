@@ -501,11 +501,32 @@ class TestApply:
         assert pending_trader_pin(store).state == "noop"
 
     def test_the_apply_still_honours_the_market_hours_blackout(self, tmp_path, monkeypatch) -> None:
+        # A scheduled run GitHub delivered inside the blackout (2026-11-12 and
+        # 11-13: the 02:45Z cron ran at 10:21Z and 10:00Z): the pin is refused
+        # exactly as before, the request stays queued, and the run says so as
+        # a WATCH instead of failing.
         store = self._store(tmp_path)
         _request(store, SHA_B)
         _trader_smoke_manifest(store, SHA_B, finished_hour=19)
         monkeypatch.setattr(track_c, "_now", lambda: dt.datetime(2026, 9, 9, 9, 45, tzinfo=ET))
-        with pytest.raises(TraderPinRefusedError, match="market_hours"):
+        track_c.release_pin_apply_handler(self._args(tmp_path))
+        assert self._pin(store) == SHA_A
+        assert pending_trader_pin(store).state == "fresh"
+        manifest = self._manifest(tmp_path)
+        (metric,) = manifest["metrics"]
+        assert metric["status"] == "WATCH" and metric["value"] == 0.0
+        assert "deferred to the next evening" in metric["status_reason"]
+        assert "market_hours" in metric["status_reason"]
+        assert [o["key"] for o in manifest["outputs"]] == []
+
+    def test_a_request_that_already_waited_an_evening_is_not_deferred_again(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        store = self._store(tmp_path)
+        _request(store, SHA_B, at=dt.datetime(2026, 9, 3, 14, 0, tzinfo=ET))
+        _trader_smoke_manifest(store, SHA_B, finished_hour=19)
+        monkeypatch.setattr(track_c, "_now", lambda: dt.datetime(2026, 9, 9, 9, 45, tzinfo=ET))
+        with pytest.raises(TraderPinRefusedError, match="already waited an evening"):
             track_c.release_pin_apply_handler(self._args(tmp_path))
         assert self._pin(store) == SHA_A
 
