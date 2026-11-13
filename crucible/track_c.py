@@ -351,6 +351,7 @@ def release_pin_apply_handler(args: argparse.Namespace) -> int:
                 schema_version=release.TRADER_PIN_REQUEST_SCHEMA_VERSION,
             )
         moved = 0.0
+        status = "OK"
         outcome = pending.describe()
         if pending.state == "stale":
             raise release.TraderPinRefusedError(f"release.pin_apply: {outcome}")
@@ -387,6 +388,24 @@ def release_pin_apply_handler(args: argparse.Namespace) -> int:
                     f"to {sha} (gated on {evidence.run_id})"
                 )
                 return
+            elif (refusal := release.trader_pin_window_refusal(_now())) is not None:
+                # The scheduled run landed inside the blackout (GitHub delivered
+                # the 02:45Z cron at 10:21Z on 2026-11-12 and 10:00Z on 11-13):
+                # the pin is refused exactly as before, and the request stays
+                # queued for the next evening. One deferral is a WATCH; a request
+                # that already waited an evening raises, so a cron that is late
+                # every night is a failure, never a quiet queue.
+                if _request_day_et(pending.request) < previous_trading_day(ctx.trading_day):
+                    raise release.TraderPinRefusedError(
+                        f"release.pin_apply: {outcome}; not applied again: {refusal}. The "
+                        "request has already waited an evening; check the trader-pin "
+                        "workflow's delivery time."
+                    )
+                status = "WATCH"
+                outcome += (
+                    f"; deferred to the next evening, not applied: {refusal}. The request "
+                    "stays queued."
+                )
             else:
                 ctx.record_input(
                     evidence.manifest_key,
@@ -415,7 +434,7 @@ def release_pin_apply_handler(args: argparse.Namespace) -> int:
                 "value": moved,
                 "unit": "pointer_moves",
                 "n_floor": 0,
-                "status": "OK",
+                "status": status,
                 "status_reason": outcome,
                 "source_path": release.TRADER_PIN_KEY,
                 "last_updated_utc": ctx.started.strftime("%Y-%m-%dT%H:%M:%SZ"),
