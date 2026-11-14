@@ -40,7 +40,7 @@ import io
 import zipfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TypedDict, cast
 
 import yaml
 
@@ -99,20 +99,28 @@ def read_release_wheel(store: Store, sha: str) -> WheelRead:
     return WheelRead(raw, None)
 
 
-def registry_rows(raw: bytes) -> dict[str, dict[str, Any]]:
+type RegistryRow = dict[str, object]
+
+
+class _RegistryDocument(TypedDict, total=False):
+    components: dict[object, RegistryRow | None] | list[RegistryRow]
+
+
+def registry_rows(raw: bytes) -> dict[str, RegistryRow]:
     """Name -> row mapping of a historical `components.yaml`, parsed narrowly.
 
     Not `crucible.components.load_registry`: that validates every row against
     TODAY's model, and a release predating a since-required field would raise
     there. Only the fields a declaration test reads are consulted.
     """
-    document = yaml.safe_load(raw) or {}
+    # PyYAML's untyped boundary returns Any; only this historical shape is read below.
+    document = cast(_RegistryDocument, yaml.safe_load(raw) or {})
     rows = document.get("components") or {}
     items = rows.items() if isinstance(rows, dict) else ((r.get("name"), r) for r in rows)
     return {str(name): (row or {}) for name, row in items if name}
 
 
-def row_has_a_starter(row: dict[str, Any] | None) -> bool:
+def row_has_a_starter(row: RegistryRow | None) -> bool:
     """Whether a registry row, as a release shipped it, would have been started
     and graded: ACTIVE, with a declared starter and a deadline."""
     if not row:
@@ -143,7 +151,7 @@ class Declaration:
 
 
 def _s3_pointer_versions(store: S3Store, key: str) -> list[PointerVersion]:
-    s3_key = store._s3_key(key)
+    s3_key = store._s3_key(key)  # pyright: ignore[reportPrivateUsage] - version APIs need the backend key
     paginator = store.client.get_paginator("list_object_versions")
     found: list[PointerVersion] = []
     for page in paginator.paginate(Bucket=store.bucket, Prefix=s3_key):
@@ -160,7 +168,9 @@ def _s3_pointer_versions(store: S3Store, key: str) -> list[PointerVersion]:
 
 def _s3_read_version(store: S3Store, key: str, version_id: str) -> bytes:
     response = store.client.get_object(
-        Bucket=store.bucket, Key=store._s3_key(key), VersionId=version_id
+        Bucket=store.bucket,
+        Key=store._s3_key(key),  # pyright: ignore[reportPrivateUsage] - version APIs need the backend key
+        VersionId=version_id,
     )
     return response["Body"].read()
 
@@ -194,7 +204,7 @@ class ReleaseInForce:
     _sha_by_version: dict[str, tuple[str | None, str, bool]] = field(
         default_factory=dict, init=False
     )
-    _rows_by_sha: dict[str, tuple[dict[str, dict[str, Any]] | None, str, bool]] = field(
+    _rows_by_sha: dict[str, tuple[dict[str, RegistryRow] | None, str, bool]] = field(
         default_factory=dict, init=False
     )
 
@@ -280,7 +290,7 @@ class ReleaseInForce:
         except Exception as exc:  # noqa: BLE001 - returned as the problem, never suppressed
             return None, f"{source} is not a readable release pointer: {exc}", False
 
-    def _rows_of(self, sha: str) -> tuple[dict[str, dict[str, Any]] | None, str, bool]:
+    def _rows_of(self, sha: str) -> tuple[dict[str, RegistryRow] | None, str, bool]:
         if sha not in self._rows_by_sha:
             wheel = read_release_wheel(self.store, sha)
             if wheel.raw is None:

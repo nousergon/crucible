@@ -60,9 +60,9 @@ import datetime as dt
 import json
 import random
 from dataclasses import dataclass
-from typing import Any
+from typing import TypedDict, cast
 
-from krepis.metrics import MetricRecord, derive_status
+from krepis.metrics import MetricRecord, MetricTypeLiteral, StatusLiteral, derive_status
 from pydantic import ValidationError
 
 from crucible.aggregation import MemberRow, member_dicts, worst_member
@@ -192,7 +192,7 @@ class RowSpec:
     name: str
     module: str
     unit: str
-    metric_type: str
+    metric_type: MetricTypeLiteral
     #: The arena slot whose champion this row grades, or None when the row is
     #: reduced from the data layer or from the trader.
     slot: str | None
@@ -201,6 +201,20 @@ class RowSpec:
     #: S stays excess return — portfolio alpha is a claim about what was
     #: actually earned, not a ranking, so there is no rank to correlate.
     rank_ic: bool = False
+
+
+class AttributionDocument(TypedDict):
+    schema_version: str
+    trading_day: str
+    generated_utc: str
+    run_id: str
+    window_scope: str
+    window_trading_days: int
+    window_sessions: list[str]
+    rows: list[dict[str, object]]
+    members: list[dict[str, object]]
+    grade: str
+    grade_reason: str
 
 
 #: The five rows. Frozen and ordered: the table's shape is the clause, so a
@@ -247,7 +261,7 @@ ROWS: tuple[RowSpec, ...] = (
 )
 
 
-def attribution_members(rows: list[dict[str, Any]]) -> list[MemberRow]:
+def attribution_members(rows: list[dict[str, object]]) -> list[MemberRow]:
     """The five attribution rows, as `alpha-engine-config-I10417` members.
 
     ``id`` is the row's own `name` (`data_coverage_ratio`, `signal_rank_ic_r`,
@@ -259,7 +273,7 @@ def attribution_members(rows: list[dict[str, Any]]) -> list[MemberRow]:
     ]
 
 
-def attribution_grade(rows: list[dict[str, Any]]) -> tuple[str, str]:
+def attribution_grade(rows: list[dict[str, object]]) -> tuple[str, str]:
     """The table's headline grade, and why — reduced over ``rows`` alone.
 
     `alpha-engine-config-I10417`: never greener than the worst row. This is
@@ -285,7 +299,7 @@ def build_attribution(
     trading_day: dt.date,
     now: dt.datetime,
     run_id: str,
-) -> tuple[dict[str, Any], list[str]]:
+) -> tuple[AttributionDocument, list[str]]:
     """Reduce the store into the five-row table. Returns (document, sources).
 
     ``sources`` is every artifact key the reduction actually read, so the
@@ -294,7 +308,7 @@ def build_attribution(
     """
     sessions = _window(trading_day)
     sources: list[str] = []
-    rows: list[dict[str, Any]] = []
+    rows: list[dict[str, object]] = []
 
     for spec in ROWS:
         if spec.slot is None and spec.name == "data_coverage_ratio":
@@ -315,34 +329,32 @@ def build_attribution(
         )
 
     grade, grade_reason = attribution_grade(rows)
-    return (
-        {
-            "schema_version": ATTRIBUTION_SCHEMA_VERSION,
-            "trading_day": trading_day.isoformat(),
-            "generated_utc": _utc(now),
-            "run_id": run_id,
-            # Row 1's window, and the anchor `crucible.track_e` paces the LLM
-            # cap across. NOT the document's window: the rows are graded over
-            # different spans because the layers settle at different rates,
-            # and each row carries its own `window_*` fields saying which.
-            "window_scope": "per-row",
-            "window_trading_days": REPORT_WINDOW_TRADING_DAYS,
-            "window_sessions": [d.isoformat() for d in sessions],
-            "rows": rows,
-            # `alpha-engine-config-I10417`: the members list `grade` was
-            # reduced from, so a reader recomputes it (`attribution_grade`)
-            # rather than trusting the cached fields below.
-            "members": member_dicts(attribution_members(rows)),
-            "grade": grade,
-            "grade_reason": grade_reason,
-        },
-        sorted(set(sources)),
-    )
+    document: AttributionDocument = {
+        "schema_version": ATTRIBUTION_SCHEMA_VERSION,
+        "trading_day": trading_day.isoformat(),
+        "generated_utc": _utc(now),
+        "run_id": run_id,
+        # Row 1's window, and the anchor `crucible.track_e` paces the LLM
+        # cap across. NOT the document's window: the rows are graded over
+        # different spans because the layers settle at different rates,
+        # and each row carries its own `window_*` fields saying which.
+        "window_scope": "per-row",
+        "window_trading_days": REPORT_WINDOW_TRADING_DAYS,
+        "window_sessions": [d.isoformat() for d in sessions],
+        "rows": rows,
+        # `alpha-engine-config-I10417`: the members list `grade` was
+        # reduced from, so a reader recomputes it (`attribution_grade`)
+        # rather than trusting the cached fields below.
+        "members": member_dicts(attribution_members(rows)),
+        "grade": grade,
+        "grade_reason": grade_reason,
+    }
+    return document, sorted(set(sources))
 
 
 def rows_complete_metric(
-    document: dict[str, Any], *, now: dt.datetime, source_path: str
-) -> dict[str, Any]:
+    document: AttributionDocument, *, now: dt.datetime, source_path: str
+) -> dict[str, object]:
     """`components.yaml` declares this as `report`'s outcome signal.
 
     It counts the rows PRESENT, not the rows measured: a row that is honestly
@@ -383,7 +395,7 @@ def _coverage_row(
     sessions: list[dt.date],
     now: dt.datetime,
     sources: list[str],
-) -> dict[str, Any]:
+) -> dict[str, object]:
     """Freshness and coverage in one number, and it is one number on purpose.
 
     **An absent session is absent, not an observation of zero.** The shape
@@ -485,7 +497,7 @@ def _slot_row(
     trading_day: dt.date,
     now: dt.datetime,
     sources: list[str],
-) -> dict[str, Any]:
+) -> dict[str, object]:
     """One slot's champion, graded on its own settled verdicts IN A WINDOW.
 
     The population benchmark makes the baseline 0.0 without an argument: a
@@ -541,7 +553,7 @@ def _slot_row(
             + (f" [{floor_note}]" if floor_note else ""),
         )
     sources.append(pointer_key)
-    arm_id = pointer["arm_id"]
+    arm_id = cast(str, pointer["arm_id"])
 
     first, last = window[0], window[-1]
     prefix = experiments_prefix(arm_id)
@@ -619,7 +631,7 @@ def _rank_ic_row(
     trading_day: dt.date,
     now: dt.datetime,
     sources: list[str],
-) -> dict[str, Any]:
+) -> dict[str, object]:
     """R and M: the champion's TRUE rank IC, reduced from `shadow.v2`.
 
     Replaces the realized-excess-return stand-in this row used to carry
@@ -680,7 +692,7 @@ def _rank_ic_row(
             ),
         )
     sources.append(pointer_key)
-    arm_id = pointer["arm_id"]
+    arm_id = cast(str, pointer["arm_id"])
 
     first, last = window[0], window[-1]
     prefix = experiments_prefix(arm_id)
@@ -788,7 +800,7 @@ def _execution_row(
     trading_day: dt.date,
     now: dt.datetime,
     sources: list[str],
-) -> dict[str, Any]:
+) -> dict[str, object]:
     """Execution shortfall — the trader's row, reduced from what the trader filed.
 
     `alpha-engine-config-I10652`. The row arrives the way every other
@@ -820,7 +832,7 @@ def _execution_row(
     reading = reduce_execution_window(store, days)
     sources.extend(reading.sources)
     first, last = days[0], days[-1]
-    extra: dict[str, Any] = {
+    extra: dict[str, object] = {
         "decision_price_basis": DECISION_PRICE_BASIS,
         "notional_usd": reading.notional_usd,
         "shortfall_usd": reading.shortfall_usd,
@@ -953,9 +965,9 @@ def _row(
     ran: bool = True,
     input_present: bool = True,
     window: list[dt.date] | None = None,
-    forced_status: str | None = None,
-    extra: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+    forced_status: StatusLiteral | None = None,
+    extra: dict[str, object] | None = None,
+) -> dict[str, object]:
     """Assemble one row, and REFUSE to emit one that is not a MetricRecord.
 
     ``forced_status`` exists for one case only: a producer that says it FAILED
@@ -1004,7 +1016,7 @@ def _row(
         source_path=source_path,
         last_updated_utc=now.astimezone(dt.UTC),
     )
-    row = json.loads(record.model_dump_json())
+    row = cast(dict[str, object], json.loads(record.model_dump_json()))
     row["baseline"] = baseline
     # Every row declares the span it was reduced over. A row whose window is
     # only stated in the document header is a row that can silently be read
@@ -1017,10 +1029,10 @@ def _row(
     if horizon_trading_days is not None:
         row["horizon_trading_days"] = horizon_trading_days
     if extra:
-        for name, value in extra.items():
+        for name, extra_value in extra.items():
             if name in row:
                 raise ValueError(f"extra field {name!r} would overwrite the row's own field")
-            row[name] = value
+            row[name] = extra_value
     return row
 
 
@@ -1065,7 +1077,7 @@ def _min_active_arms_note(store: Store, slot: str, window: list[dt.date]) -> str
                 ArenaCycleDocument.model_validate(cycle)
             except ValidationError as exc:
                 raise ValueError(f"{key} does not conform to arena_cycle: {exc}") from exc
-        finding = (cycle or {}).get(MIN_ACTIVE_ARMS_FINDING_METRIC)
+        finding = cast(dict[str, object] | None, (cycle or {}).get(MIN_ACTIVE_ARMS_FINDING_METRIC))
         if finding and finding.get("status") == "BELOW_FLOOR":
             return (
                 f"min_active_arms: {finding.get('reason', 'below the floor')} "
@@ -1075,7 +1087,7 @@ def _min_active_arms_note(store: Store, slot: str, window: list[dt.date]) -> str
     return None
 
 
-def _read_json(store: Store, key: str) -> dict[str, Any] | None:
+def _read_json(store: Store, key: str) -> dict[str, object] | None:
     """One artifact, or None when it is absent. A corrupt one RAISES.
 
     Absence and corruption are different facts: returning None for both would
@@ -1084,10 +1096,10 @@ def _read_json(store: Store, key: str) -> dict[str, Any] | None:
     if not store.exists(key):
         return None
     # STRICT face of the one reader: corrupt RAISES, with the key named.
-    return load_store_document(store, key)
+    return cast(dict[str, object], load_store_document(store, key))
 
 
-def _read_champion_pointer(store: Store, key: str) -> dict[str, Any] | None:
+def _read_champion_pointer(store: Store, key: str) -> dict[str, object] | None:
     """The champion pointer at ``key``, or None when absent. A corrupt one RAISES.
 
     `alpha-engine-config-I9847` (wave 2): `_slot_row`/`_rank_ic_row` used to
@@ -1113,10 +1125,11 @@ def _read_champion_pointer(store: Store, key: str) -> dict[str, Any] | None:
     return pointer
 
 
-def _metric_value(manifest: dict[str, Any], name: str) -> float | None:
-    for metric in manifest.get("metrics", []):
+def _metric_value(manifest: dict[str, object], name: str) -> float | None:
+    metrics = cast(list[dict[str, object]], manifest.get("metrics", []))
+    for metric in metrics:
         if metric.get("name") == name:
-            return metric.get("value")
+            return cast(float | None, metric.get("value"))
     return None
 
 
@@ -1147,7 +1160,7 @@ def _bootstrap_ci(values: list[float]) -> tuple[float | None, float | None]:
         return (None, None)
     rng = random.Random(BOOTSTRAP_SEED)
     n = len(values)
-    means = []
+    means: list[float] = []
     for _ in range(BOOTSTRAP_RESAMPLES):
         sample = [values[rng.randrange(n)] for _ in range(n)]
         means.append(sum(sample) / n)

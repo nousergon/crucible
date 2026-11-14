@@ -23,7 +23,7 @@ from __future__ import annotations
 import datetime as dt
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import cast
 
 from crucible.calendar import ISO_DATE_RE, assert_trading_day
 
@@ -1490,7 +1490,7 @@ MONEY_PATH_CLAIMS_PREFIX = "runs/_money_path/claims/"
 DAILY_CHAIN_LOCK_KEY = "runs/_locks/daily_chain.json"
 
 
-def money_path_claim_key(index: int) -> str:
+def money_path_claim_key(index: object) -> str:
     """The claim object for money-path chain index ``index``.
 
     Dateless: a chain index is a position in one fleet-wide sequence, not a
@@ -2079,14 +2079,15 @@ class AcceptanceReading:
         return self.met + self.unmet + self.unmeasurable
 
 
-def _clause_ids(document: dict[str, Any], field_name: str) -> tuple[str, ...] | None:
+def _clause_ids(document: dict[str, object], field_name: str) -> tuple[str, ...] | None:
     named = document.get(field_name)
     if not isinstance(named, list) or not named:
         return None
-    return tuple(str(cid) for cid in named)
+    # Runtime list checks cannot recover the element type from an untyped JSON document.
+    return tuple(str(cid) for cid in cast("list[object]", named))
 
 
-def parse_acceptance_reading(document: Any) -> AcceptanceReading | None:
+def parse_acceptance_reading(document: object) -> AcceptanceReading | None:
     """The ONE reader of an acceptance artifact. `None` when it is not one.
 
     **One parse, two consumers** (`alpha-engine-config-I9921` adversarial
@@ -2111,6 +2112,8 @@ def parse_acceptance_reading(document: Any) -> AcceptanceReading | None:
     """
     if not isinstance(document, dict):
         return None
+    # JSON decoding enters through an untyped mapping; validation below narrows every field.
+    document = cast("dict[str, object]", document)
     counts: list[int] = []
     for field_name in ("met", "unmet", "unmeasurable"):
         value = document.get(field_name)
