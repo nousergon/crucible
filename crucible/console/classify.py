@@ -22,8 +22,9 @@ responses.
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import NotRequired, TypedDict, cast
 
 from crucible.calendar import resolve_trading_day
 from crucible.components import Component
@@ -56,6 +57,20 @@ STATES: tuple[str, ...] = (
 #: because it is 21:30Z and the job is due at 02:00Z is not a change in the
 #: system. The 2026-09-15 morning report counted 30 such rows as "moved".
 NOT_YET_DUE_STATES: tuple[str, ...] = ("RUNNING", "ARMED")
+
+
+class _Metric(TypedDict):
+    name: NotRequired[str]
+    status: NotRequired[str]
+
+
+class _Manifest(TypedDict):
+    status: NotRequired[str]
+    run_id: NotRequired[str]
+    trading_day: NotRequired[str]
+    attempts: NotRequired[list[object]]
+    reason: NotRequired[str | None]
+    metrics: NotRequired[list[_Metric]]
 
 
 def not_yet_due(*component_states: str | None) -> bool:
@@ -96,7 +111,7 @@ class Classification:
 
 def classify(
     component: Component,
-    manifest: dict[str, Any] | None,
+    manifest: Mapping[str, object] | None,
     *,
     now: dt.datetime,
     history: bool = True,
@@ -158,15 +173,18 @@ def classify(
 
     # 3. Evidence. A manifest exists, so the run's own record decides.
     if manifest is not None:
-        status = manifest.get("status")
-        run_id = manifest.get("run_id")
-        day = manifest.get("trading_day")
-        retried = len(manifest.get("attempts", [])) > 1
+        # JSON boundary: crucible.documents parses each manifest to an object but
+        # does not schema-validate it; these are the fields classify reads.
+        typed_manifest = cast(_Manifest, manifest)
+        status = typed_manifest.get("status")
+        run_id = typed_manifest.get("run_id")
+        day = typed_manifest.get("trading_day")
+        retried = len(typed_manifest.get("attempts", [])) > 1
         if status == "failed":
             return Classification(
                 component.name,
                 "FAILED",
-                f"ran and ended failed: {manifest.get('reason') or '(no reason recorded)'}",
+                f"ran and ended failed: {typed_manifest.get('reason') or '(no reason recorded)'}",
                 trading_day=day,
                 run_id=run_id,
             )
@@ -179,7 +197,7 @@ def classify(
             # empty (feature_psi_max_ratio and ic_decay_ratio both
             # UNREPORTED) render HEALTHY, which is principle 7 violated:
             # a component emitting nothing is unobserved, not healthy.
-            metrics = manifest.get("metrics") or []
+            metrics = typed_manifest.get("metrics") or []
             unreported_metrics = [
                 m.get("name", "?") for m in metrics if m.get("status") == "UNREPORTED"
             ]
@@ -221,7 +239,7 @@ def classify(
                 # case above — but it is not a clean HEALTHY either, or the
                 # breached/silent metric is invisible on the one row that
                 # owns it.
-                clauses = []
+                clauses: list[str] = []
                 if breached_metrics:
                     clauses.append(
                         f"{len(breached_metrics)} declared metric(s) breached their "
