@@ -9623,7 +9623,9 @@ def _clause_execution_shortfall_row_graded(store: Store, window: list[dt.date]) 
             f"the trader filed no execution-shortfall artifact for any session in {window_phrase}",
             evidence,
         )
-    if row["n_orders_filled"] == 0 and len(row["sessions_no_orders"]) == len(sources):
+    if row["n_orders_filled"] == 0 and len(cast(list[object], row["sessions_no_orders"])) == len(
+        sources
+    ):
         return Clause(
             name,
             requirement,
@@ -9633,7 +9635,7 @@ def _clause_execution_shortfall_row_graded(store: Store, window: list[dt.date]) 
             "to grade; this is not a producer failure",
             evidence,
         )
-    simulated = list(row.get("sessions_simulated") or [])
+    simulated = list(cast(list[object], row.get("sessions_simulated") or []))
     if row["n_orders_filled"] == 0 and simulated:
         return Clause(
             name,

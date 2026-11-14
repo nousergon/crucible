@@ -66,8 +66,8 @@ def report_handler(args: argparse.Namespace) -> int:
         # report card's numbers reach the telemetry surface by the same route
         # as everything else rather than only through their own artifact.
         for row in document["rows"]:
-            ctx.record_metric(row)
-        ctx.record_metric(rows_complete_metric(document, now=now, source_path=key))
+            ctx.record_metric(dict(row))
+        ctx.record_metric(dict(rows_complete_metric(document, now=now, source_path=key)))
 
         # §2 row 3: the cap is published on every run, spend or none. It is
         # read off the week's manifests rather than off this process, because

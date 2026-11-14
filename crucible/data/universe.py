@@ -65,7 +65,7 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Protocol, TypedDict, cast
 
 from crucible.keys import declared_universe_key
 from crucible.models import DeclaredUniverseDocument
@@ -195,18 +195,20 @@ class DeclaredUniverse:
         return key
 
 
-def _normalise(raw: list[Any], *, where: str) -> tuple[str, ...]:
+def _normalise(raw: object, *, where: str) -> tuple[str, ...]:
     if not isinstance(raw, list) or not raw:
         raise MalformedUniverseError(
             f"{where}: `{_TICKERS_FIELD}` must be a non-empty list of symbols; got "
-            f"{type(raw).__name__} of length {len(raw) if isinstance(raw, list) else 'n/a'}"
+            f"{type(cast(object, raw)).__name__} of length "
+            f"{len(cast(list[object], raw)) if isinstance(raw, list) else 'n/a'}"
         )
-    cleaned = {s.strip().upper() for s in raw if isinstance(s, str) and s.strip()}
-    if len(cleaned) != len({s for s in raw if isinstance(s, str) and s.strip()}):
+    items = cast(list[object], raw)
+    cleaned = {s.strip().upper() for s in items if isinstance(s, str) and s.strip()}
+    if len(cleaned) != len({s for s in items if isinstance(s, str) and s.strip()}):
         # Two spellings of one symbol would count twice in the denominator
         # and once in the numerator, so the ratio could never reach 1.0.
         raise MalformedUniverseError(f"{where}: duplicate symbols after normalisation")
-    non_strings = [s for s in raw if not isinstance(s, str) or not s.strip()]
+    non_strings = [s for s in items if not isinstance(s, str) or not s.strip()]
     if non_strings:
         raise MalformedUniverseError(
             f"{where}: {len(non_strings)} entr(y/ies) in `{_TICKERS_FIELD}` are not "
@@ -229,22 +231,46 @@ def universe_from_argv(raw: str) -> DeclaredUniverse:
     )
 
 
+class _StreamingBody(Protocol):
+    def read(self) -> bytes: ...
+
+
+class _GetObjectOutput(TypedDict):
+    Body: _StreamingBody
+
+
+class _S3Client(Protocol):
+    def get_object(self, *, Bucket: str, Key: str) -> _GetObjectOutput: ...
+
+
+class _Boto3(Protocol):
+    def client(self, service_name: str) -> _S3Client: ...
+
+
 def _read_s3(uri: str) -> bytes:
-    import boto3  # noqa: PLC0415 - lazy: the laptop replay path never needs it
-    from botocore.exceptions import ClientError  # noqa: PLC0415 - lazy, as above
+    import boto3  # pyright: ignore[reportMissingTypeStubs]  # noqa: PLC0415 - lazy; dependency has no stubs
+    from botocore.exceptions import (  # pyright: ignore[reportMissingTypeStubs]  # noqa: PLC0415 - lazy; dependency has no stubs
+        ClientError,
+    )
 
     rest = uri.removeprefix("s3://")
     bucket, _, key = rest.partition("/")
     if not bucket or not key:
         raise MalformedUniverseError(f"{uri}: an s3:// universe URI needs a bucket and a key")
     try:
-        return boto3.client("s3").get_object(Bucket=bucket, Key=key)["Body"].read()
+        s3 = cast(_Boto3, boto3)
+        return s3.client("s3").get_object(Bucket=bucket, Key=key)["Body"].read()
     except ClientError as exc:
         # A missing object reads as missing — the same `FileNotFoundError` the
         # local branch raises — so a pointer's dangling target is recognisable
         # by one type whichever branch fetched it. Anything else (denied,
         # throttled) is not "missing" and propagates unchanged.
-        if exc.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+        # botocore has no installed type information; this is its documented
+        # JSON-like error response boundary.
+        response = cast(dict[str, object], exc.response)
+        error = response.get("Error")
+        code = cast(dict[str, object], error).get("Code") if isinstance(error, dict) else None
+        if code in ("NoSuchKey", "404"):
             raise FileNotFoundError(uri) from exc
         raise
 
@@ -328,13 +354,14 @@ def load_declared_universe(
     )
 
 
-def _parse(payload: bytes, *, where: str) -> dict[str, Any]:
+def _parse(payload: bytes, *, where: str) -> dict[str, object]:
     try:
-        document = json.loads(payload)
+        # ``json.loads`` is untyped; narrow its result before exposing it.
+        document = cast(object, json.loads(payload))
     except ValueError as exc:
         raise MalformedUniverseError(f"{where}: not JSON: {exc}") from exc
     if not isinstance(document, dict):
         raise MalformedUniverseError(
             f"{where}: expected a JSON object, got {type(document).__name__}"
         )
-    return document
+    return cast(dict[str, object], document)
