@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import datetime as dt
 import math
-from typing import Literal
+from collections.abc import Mapping
+from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 
@@ -90,7 +91,7 @@ class CostAllocation(BaseModel):
         if "crucible-and-trader" not in self.declared_scopes:
             raise ValueError("canonical scope is not declared")
         for day in self.days:
-            covered = set()
+            covered: set[str] = set()
             for member in day.members:
                 if member.scope not in self.declared_scopes:
                     raise ValueError("member scope is not declared")
@@ -112,14 +113,20 @@ class CostAllocation(BaseModel):
             raise ValueError("duplicate allocation date")
         return self
 
-    def amounts(self, account: dict[dt.date, dict], *, scope: str) -> dict[dt.date, float]:
+    def amounts(
+        self, account: Mapping[dt.date, Mapping[str, object]], *, scope: str
+    ) -> dict[dt.date, float]:
         """Cross-check independent account series before returning a scoped total."""
         if {day.date for day in self.days} != set(account):
             raise ValueError("allocation date coverage differs from the account series")
-        amounts = {}
+        amounts: dict[dt.date, float] = {}
         for day in self.days:
             try:
-                values = [float(v) for v in account[day.date]["by_system_usd"].values()]
+                # The account ledger is parsed from JSON and validated numerically below.
+                by_system = cast(
+                    Mapping[str, float | int | str], account[day.date]["by_system_usd"]
+                )
+                values = [float(v) for v in by_system.values()]
                 if not all(math.isfinite(value) for value in values):
                     raise ValueError("nonfinite account amount")
                 account_usd = math.fsum(values)
