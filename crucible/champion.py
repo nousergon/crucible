@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any
 
 from pydantic import ValidationError
 
@@ -115,8 +114,8 @@ class ChampionPointer:
     code_sha: str
     promotion_source: str
     manifest_key: str
-    evidence: dict[str, Any] = field(default_factory=dict)
-    attestation: dict[str, Any] | None = None
+    evidence: dict[str, object] = field(default_factory=dict)
+    attestation: dict[str, object] | None = None
     schema_version: str = CHAMPION_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -137,7 +136,7 @@ class ChampionPointer:
                 "status from it, and a pointer with no producing run cannot be checked"
             )
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "schema_version": self.schema_version,
             "slot": self.slot,
@@ -153,7 +152,7 @@ class ChampionPointer:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> ChampionPointer:
+    def from_dict(cls, payload: dict[str, object]) -> ChampionPointer:
         """`alpha-engine-config-I10045` row 6: validated once, whole, against
         `crucible.models.ChampionPointerDocument` — replacing the previous
         hand-rolled `jsonschema.Draft202012Validator` call, with the same
@@ -317,7 +316,7 @@ def _assert_producing_run_ok(store: Store, pointer: ChampionPointer) -> None:
 def _assert_attested(pointer: ChampionPointer) -> None:
     if pointer.slot not in ATTESTED_SLOTS:
         return
-    attestation = pointer.attestation or {}
+    attestation: dict[str, object] = pointer.attestation or {}
     status = attestation.get("status")
     if status != ATTESTATION_PASS:
         raise ChampionUnusableError(
