@@ -30,6 +30,7 @@ from crucible.features.depth import (
     COMPLETENESS_SAMPLE_SIZE,
     FEATURES_PREFIX,
     NULL_RATIO_CEILING,
+    NULL_RATIO_DENOMINATORS,
     check_feature_layer_completeness,
     check_feature_layer_depth,
     sample_sessions,
@@ -45,6 +46,9 @@ def store(tmp_path):
     return LocalStore(tmp_path)
 
 
+INDICATOR_DENOMINATORS = frozenset(NULL_RATIO_DENOMINATORS.values())
+
+
 def _session_frame(*, tickers: tuple[str, ...], null_columns: tuple[str, ...] = ()) -> pd.DataFrame:
     """A session cross-section shaped like `build_features`'s output: one row
     per ticker, every catalogue column present. Columns named in
@@ -58,6 +62,10 @@ def _session_frame(*, tickers: tuple[str, ...], null_columns: tuple[str, ...] = 
     for i, col in enumerate(columns):
         if col in null_columns:
             data[col] = [None] * len(tickers)
+        elif col in INDICATOR_DENOMINATORS:
+            # An indicator a column is graded against carries 1 (covered) on
+            # every row, so the graded column is expected on every row.
+            data[col] = [1.0] * len(tickers)
         else:
             data[col] = [float(i + 1)] * len(tickers)
     return pd.DataFrame(data)
