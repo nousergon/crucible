@@ -71,8 +71,9 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol, TypedDict, TypeGuard, cast
 
 from krepis.trading_calendar import subtract_trading_days
 
@@ -81,6 +82,10 @@ from crucible.documents import read_store_document
 from crucible.keys import iac_conformance_key, manifest_key
 from crucible.runner import RunContext, run_job
 from crucible.store import Store
+
+if TYPE_CHECKING:
+    import yaml
+
 from crucible.tags import (
     TAG_KEY,
     TAG_VALUE,
@@ -131,11 +136,74 @@ COMPARISON_PERSISTED = "iac_conformance_persisted"
 ACCESS_DENIED_CODES = frozenset({"AccessDenied", "AccessDeniedException", "UnauthorizedOperation"})
 
 
+#: A parsed JSON/YAML object whose values this module has not validated yet.
+_JsonObject = dict[str, object]
+
+
+def _is_mapping(value: object) -> TypeGuard[_JsonObject]:
+    """`isinstance(value, dict)`, typed as the parsed-document mapping it is."""
+    return isinstance(value, dict)
+
+
+class _IamRole(TypedDict, total=False):
+    RoleName: str
+
+
+class _ListRolesPage(TypedDict, total=False):
+    Roles: list[_IamRole]
+
+
+class _RoleTag(TypedDict, total=False):
+    Key: str
+    Value: str
+
+
+class _ListRoleTagsResponse(TypedDict, total=False):
+    Tags: list[_RoleTag]
+
+
+class _ListRolesPaginator(Protocol):
+    def paginate(self) -> Iterable[_ListRolesPage]: ...
+
+
+class _IamRoleLister(Protocol):
+    """The two IAM calls :func:`_tagged_iam_role_names` makes."""
+
+    def get_paginator(self, operation_name: str, /) -> _ListRolesPaginator: ...
+
+    def list_role_tags(self, *, RoleName: str) -> _ListRoleTagsResponse: ...
+
+
+class _GetTemplateResponse(TypedDict, total=False):
+    TemplateBody: str | _JsonObject
+
+
+class _TemplateReader(Protocol):
+    """The one CloudFormation call that reads a deployed template."""
+
+    def get_template(self, *, StackName: str) -> _GetTemplateResponse: ...
+
+
+class _Parameter(TypedDict, total=False):
+    Value: str
+
+
+class _GetParameterResponse(TypedDict, total=False):
+    Parameter: _Parameter
+
+
+class _ParameterReader(Protocol):
+    """The one SSM call :func:`declared_inventory_from_ssm` makes."""
+
+    def get_parameter(self, *, Name: str) -> _GetParameterResponse: ...
+
+
 def _is_access_denied(exc: BaseException) -> bool:
     response = getattr(exc, "response", None)
-    if not isinstance(response, dict):
+    if not _is_mapping(response):
         return False
-    return response.get("Error", {}).get("Code", "") in ACCESS_DENIED_CODES
+    error = cast("dict[str, _JsonObject]", response).get("Error", {})
+    return error.get("Code", "") in ACCESS_DENIED_CODES
 
 
 class AccessDeniedReadingTheAccountError(RuntimeError):
@@ -238,7 +306,7 @@ class AccountTemplateAudit:
     def met(self) -> bool:
         return not self.only_in_account and not self.only_in_template
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "stack": self.stack,
             "met": self.met,
@@ -264,7 +332,7 @@ class AccountTemplateAudit:
                 f"{self.template_resource_count} taggable resource(s) {self.stack!r} declares"
                 f"{launched}"
             )
-        parts = []
+        parts: list[str] = []
         if self.only_in_account:
             parts.append(f"{len(self.only_in_account)} tagged but not stack-managed")
         if self.only_in_template:
@@ -272,7 +340,7 @@ class AccountTemplateAudit:
         return "; ".join(parts) + launched
 
 
-def _tagged_iam_role_names(iam: Any) -> set[str]:
+def _tagged_iam_role_names(iam: _IamRoleLister | None) -> set[str]:
     """Every IAM role account-wide carrying `system=crucible-v2`.
 
     `resourcegroupstaggingapi` does not cover IAM at all (`crucible.tags`'
@@ -313,7 +381,7 @@ def _is_the_audited_stack(resource: TaggedResource, *, stack: str) -> bool:
     return len(parts) > 1 and parts[1] == stack
 
 
-def _types_the_stacks_launch_template_tags(*, stack: str, cfn: Any) -> frozenset[str]:
+def _types_the_stacks_launch_template_tags(*, stack: str, cfn: _TemplateReader) -> frozenset[str]:
     """The EC2 resource types the stack's own LaunchTemplate applies the tag to.
 
     Read from `TagSpecifications` in the deployed template, so it is DERIVED
@@ -346,12 +414,13 @@ def _types_the_stacks_launch_template_tags(*, stack: str, cfn: Any) -> frozenset
         # it. Reporting more is the direction this module already chose.
         return frozenset()
     types: set[str] = set()
-    for resource in (body.get("Resources") or {}).values():
-        if not isinstance(resource, dict) or resource.get("Type") != "AWS::EC2::LaunchTemplate":
+    for resource in cast(_JsonObject, body.get("Resources") or {}).values():
+        if not _is_mapping(resource) or resource.get("Type") != "AWS::EC2::LaunchTemplate":
             continue
-        data = ((resource.get("Properties") or {}).get("LaunchTemplateData")) or {}
-        for spec in data.get("TagSpecifications") or []:
-            if isinstance(spec, dict) and spec.get("ResourceType"):
+        properties = cast(_JsonObject, resource.get("Properties") or {})
+        data = cast(_JsonObject, properties.get("LaunchTemplateData") or {})
+        for spec in cast("list[object]", data.get("TagSpecifications") or []):
+            if _is_mapping(spec) and spec.get("ResourceType"):
                 types.add(str(spec["ResourceType"]))
     return frozenset(types)
 
@@ -460,7 +529,7 @@ class TemplateDeclaredAudit:
             and not self.roles_only_in_declared
         )
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "met": self.met,
             "template_resource_count": self.template.resource_count,
@@ -479,7 +548,7 @@ class TemplateDeclaredAudit:
                 f"{self.template.iam_role_count} IAM roles) matches the plan's declared "
                 f"inventory at {self.declared.source}"
             )
-        parts = []
+        parts: list[str] = []
         if self.template.resource_count != self.declared.resource_count:
             parts.append(
                 f"resource count {self.template.resource_count} != declared "
@@ -494,7 +563,7 @@ class TemplateDeclaredAudit:
         return "; ".join(parts)
 
 
-def _multi_constructor(loader: Any, tag_suffix: str, node: Any) -> Any:
+def _multi_constructor(loader: yaml.SafeLoader, tag_suffix: str, node: yaml.Node) -> object:
     """Tolerate every CloudFormation short-form tag (`!Ref`, `!Sub`, `!GetAtt`,
     ...) without resolving it. This module only ever reads `Resources.<id>
     .Type`, a plain scalar never expressed with an intrinsic function, so
@@ -507,23 +576,23 @@ def _multi_constructor(loader: Any, tag_suffix: str, node: Any) -> Any:
         return loader.construct_scalar(node)
     if isinstance(node, yaml.SequenceNode):
         return loader.construct_sequence(node)
-    return loader.construct_mapping(node)
+    return loader.construct_mapping(cast("yaml.MappingNode", node))
 
 
-def _parse_cfn_yaml(text: str) -> dict[str, Any]:
+def _parse_cfn_yaml(text: str) -> _JsonObject:
     import yaml  # noqa: PLC0415 - lazy, keeps yaml off the import path for callers that never parse
 
     loader_cls = type("_CfnLoader", (yaml.SafeLoader,), {})
     loader_cls.add_multi_constructor("!", _multi_constructor)
     document = yaml.load(text, Loader=loader_cls)  # noqa: S506 - the loader above is a SafeLoader subclass
-    if not isinstance(document, dict):
+    if not _is_mapping(document):
         raise TemplateUnreadableError(
             "the template body did not parse to a mapping; it may not be valid CloudFormation YAML"
         )
     return document
 
 
-def template_inventory_from_stack(*, stack: str, cfn: Any) -> TemplateInventory:
+def template_inventory_from_stack(*, stack: str, cfn: _TemplateReader) -> TemplateInventory:
     """Reads the ACTUAL currently-applied template via `GetTemplate` —
     deliberately not the stack's current resource list
     (`list_stack_resources`, which `audit_account_vs_template` already
@@ -550,7 +619,7 @@ def template_inventory_from_stack(*, stack: str, cfn: Any) -> TemplateInventory:
     if body is None:
         raise TemplateUnreadableError(f"get_template({stack!r}) returned no TemplateBody")
     document = body if isinstance(body, dict) else _parse_cfn_yaml(body)
-    resources = document.get("Resources") or {}
+    resources = cast(_JsonObject, document.get("Resources") or {})
     if not resources:
         raise TemplateUnreadableError(
             f"the template for {stack!r} declares no Resources — an empty template would make "
@@ -560,13 +629,13 @@ def template_inventory_from_stack(*, stack: str, cfn: Any) -> TemplateInventory:
         sorted(
             logical_id
             for logical_id, definition in resources.items()
-            if isinstance(definition, dict) and definition.get("Type") == "AWS::IAM::Role"
+            if _is_mapping(definition) and definition.get("Type") == "AWS::IAM::Role"
         )
     )
     return TemplateInventory(resource_count=len(resources), iam_role_logical_ids=iam_roles)
 
 
-def declared_inventory_from_ssm(*, parameter_name: str, ssm: Any) -> DeclaredInventory:
+def declared_inventory_from_ssm(*, parameter_name: str, ssm: _ParameterReader) -> DeclaredInventory:
     """The plan's own declared inventory, read from an SSM parameter an
     operator sets by hand when the plan's stated inventory changes — never
     written by `aws cloudformation deploy`. See the module docstring
@@ -648,7 +717,7 @@ def _metric(
     source_path: str,
     value: float | None = None,
     unit: str | None = None,
-) -> dict[str, Any]:
+) -> dict[str, object]:
     return {
         "name": name,
         "module": IAC_CONFORMANCE_MODULE,
@@ -688,12 +757,12 @@ def _previous_week_had_findings(store: Store, trading_day: dt.date) -> bool:
     read = read_store_document(store, key)
     if read.absent or read.document is None:
         return False
-    metrics = read.document.get("metrics") or []
+    metrics: list[object] = read.document.get("metrics") or []
     return any(
         m.get("name") in (COMPARISON_ACCOUNT_VS_TEMPLATE, COMPARISON_TEMPLATE_VS_DECLARED)
         and m.get("status") == "BREACH"
         for m in metrics
-        if isinstance(m, dict)
+        if _is_mapping(m)
     )
 
 
@@ -736,9 +805,9 @@ def iac_conformance_handler(args: argparse.Namespace) -> int:
     def body(ctx: RunContext) -> None:
         stack = cfg.stack_name
         now = ctx.started
-        metrics: list[dict[str, Any]] = []
+        metrics: list[dict[str, object]] = []
         findings: list[str] = []
-        readings: dict[str, Any] = {}
+        readings: dict[str, object] = {}
 
         try:
             account_audit = audit_account_vs_template(
