@@ -80,7 +80,7 @@ import html
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TypeGuard, cast
 
 from crucible.calendar import is_trading_day, resolve_trading_day
 from crucible.console.render import STATUS_COLORS, _read_ladder, _state_class
@@ -233,6 +233,19 @@ HEADLINE_LOOKBACK_SESSIONS = 5
 _URL = re.compile(r"https?://|www\.", re.IGNORECASE)
 
 
+#: One projected row of the page: field name to a JSON scalar.
+_Row = dict[str, object]
+
+
+def _is_object(value: object) -> TypeGuard[dict[str, object]]:
+    """A JSON object read from a stored document (string keys by construction)."""
+    return isinstance(value, dict)
+
+
+def _is_list(value: object) -> TypeGuard[list[object]]:
+    return isinstance(value, list)
+
+
 @dataclass
 class PublicPage:
     """Everything the public page shows, as data.
@@ -258,17 +271,17 @@ class PublicPage:
     headline_trading_day: str | None = None
     #: One row per plan §6 phase, from `gates/ladder.json`: number, title,
     #: state, clauses met of total. No `detail`, no `tracker_url`.
-    phases: list[dict[str, Any]] = field(default_factory=list)
+    phases: list[_Row] = field(default_factory=list)
     phase_ladder_fault: str | None = None
     #: One row per slot in `crucible.slots.SLOTS` order: the serving arm, the
     #: cycle's verdict, and how many arms were active and scored.
-    slots: list[dict[str, Any]] = field(default_factory=list)
+    slots: list[_Row] = field(default_factory=list)
     #: The `standing` rows of `board/current.json`: title, state, last read.
-    slo: list[dict[str, Any]] = field(default_factory=list)
+    slo: list[_Row] = field(default_factory=list)
     slo_fault: str | None = None
     #: One row per graded attribution layer: its name and its STATUS. Never
     #: its value.
-    integrity: list[dict[str, Any]] = field(default_factory=list)
+    integrity: list[_Row] = field(default_factory=list)
     integrity_fault: str | None = None
     #: `{"key": ..., "fault": ...}` for every artifact this page tried to read
     #: and could not, deduplicated by key.
@@ -414,16 +427,16 @@ def _read_headline(store: Store, trading_day: str) -> tuple[list[str], str | Non
     return kept, None, reported
 
 
-def _phase_rows(ladder: dict[str, Any]) -> list[dict[str, Any]]:
+def _phase_rows(ladder: dict[str, object]) -> list[_Row]:
     """The ladder's phases, projected by name.
 
     `number`, `title`, `state` and the two clause counts. `detail` and
     `tracker_url` are deliberately absent — the first is operator prose that
     quotes gate readings, the second points at a private repository.
     """
-    rows: list[dict[str, Any]] = []
-    for phase in ladder.get("phases", []):
-        if not isinstance(phase, dict):
+    rows: list[_Row] = []
+    for phase in cast("list[object]", ladder.get("phases", [])):
+        if not _is_object(phase):
             continue
         rows.append(
             {
@@ -438,7 +451,7 @@ def _phase_rows(ladder: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
-def _verdict_label(status: Any) -> str:
+def _verdict_label(status: object) -> str:
     """:data:`VERDICT_LEGEND`'s sentence for ``status``, refusing an unknown one.
 
     The same posture :func:`crucible.console.render._state_class` takes: a
@@ -452,12 +465,10 @@ def _verdict_label(status: Any) -> str:
             f"arena decision status {status!r} has no entry in VERDICT_LEGEND, so the "
             "public page has no declared wording for it — add one before it can render."
         )
-    return VERDICT_LEGEND[status]
+    return VERDICT_LEGEND[cast(str, status)]
 
 
-def _slot_rows(
-    store: Store, trading_day: str, faults: list[dict[str, str]]
-) -> list[dict[str, Any]]:
+def _slot_rows(store: Store, trading_day: str, faults: list[dict[str, str]]) -> list[_Row]:
     """One row per slot: who serves it, and what this cycle decided.
 
     Two artifacts per slot, each read independently, because they fail
@@ -466,9 +477,10 @@ def _slot_rows(
     cycle whose pointer has never been written (bootstrap). Collapsing them
     would render one absence as the other.
     """
-    rows: list[dict[str, Any]] = []
+    rows: list[_Row] = []
     for slot in SLOTS:
-        row: dict[str, Any] = {
+        cycle_key = arena_cycle_key(slot, trading_day)
+        row: _Row = {
             "slot": slot,
             "serving_arm": None,
             "serving_as_of": None,
@@ -478,7 +490,7 @@ def _slot_rows(
             "moved": None,
             "active_arms": None,
             "scored_arms": None,
-            "artifact": arena_cycle_key(slot, trading_day),
+            "artifact": cycle_key,
             "fault": None,
         }
         pointer_key = champion_key(slot)
@@ -491,13 +503,12 @@ def _slot_rows(
             # infrastructure, not a public claim.
             row["serving_arm"] = pointer.document.get("arm_id")
             row["serving_as_of"] = pointer.document.get("as_of")
-        cycle_key = row["artifact"]
         cycle = read_store_document(store, cycle_key)
         if cycle.problem is not None:
             row["fault"] = _record(faults, cycle_key, f"{cycle_key}: {cycle.problem}")
         elif cycle.document is not None:
             decision = cycle.document.get("decision")
-            if not isinstance(decision, dict):
+            if not _is_object(decision):
                 row["fault"] = _record(
                     faults,
                     cycle_key,
@@ -509,19 +520,17 @@ def _slot_rows(
                 status = decision.get("status")
                 row["verdict"] = status
                 row["verdict_means"] = _verdict_label(status)
-                row["verdict_state"] = VERDICT_STATE[status]
+                row["verdict_state"] = VERDICT_STATE[cast(str, status)]
                 row["moved"] = decision.get("moved")
-            active = cycle.document.get("active_arms")
-            scored = cycle.document.get("scored_arms")
-            row["active_arms"] = len(active) if isinstance(active, list) else None
-            row["scored_arms"] = len(scored) if isinstance(scored, list) else None
+            active: object = cycle.document.get("active_arms")
+            scored: object = cycle.document.get("scored_arms")
+            row["active_arms"] = len(active) if _is_list(active) else None
+            row["scored_arms"] = len(scored) if _is_list(scored) else None
         rows.append(row)
     return rows
 
 
-def _slo_rows(
-    store: Store, faults: list[dict[str, str]]
-) -> tuple[list[dict[str, Any]], str | None]:
+def _slo_rows(store: Store, faults: list[dict[str, str]]) -> tuple[list[_Row], str | None]:
     """The board's `standing` rows, projected to title, state and last read.
 
     `detail` and `means_when_red` are board free text: the first quotes the
@@ -541,7 +550,7 @@ def _slo_rows(
     if problem is not None:
         return [], _record(faults, BOARD_CURRENT_KEY, problem)
     assert read.document is not None  # `require` returned None, so it read
-    rows = [
+    rows: list[_Row] = [
         {
             "id": row.get("id"),
             "title": row.get("title"),
@@ -549,8 +558,8 @@ def _slo_rows(
             "last_read": row.get("last_read"),
             "artifact": BOARD_CURRENT_KEY,
         }
-        for row in read.document["rows"]
-        if isinstance(row, dict) and row.get("source") == STANDING_SOURCE
+        for row in cast("list[object]", read.document["rows"])
+        if _is_object(row) and row.get("source") == STANDING_SOURCE
     ]
     if not rows:
         # Honestly empty, and said so: a board with no standing rows is a
@@ -567,7 +576,7 @@ def _slo_rows(
 
 def _integrity_rows(
     store: Store, trading_day: str, faults: list[dict[str, str]]
-) -> tuple[list[dict[str, Any]], str | None]:
+) -> tuple[list[_Row], str | None]:
     """Each graded layer's NAME and STATUS from the attribution artifact.
 
     Never its `value` and never its `unit`. The distinction is the whole
@@ -590,8 +599,8 @@ def _integrity_rows(
     assert read.document is not None  # `require` returned None, so it read
     return [
         {"layer": row.get("name"), "status": row.get("status")}
-        for row in read.document["rows"]
-        if isinstance(row, dict)
+        for row in cast("list[object]", read.document["rows"])
+        if _is_object(row)
     ], None
 
 
@@ -678,7 +687,7 @@ _PREAMBLE = (
 )
 
 
-def _e(value: Any) -> str:
+def _e(value: object) -> str:
     return html.escape("" if value is None else str(value))
 
 
