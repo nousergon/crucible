@@ -573,6 +573,48 @@ class TestComposesWithTheHardRiskLayer:
         assert w_prev[anf] > 0.1
         assert on.weights[anf] > 0.0
 
+    def test_a_capped_name_turning_negative_raises_the_budget_instead_of_the_session(
+        self,
+    ) -> None:
+        """alpha-engine-config-I13712: MU held at the 25% cap turns to -0.1%
+        alpha under a 20% budget. Its sale is a forced move, so pace 0 alone
+        trades ~25% one-way; the budget used to admit no pace and the governor
+        raised TurnoverBudgetError for the whole book."""
+        rows, _cash = _REPLAY["2026-11-09"]
+        alpha = np.array([r[1] for r in rows] + [0.0, -1e-6])
+        mu = [r[0] for r in rows].index("MU")
+        alpha[mu] = -0.001
+        _t, w_prev, on = _solve(
+            "2026-11-09",
+            alpha=alpha,
+            aim_adjustment_rate=0.5,
+            max_daily_turnover=0.20,
+            conviction_budget_gate_enabled=False,
+        )
+        aim = on.diagnostics["aim_adjustment"]
+        assert w_prev[mu] > 0.2
+        assert on.weights[mu] == pytest.approx(0.0, abs=1e-9)
+        assert aim["hard_risk_exits"] == ["MU"]
+        assert aim["turnover_budget_raised_for_forced_moves"] is True
+        assert aim["turnover_budget_configured_cap"] == pytest.approx(0.20)
+        assert aim["turnover_budget_cap"] > 0.20
+        assert aim["reason"] == "budget_limited_step"
+        assert aim["rate_applied"] < 0.5
+        # The forced sale alone is above the configured 20%: that was the crash.
+        assert _turnover(on.weights, w_prev) > 0.20
+        assert on.weights.sum() == pytest.approx(1.0, abs=1e-9)
+
+    def test_a_budget_that_already_carries_the_forced_moves_is_not_raised(self) -> None:
+        _t, _w, on = _solve(
+            "2026-11-09",
+            aim_adjustment_rate=0.5,
+            max_daily_turnover=0.20,
+            conviction_budget_gate_enabled=False,
+        )
+        aim = on.diagnostics["aim_adjustment"]
+        assert aim["turnover_budget_raised_for_forced_moves"] is False
+        assert aim["turnover_budget_cap"] == aim["turnover_budget_configured_cap"]
+
     def test_a_negative_alpha_floor_exit_leaves_in_full_under_the_pace(self) -> None:
         """``negative_alpha_exit_below``: CVLT at -3% against a -2% floor."""
         rows, _cash = _REPLAY["2026-11-09"]
