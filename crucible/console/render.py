@@ -11,8 +11,9 @@ from __future__ import annotations
 import datetime as dt
 import html
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
-from typing import Any, get_args
+from typing import TypedDict, cast, get_args
 
 from krepis.metrics import StatusLiteral
 from pydantic import ValidationError
@@ -67,6 +68,70 @@ _C14_PHASE = next(p for p in PHASES if p.id == "phase1")
 # `CONSOLE_KEY` stays in this module's `__all__` for its existing readers.
 
 
+class _ManifestMetric(TypedDict, total=False):
+    status: str
+
+
+class _RunManifest(TypedDict, total=False):
+    """The run-manifest fields this page reads, as `run_manifest` declares them."""
+
+    status: str
+    cost_usd: float
+    attempts: list[object] | None
+    metrics: list[_ManifestMetric]
+
+
+def _run_manifest(document: Mapping[str, object]) -> _RunManifest:
+    # JSON boundary: `crucible.documents.read_manifests_under` guarantees an
+    # object and nothing more. The fields above are read unchecked here exactly
+    # as before; a malformed one still fails where it is used.
+    return cast("_RunManifest", document)
+
+
+class ComponentRow(TypedDict):
+    """One row of the page's component table (:func:`_row`)."""
+
+    component: str
+    state: str
+    reason: str
+    lifecycle: str
+    schedule: str | None
+    deadline: str | None
+    absence_watched_by: str
+    console_surface: str
+    log_location: str
+    run_id: str | None
+    trading_day: str | None
+    cost_usd: float | None
+    attempts: int | None
+
+
+class _PhaseLadderRow(TypedDict):
+    """The `phase_ladder.v1` row fields this page renders."""
+
+    phase: str
+    title: str
+    state: str
+    detail: str
+    tracker: str
+    tracker_url: str
+    clauses_met: int | None
+    clauses_total: int | None
+    read_on: str | None
+
+
+class _PhaseLadder(TypedDict, total=False):
+    """The `phase_ladder.v1` fields this page renders."""
+
+    trading_day: str
+    current_phase: str
+    phases_total: int
+    phases_met: int
+    unmeasured: int
+    out_of_order: list[str]
+    phases: list[_PhaseLadderRow]
+
+
 @dataclass
 class ConsolePage:
     """Everything the page shows, as data.
@@ -82,7 +147,7 @@ class ConsolePage:
 
     trading_day: str
     generated_utc: str
-    rows: list[dict[str, Any]] = field(default_factory=list)
+    rows: list[ComponentRow] = field(default_factory=list)
     #: Every artifact this page tried to read and could not, as
     #: `{"key": ..., "fault": ...}`. A first-class published field rather than
     #: a log line: `alpha-engine-config-I9900` is the case where ONE
@@ -103,24 +168,24 @@ class ConsolePage:
     #: older than this page's trading day — ``phase_ladder_fault`` then says
     #: which, and the panel renders UNREPORTED rather than a recomputed
     #: ladder.
-    phase_ladder: dict[str, Any] = field(default_factory=dict)
+    phase_ladder: dict[str, object] = field(default_factory=dict)
     #: Why ``phase_ladder`` is empty, as a sentence naming `gates/ladder.json`
     #: and the cause; None when the ladder read. A published field rather than
     #: a log line: the panel's red has to name what to fix, and the JSON an
     #: agent reads has to carry the same cause the HTML shows.
     phase_ladder_fault: str | None = None
-    attribution: list[dict[str, Any]] = field(default_factory=list)
+    attribution: list[dict[str, object]] = field(default_factory=list)
     #: The champion pointer document per slot, or None when no pointer has
     #: been written OR the pointer could not be read. Which of those two it is
     #: lives in ``champion_faults``: a reader-state field carried INSIDE the
     #: pointer document (`{"unreadable": ...}`) overloaded the trader's
     #: contract namespace with a fact about our read of it
     #: (`alpha-engine-config-I9931` item 3).
-    champions: dict[str, Any] = field(default_factory=dict)
+    champions: dict[str, dict[str, object] | None] = field(default_factory=dict)
     #: `{slot: fault}` for every champion pointer that is present and could
     #: not be read. Empty when every pointer read or is honestly absent.
     champion_faults: dict[str, str] = field(default_factory=dict)
-    deploys: list[dict[str, Any]] = field(default_factory=list)
+    deploys: list[dict[str, object]] = field(default_factory=list)
     week_cost_usd: float = 0.0
     unreported: int = 0
     population: int = 0
@@ -164,7 +229,7 @@ class ManifestRead:
     we could not read it.
     """
 
-    manifest: dict[str, Any] | None
+    manifest: _RunManifest | None
     problem: str | None
     #: `{key: fault}` for every key under the prefix that could not be read.
     #: Keyed by STORE KEY rather than by component so the page's unreadable
@@ -224,7 +289,7 @@ def _read_representative_manifest(store: Store, job: str, trading_day: str) -> M
         # blank row where an access failure belongs, and *no data* is never
         # rendered green (principle 7, alpha-engine-config-I9960).
         return ManifestRead(None, listed.listing_problem, {})
-    candidates = [document for _key, document in listed.documents]
+    candidates = [_run_manifest(document) for _key, document in listed.documents]
     faults = dict(listed.faults)
     if faults:
         # Reported even when a readable sibling exists. A component with one
@@ -301,14 +366,14 @@ def _read_manifests_by_slot(
     listed = read_manifests_under(store, manifest_prefix(job, trading_day))
     if listed.listing_problem is not None:
         return {slot: ManifestRead(None, listed.listing_problem, {}) for slot in slots}
-    docs_by_slot: dict[str, list[dict[str, Any]]] = {slot: [] for slot in slots}
+    docs_by_slot: dict[str, list[_RunManifest]] = {slot: [] for slot in slots}
     faults_by_slot: dict[str, dict[str, str]] = {slot: {} for slot in slots}
     for key, document in listed.documents:
         parsed = parse_manifest_key(key)
         assert parsed is not None  # `read_manifests_under` already filtered to manifest keys
         _, _, discriminator = parsed
         if discriminator in docs_by_slot:
-            docs_by_slot[discriminator].append(document)
+            docs_by_slot[discriminator].append(_run_manifest(document))
         # A discriminator outside `slots` (a slot the registry no longer
         # dispatches, or a stray key) is not this row's business — it is
         # neither dropped nor mistaken for one of the expected slots.
@@ -359,7 +424,7 @@ def classify_registry(
     trading_day: dt.date,
     faults: dict[str, str] | None = None,
     skip: frozenset[str] = frozenset(),
-) -> tuple[dict[str, Classification], dict[str, dict[str, Any] | None]]:
+) -> tuple[dict[str, Classification], dict[str, _RunManifest | None]]:
     """Classify every registry row once, and hand back the manifests too.
 
     Extracted so the console page and the declared board
@@ -394,7 +459,7 @@ def classify_registry(
     in its reason for every caller, so nothing is lost by not asking.
     """
     classifications: dict[str, Classification] = {}
-    manifests: dict[str, dict[str, Any] | None] = {}
+    manifests: dict[str, _RunManifest | None] = {}
     for name, component in sorted(registry.items()):
         if name in skip:
             continue
@@ -415,7 +480,7 @@ def classify_registry(
     return classifications, manifests
 
 
-def _read_ladder(store: Store, trading_day: dt.date) -> tuple[dict[str, Any], str | None]:
+def _read_ladder(store: Store, trading_day: dt.date) -> tuple[dict[str, object], str | None]:
     """`gates/ladder.json` as the gate publisher wrote it, or why it is unusable.
 
     The console READS this key. It does not compute it and it does not write
@@ -495,7 +560,7 @@ def build_page(
         days.append(previous_trading_day(days[-1]))
     day_set = {d.isoformat() for d in days}
 
-    rows: list[dict[str, Any]] = []
+    rows: list[ComponentRow] = []
     metric_gap = 0
     unreadable: list[dict[str, str]] = []
     manifest_faults: dict[str, str] = {}
@@ -555,7 +620,7 @@ def build_page(
         )
 
     week_cost = 0.0
-    deploys: list[dict[str, Any]] = []
+    deploys: list[dict[str, object]] = []
     for key in store.list_keys(RUNS_ROOT):
         parsed = parse_manifest_key(key)
         if parsed is None:
@@ -631,8 +696,8 @@ def build_page(
 def _row(
     component: Component,
     classification: Classification,
-    manifest: dict[str, Any] | None,
-) -> dict[str, Any]:
+    manifest: _RunManifest | None,
+) -> ComponentRow:
     return {
         "component": component.name,
         "state": classification.state,
@@ -652,7 +717,7 @@ def _row(
 
 def _attribution_rows(
     read: DocumentRead, key: str, unreadable: list[dict[str, str]]
-) -> list[dict[str, Any]]:
+) -> list[dict[str, object]]:
     """The attribution table's rows, or an empty table plus a named fault.
 
     `rows` is the one required field of this artifact, and it must be a list.
@@ -674,7 +739,7 @@ def _attribution_rows(
 
 def _champions(
     store: Store, unreadable: list[dict[str, str]]
-) -> tuple[dict[str, Any], dict[str, str]]:
+) -> tuple[dict[str, dict[str, object] | None], dict[str, str]]:
     """``(pointer per slot, fault per unreadable slot)``.
 
     Track B owns `promote` and therefore the pointers. Reading them here is a
@@ -690,7 +755,7 @@ def _champions(
     it (`{"unreadable": ...}`) is a second schema nobody declared
     (`alpha-engine-config-I9931` item 3).
     """
-    out: dict[str, Any] = {}
+    out: dict[str, dict[str, object] | None] = {}
     faults: dict[str, str] = {}
     for slot in ("u", "r", "m", "s"):
         # `keys.champion_key`, not a restatement of its shape. Handed over
@@ -854,11 +919,11 @@ code { font: 12px ui-monospace, monospace; }
 )
 
 
-def _e(value: Any) -> str:
+def _e(value: object) -> str:
     return html.escape("" if value is None else str(value))
 
 
-def _state_class(status: Any) -> str:
+def _state_class(status: object) -> str:
     """The `s-{status}` class for a status, refusing one with no color.
 
     C14 was exactly the absence of this check: a status could reach the
@@ -1043,7 +1108,9 @@ def _ladder_section(page: ConsolePage) -> list[str]:
     reading three GitHub issue comments and knowing which of them superseded
     the others.
     """
-    ladder = page.phase_ladder
+    # JSON boundary: `_read_ladder` held this document to phase_ladder.v1 (or
+    # left it empty), so its fields are typed as that schema declares them.
+    ladder = cast("_PhaseLadder", page.phase_ladder)
     if not ladder:
         # UNREPORTED, in the page's own red, never `empty`'s gray and never a
         # recomputed ladder (`alpha-engine-config-I10575`). The console is a

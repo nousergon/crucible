@@ -196,9 +196,9 @@ def machine_principals(cfn: Any | None = None, *, stack: str | None = None) -> t
         raise StackUnmeasurableError(str(exc)) from exc
     names = sorted(
         {
-            r["PhysicalResourceId"]
+            physical
             for r in resources
-            if r["ResourceType"] == "AWS::IAM::Role" and r.get("PhysicalResourceId")
+            if r["ResourceType"] == "AWS::IAM::Role" and (physical := r.get("PhysicalResourceId"))
         }
     )
     if not names:

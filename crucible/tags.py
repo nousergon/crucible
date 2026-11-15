@@ -33,8 +33,14 @@ silent false positive.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict
+
+if TYPE_CHECKING:
+    import datetime as dt
+
+    from crucible.cost import CostExplorerCache
 
 __all__ = [
     "TAG_KEY",
@@ -114,6 +120,94 @@ UNTAGGABLE_TYPES: dict[str, str] = {
 }
 
 
+class _Tag(TypedDict):
+    """One AWS tag, as IAM and the resource-tagging API both return it."""
+
+    Key: str
+    Value: str
+
+
+class _ListRoleTagsResponse(TypedDict, total=False):
+    Tags: list[_Tag]
+
+
+class _IamClient(Protocol):
+    """The one IAM call this module makes (a boto3 `iam` client satisfies it)."""
+
+    def list_role_tags(self, *, RoleName: str) -> _ListRoleTagsResponse: ...
+
+
+class _StackResourceSummary(TypedDict):
+    """One `StackResourceSummaries` entry of `cloudformation:ListStackResources`."""
+
+    LogicalResourceId: str
+    ResourceType: str
+    PhysicalResourceId: NotRequired[str]
+    LastUpdatedTimestamp: NotRequired[dt.datetime]
+
+
+class _ListStackResourcesPage(TypedDict, total=False):
+    StackResourceSummaries: list[_StackResourceSummary]
+
+
+class _ListStackResourcesPaginator(Protocol):
+    def paginate(self, *, StackName: str) -> Iterable[_ListStackResourcesPage]: ...
+
+
+class _CfnClient(Protocol):
+    """The one CloudFormation read this module makes, paginated."""
+
+    def get_paginator(
+        self, operation_name: Literal["list_stack_resources"], /
+    ) -> _ListStackResourcesPaginator: ...
+
+
+class _TagFilter(TypedDict):
+    Key: str
+    Values: list[str]
+
+
+class _ResourceTagMapping(TypedDict):
+    """One `ResourceTagMappingList` entry of `tag:GetResources`."""
+
+    ResourceARN: str
+    Tags: NotRequired[list[_Tag] | None]
+
+
+class _GetResourcesPage(TypedDict, total=False):
+    ResourceTagMappingList: list[_ResourceTagMapping]
+
+
+class _GetResourcesPaginator(Protocol):
+    def paginate(self, *, TagFilters: Sequence[_TagFilter]) -> Iterable[_GetResourcesPage]: ...
+
+
+class _TaggingClient(Protocol):
+    """The one resource-tagging read this module makes, paginated."""
+
+    def get_paginator(
+        self, operation_name: Literal["get_resources"], /
+    ) -> _GetResourcesPaginator: ...
+
+
+class _CostAllocationTag(TypedDict, total=False):
+    TagKey: str
+    Status: str
+    LastUpdatedDate: str
+
+
+class _ListCostAllocationTagsResponse(TypedDict, total=False):
+    CostAllocationTags: list[_CostAllocationTag] | None
+
+
+class _CostAllocationTagsClient(Protocol):
+    """The one Cost Explorer call :func:`cost_allocation_tag_status` makes."""
+
+    def list_cost_allocation_tags(
+        self, *, TagKeys: Sequence[str]
+    ) -> _ListCostAllocationTagsResponse: ...
+
+
 class StackNotAppliedError(RuntimeError):
     """The stack this audit reads does not exist yet."""
 
@@ -164,7 +258,7 @@ class TagAudit:
     def met(self) -> bool:
         return not self.untagged
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "stack": self.stack,
             "tag": f"{TAG_KEY}={TAG_VALUE}",
@@ -187,7 +281,7 @@ class TagAudit:
         return f"{len(self.untagged)} of {len(self.resources)} resources untagged: {names}"
 
 
-def _iam_role_tagged(clients: dict[str, Any], physical_id: str) -> bool:
+def _iam_role_tagged(clients: Mapping[str, _IamClient | None], physical_id: str) -> bool:
     """Whether an IAM role carries the tag, read from IAM itself.
 
     `resourcegroupstaggingapi` does not cover IAM, and it does not say so — it
@@ -207,13 +301,13 @@ def _iam_role_tagged(clients: dict[str, Any], physical_id: str) -> bool:
 #: Per-type tag resolution. A type absent from this table resolves through
 #: `resourcegroupstaggingapi`, which is right for most services and wrong for
 #: the ones it does not cover.
-TAG_READERS: dict[str, Any] = {
+TAG_READERS: dict[str, Callable[[Mapping[str, _IamClient | None], str], bool]] = {
     "AWS::IAM::Role": _iam_role_tagged,
 }
 
 
-def _stack_resources(cfn: Any, stack: str) -> list[dict[str, Any]]:
-    resources: list[dict[str, Any]] = []
+def _stack_resources(cfn: _CfnClient, stack: str) -> list[_StackResourceSummary]:
+    resources: list[_StackResourceSummary] = []
     try:
         paginator = cfn.get_paginator("list_stack_resources")
         for page in paginator.paginate(StackName=stack):
@@ -248,7 +342,7 @@ def identifier_candidates(arn: str) -> set[str]:
     return {arn, arn.rsplit("/", 1)[-1], arn.rsplit(":", 1)[-1]}
 
 
-def tagged_resources(tagging: Any) -> list[TaggedResource]:
+def tagged_resources(tagging: _TaggingClient) -> list[TaggedResource]:
     """Every resource carrying the tag, one entry each, with its tags.
 
     Replaces the flat identifier set this module used to return. That set
@@ -271,7 +365,7 @@ def tagged_resources(tagging: Any) -> list[TaggedResource]:
     return found
 
 
-def _tagged_identifiers(tagging: Any) -> set[str]:
+def _tagged_identifiers(tagging: _TaggingClient) -> set[str]:
     """Every identifier form of every tagged resource, flattened.
 
     DERIVED from :func:`tagged_resources` rather than gathered separately, so
@@ -314,11 +408,13 @@ class CostAllocationStatus:
     def active(self) -> bool:
         return self.status == "Active"
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return {"status": self.status, "last_updated_date": self.last_updated_date}
 
 
-def cost_allocation_tag_status(ce: Any, *, cache: Any | None = None) -> CostAllocationStatus:
+def cost_allocation_tag_status(
+    ce: _CostAllocationTagsClient, *, cache: CostExplorerCache | None = None
+) -> CostAllocationStatus:
     """Whether `TAG_KEY` is `Active` as a cost-allocation tag in Billing.
 
     `ce:ListCostAllocationTags` is a distinct IAM action from
@@ -343,7 +439,7 @@ def cost_allocation_tag_status(ce: Any, *, cache: Any | None = None) -> CostAllo
     cache = cache or default_cache()
     key = ("list_cost_allocation_tags", TAG_KEY)
 
-    def fetch() -> dict[str, Any]:
+    def fetch() -> _ListCostAllocationTagsResponse:
         try:
             return ce.list_cost_allocation_tags(TagKeys=[TAG_KEY])
         except Exception as exc:
@@ -358,7 +454,7 @@ def cost_allocation_tag_status(ce: Any, *, cache: Any | None = None) -> CostAllo
     # flipping it, which this process cannot observe mid-run regardless of
     # TTL, so it is cached for the process's lifetime rather than re-read on
     # a timer.
-    response = cache.get_or_fetch(key, closed=True, fetch=fetch)
+    response: _ListCostAllocationTagsResponse = cache.get_or_fetch(key, closed=True, fetch=fetch)
     for entry in response.get("CostAllocationTags") or []:
         if entry.get("TagKey") == TAG_KEY:
             return CostAllocationStatus(
@@ -368,7 +464,9 @@ def cost_allocation_tag_status(ce: Any, *, cache: Any | None = None) -> CostAllo
     return CostAllocationStatus(status="absent", last_updated_date=None)
 
 
-def audit_stack_tags(*, stack: str, cfn: Any, tagging: Any, iam: Any = None) -> TagAudit:
+def audit_stack_tags(
+    *, stack: str, cfn: _CfnClient, tagging: _TaggingClient, iam: _IamClient | None = None
+) -> TagAudit:
     """Which of ``stack``'s taggable resources lack `system=crucible-v2`."""
     summaries = _stack_resources(cfn, stack)
     tagged = _tagged_identifiers(tagging)

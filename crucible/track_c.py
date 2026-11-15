@@ -1028,18 +1028,14 @@ def drift_handler(args: argparse.Namespace) -> int:
 
         records = drift_metrics(
             trading_day=ctx.trading_day,
-            feature_psi_by_name=payloads["features"]["psi_by_feature"],
-            prediction_psi=payloads["predictions"]["psi"],
-            ic_decay_by_horizon={int(h): v for h, v in payloads["ic"]["decay_by_horizon"].items()},
-            unmeasured_reasons={
-                name: doc["unmeasured_reason"]
-                for name, doc in payloads.items()
-                if doc.get("unmeasured_reason")
-            },
+            feature_psi_by_name=computed.features["psi_by_feature"],
+            prediction_psi=computed.predictions["psi"],
+            ic_decay_by_horizon={int(h): v for h, v in computed.ic["decay_by_horizon"].items()},
+            unmeasured_reasons=computed.unmeasured_reasons(),
             # `alpha-engine-config-I10071`: names which of the two drift
             # comparisons (cross-sectional vs along-time) produced the worst
             # feature's ratio, on the row itself.
-            feature_method_by_name=payloads["features"].get("method_by_feature", {}),
+            feature_method_by_name=computed.features.get("method_by_feature", {}),
         )
         for record in records:
             ctx.record_metric(record)
