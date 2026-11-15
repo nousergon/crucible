@@ -76,9 +76,17 @@ from __future__ import annotations
 
 import datetime as dt
 import math
-from collections.abc import Iterable, Sequence
+from collections.abc import Buffer, Container, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import (
+    TYPE_CHECKING,
+    NotRequired,
+    Protocol,
+    SupportsFloat,
+    SupportsIndex,
+    TypedDict,
+    cast,
+)
 
 from crucible.documents import load_store_document
 from crucible.drift import BANDS, DEFAULT_BINS, feature_psi, ic_decay, psi
@@ -118,18 +126,92 @@ _CROSS_SECTION = "/cross_section.json"
 _SETTLED = "/cross_section_settled.json"
 
 
+class _FeatureColumn(Protocol):
+    """One column of a compiled feature frame: only its values are read."""
+
+    def tolist(self) -> list[object]: ...
+
+
+class _FeatureFrame(Protocol):
+    """What this module reads of a compiled feature frame
+    (`crucible.features.read_features`' `pandas.DataFrame`)."""
+
+    @property
+    def columns(self) -> Container[object]: ...
+
+    def __getitem__(self, key: str, /) -> _FeatureColumn: ...
+
+
+class FeaturesDriftInput(TypedDict):
+    """The `features` drift input document (:data:`DRIFT_INPUT_SCHEMA_VERSION`)."""
+
+    schema_version: str
+    trading_day: str
+    current_session: str
+    reference_sessions: list[str]
+    reference_sessions_requested: int
+    feature_version: str
+    method: str
+    psi_by_feature: dict[str, float]
+    method_by_feature: dict[str, str]
+    unmeasured_reason: NotRequired[str]
+    columns_not_comparable: NotRequired[list[str]]
+    columns_awaiting_reference: NotRequired[dict[str, str]]
+    reference_rows_by_feature: NotRequired[dict[str, int]]
+
+
+class PredictionsDriftInput(TypedDict):
+    """The `predictions` drift input document (:data:`DRIFT_INPUT_SCHEMA_VERSION`)."""
+
+    schema_version: str
+    trading_day: str
+    method: str
+    psi: float | None
+    worst_arm: str | None
+    psi_by_arm: dict[str, float]
+    reference_dates_by_arm: dict[str, list[str]]
+    arms_without_a_cross_section_today: list[str]
+    arms_without_an_earlier_cross_section: list[str]
+    unmeasured_reason: NotRequired[str]
+
+
+class IcDriftInput(TypedDict):
+    """The `ic` drift input document (:data:`DRIFT_INPUT_SCHEMA_VERSION`)."""
+
+    schema_version: str
+    trading_day: str
+    method: str
+    decay_by_horizon: dict[str, float]
+    worst_arm_by_horizon: dict[str, str]
+    decay_by_arm: dict[str, dict[str, float]]
+    current_ic_by_arm: dict[str, dict[str, float]]
+    baseline_ic_by_arm: dict[str, dict[str, float]]
+    settled_dates_too_few_by_arm: dict[str, dict[str, int]]
+    unmeasured_reason: NotRequired[str]
+
+
 @dataclass(frozen=True)
 class DriftInputs:
     """The three documents `drift_handler` files and then reads, plus the
     store keys they were derived from (for the manifest's lineage)."""
 
-    features: dict[str, Any]
-    predictions: dict[str, Any]
-    ic: dict[str, Any]
+    features: FeaturesDriftInput
+    predictions: PredictionsDriftInput
+    ic: IcDriftInput
     sources: tuple[str, ...] = field(default_factory=tuple)
 
-    def as_dict(self) -> dict[str, dict[str, Any]]:
+    def as_dict(self) -> dict[str, Mapping[str, object]]:
         return {"features": self.features, "predictions": self.predictions, "ic": self.ic}
+
+    def unmeasured_reasons(self) -> dict[str, str]:
+        """Per input, the producer's own statement of why its value is absent,
+        for each input that carries one."""
+        reasons = (
+            ("features", self.features.get("unmeasured_reason")),
+            ("predictions", self.predictions.get("unmeasured_reason")),
+            ("ic", self.ic.get("unmeasured_reason")),
+        )
+        return {name: reason for name, reason in reasons if reason}
 
 
 def feature_days(store: Store, version: str) -> list[dt.date]:
@@ -153,9 +235,13 @@ def feature_days(store: Store, version: str) -> list[dt.date]:
     return sorted(days)
 
 
-def _finite(values: Iterable[Any]) -> list[float]:
+def _finite(values: Iterable[object]) -> list[float]:
     out: list[float] = []
     for v in values:
+        # Exactly what `float()` accepts; anything else would raise TypeError
+        # below and be skipped, so this skips the same values, typed.
+        if not isinstance(v, (float, int, str, Buffer, SupportsFloat, SupportsIndex)):
+            continue
         try:
             f = float(v)
         except (TypeError, ValueError):
@@ -165,7 +251,14 @@ def _finite(values: Iterable[Any]) -> list[float]:
     return out
 
 
-def _numeric_columns(frame: Any, catalog_columns: Sequence[str]) -> list[str]:
+def _read_frame(payload: bytes) -> _FeatureFrame:
+    # Untyped-library boundary: pandas ships no type information pyright can
+    # match a `DataFrame` against, so the protocol this module reads through
+    # is asserted here, once, rather than at every column access.
+    return cast("_FeatureFrame", read_features(payload))
+
+
+def _numeric_columns(frame: _FeatureFrame, catalog_columns: Sequence[str]) -> list[str]:
     return [c for c in catalog_columns if c in frame.columns]
 
 
@@ -217,7 +310,7 @@ ALONG_TIME_BREACH_SIGMA = 3.0
 ALONG_TIME_MIN_REFERENCE_SESSIONS = 5
 
 
-def _daily_representative(frame: Any, column: str) -> float | None:
+def _daily_representative(frame: _FeatureFrame, column: str) -> float | None:
     """The single value a market-wide column carries on this trading day.
 
     A market-wide column is identical across the whole cross-section by
@@ -289,7 +382,7 @@ def _features_input(
     reference_sessions: int,
     catalog: Sequence[FeatureSpec],
     sources: list[str],
-) -> dict[str, Any]:
+) -> FeaturesDriftInput:
     catalog_columns = tuple(spec.name for spec in catalog)
     market_wide_names = frozenset(spec.name for spec in catalog if spec.market_wide)
     current_key = features_key(version, trading_day.isoformat())
@@ -300,11 +393,11 @@ def _features_input(
             "green-over-nothing this job exists to refuse — compile the day first "
             "(`crucible data.daily --date ...`)."
         )
-    current = read_features(store.get_bytes(current_key))
+    current = _read_frame(store.get_bytes(current_key))
     sources.append(current_key)
     columns = _numeric_columns(current, catalog_columns)
     prior = [d for d in feature_days(store, version) if d < trading_day][-reference_sessions:]
-    document: dict[str, Any] = {
+    document: FeaturesDriftInput = {
         "schema_version": DRIFT_INPUT_SCHEMA_VERSION,
         "trading_day": trading_day.isoformat(),
         "current_session": trading_day.isoformat(),
@@ -337,7 +430,7 @@ def _features_input(
     mw_training: dict[str, list[float]] = {c: [] for c in market_wide_columns}
     for day in prior:
         key = features_key(version, day.isoformat())
-        frame = read_features(store.get_bytes(key))
+        frame = _read_frame(store.get_bytes(key))
         sources.append(key)
         for c in cross_sectional_columns:
             if c in frame.columns:
@@ -352,7 +445,7 @@ def _features_input(
     # rather than fed to `psi`, which would (correctly) refuse the empty
     # reference and take the whole row down over a column that only just
     # appeared.
-    cs_comparable = {c: v for c, v in cs_training.items() if v}
+    cs_comparable: dict[str, Sequence[float]] = {c: v for c, v in cs_training.items() if v}
     mw_comparable = {c: v for c, v in mw_training.items() if v}
     not_comparable = sorted(
         (set(cs_training) - set(cs_comparable)) | (set(mw_training) - set(mw_comparable))
@@ -373,7 +466,7 @@ def _features_input(
         for c, v in mw_comparable.items()
         if c not in mw_scoreable
     }
-    cs_live = {c: _finite(current[c].tolist()) for c in cs_comparable}
+    cs_live: dict[str, Sequence[float]] = {c: _finite(current[c].tolist()) for c in cs_comparable}
     mw_live: dict[str, list[float]] = {}
     for c in mw_scoreable:
         value = _daily_representative(current, c)
@@ -432,8 +525,12 @@ def _dated_documents(store: Store, arm_id: str, suffix: str) -> dict[dt.date, st
     return out
 
 
-def _scores(document: dict[str, Any]) -> list[float]:
-    return _finite(row["score"] for row in document["ranks"])
+def _scores(document: Mapping[str, object]) -> list[float]:
+    # JSON boundary: `document` is a parsed cross_section.v2, whose `ranks` is
+    # a list of row objects each carrying `score`. Unchecked here exactly as
+    # before; a malformed document still raises at the subscript.
+    ranks = cast("Iterable[Mapping[str, object]]", document["ranks"])
+    return _finite(row["score"] for row in ranks)
 
 
 def _predictions_input(
@@ -443,7 +540,7 @@ def _predictions_input(
     slots: Sequence[str],
     reference_sessions: int,
     sources: list[str],
-) -> dict[str, Any]:
+) -> PredictionsDriftInput:
     by_arm: dict[str, float] = {}
     reference_dates: dict[str, list[str]] = {}
     without_current: list[str] = []
@@ -466,7 +563,7 @@ def _predictions_input(
         by_arm[arm_id] = psi(reference, _scores(current_doc))
         reference_dates[arm_id] = [d.isoformat() for d in prior]
     worst_arm, worst = max(by_arm.items(), key=lambda kv: kv[1]) if by_arm else (None, None)
-    document: dict[str, Any] = {
+    document: PredictionsDriftInput = {
         "schema_version": DRIFT_INPUT_SCHEMA_VERSION,
         "trading_day": trading_day.isoformat(),
         "method": (
@@ -518,7 +615,7 @@ def _ic_input(
     *,
     slots: Sequence[str],
     sources: list[str],
-) -> dict[str, Any]:
+) -> IcDriftInput:
     decay_by_arm: dict[str, dict[int, float]] = {}
     current_by_arm: dict[str, dict[int, float]] = {}
     baseline_by_arm: dict[str, dict[int, float]] = {}
@@ -553,7 +650,7 @@ def _ic_input(
             if horizon not in worst or value > worst[horizon]:
                 worst[horizon] = value
                 worst_arm_by_horizon[horizon] = arm_id
-    document: dict[str, Any] = {
+    document: IcDriftInput = {
         "schema_version": DRIFT_INPUT_SCHEMA_VERSION,
         "trading_day": trading_day.isoformat(),
         "method": (
