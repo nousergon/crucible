@@ -62,7 +62,7 @@ import datetime as dt
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import cast
 
 from pydantic import ValidationError
 
@@ -338,7 +338,7 @@ ARTIFACT_GRADED_FAULTS: Mapping[str, ArtifactGradedFault] = {
 
 def _find_manifest(
     store: Store, target_job: str, trading_day: str, run_id: str
-) -> tuple[str, dict[str, Any]]:
+) -> tuple[str, dict[str, object]]:
     """The manifest key and document under `runs/{target_job}/{trading_day}/`
     whose own `run_id` equals ``run_id``, or a refusal naming exactly why not.
 
@@ -361,14 +361,14 @@ def _find_manifest(
             f"describe: {type(exc).__name__}: {exc}. A record cannot be filed against a "
             "listing we could not read."
         ) from exc
-    matches: list[tuple[str, dict[str, Any]]] = []
+    matches: list[tuple[str, dict[str, object]]] = []
     for key in keys:
         if not is_manifest_key(key):
             continue
         read = read_store_document(store, key)
         if read.problem is not None or read.absent:
             continue
-        document = read.document or {}
+        document: dict[str, object] = read.document or {}
         if document.get("run_id") == run_id:
             matches.append((key, document))
     if not matches:
@@ -403,7 +403,7 @@ def _induced_evidence(
     return key, None
 
 
-def _refuse_a_failure_that_is_not_the_fault(key: str, document: dict[str, Any]) -> None:
+def _refuse_a_failure_that_is_not_the_fault(key: str, document: dict[str, object]) -> None:
     """A FAILED probe manifest is not automatically evidence of the fault it
     was launched to induce (`alpha-engine-config-I10367` deliverable 3).
 
@@ -476,7 +476,7 @@ def _refuse_a_failure_that_is_not_the_fault(key: str, document: dict[str, Any]) 
 
 def _absorbed_evidence(
     store: Store, target_job: str, trading_day: str, run_id: str
-) -> tuple[str, dict[str, Any]]:
+) -> tuple[str, dict[str, object]]:
     """The OK manifest an `absorbed` record describes, plus the `attempts[]`
     row recording the declared-transient-class retry that made it ok.
 
@@ -503,18 +503,19 @@ def _absorbed_evidence(
             "without the attempt ladder predates the guarantee this record reads and is "
             "not evidence of an absorption."
         )
+    # Raw manifest JSON: `isinstance` narrows `attempts` and each row only to a
+    # list / dict of unknown members, so their JSON value types are stated here.
+    attempt_list = cast("list[object]", attempts)
+    attempt_rows = [cast("dict[str, object]", a) for a in attempt_list if isinstance(a, dict)]
     retries = [
-        a
-        for a in attempts
-        if isinstance(a, dict)
-        and isinstance(a.get("n"), int)
-        and a["n"] > 1
-        and a.get("reason") in TRANSIENT_RETRY_REASONS
+        (n, a)
+        for a in attempt_rows
+        if isinstance(n := a.get("n"), int) and n > 1 and a.get("reason") in TRANSIENT_RETRY_REASONS
     ]
     if not retries:
-        reasons = [a.get("reason") for a in attempts if isinstance(a, dict)]
+        reasons = [a.get("reason") for a in attempt_rows]
         raise FaultRecordRefusedError(
-            f"{key} records {len(attempts)} attempt(s) with reason(s) {reasons} and not "
+            f"{key} records {len(attempt_list)} attempt(s) with reason(s) {reasons} and not "
             "one retry in the declared transient class "
             f"({sorted(TRANSIENT_RETRY_REASONS)}). An `ok` manifest with no retry is a "
             "clean first-attempt run: it is evidence the job worked, never evidence a "
@@ -523,7 +524,8 @@ def _absorbed_evidence(
     # The LAST retry, when a future MAX_ATTEMPTS allows more than one: the
     # attempt that actually carried the run to `ok` is the one this record is
     # about.
-    return key, dict(max(retries, key=lambda a: int(a["n"])))
+    _, last_retry = max(retries, key=lambda retry: retry[0])
+    return key, dict(last_retry)
 
 
 def _validate_bus_key(store: Store, bus_key: str) -> None:
@@ -615,7 +617,7 @@ def record_fault(
         )
 
     manifest_key: str | None = None
-    attempt: dict[str, Any] | None = None
+    attempt: dict[str, object] | None = None
     closed_paths: list[dict[str, str]] | None = None
 
     if outcome == "unreachable":
@@ -662,7 +664,7 @@ def record_fault(
                 )
             manifest_key, attempt = _absorbed_evidence(store, target_job, trading_day, run_id)
 
-    document: dict[str, Any] = {
+    document: dict[str, object] = {
         "schema_version": FAULT_RECORD_SCHEMA_VERSION,
         "fault_id": fault_id,
         "outcome": outcome,

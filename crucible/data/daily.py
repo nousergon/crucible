@@ -43,7 +43,7 @@ import datetime as dt
 import json
 import math
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, cast
 
 from crucible.calendar import assert_trading_day
 from crucible.data.point_in_time import GROUP_COVERAGE_FLOOR_RATIO, PointInTimeSource
@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     import pandas as pd
 
     from crucible.runner import RunContext
+    from crucible.store import Store
 
 __all__ = [
     "CALENDAR_DAYS_PER_TRADING_DAY",
@@ -182,7 +183,7 @@ def run_daily(
     expected_symbols: list[str] | None = None,
     coverage_floor: float = COVERAGE_FLOOR_RATIO,
     strategy_dir: Path | str | None = None,
-) -> dict[str, Any]:
+) -> dict[str, object]:
     """Compile the day. Called through `crucible.runner.run_job`, never directly.
 
     ``expected_symbols`` is the denominator of the coverage ratio, and it is
@@ -267,7 +268,9 @@ def run_daily(
         }
     )
 
-    day_rows = panel[panel["trading_day"] == trading_day]
+    # pandas ships no stubs: a boolean-mask `__getitem__` and a column read are
+    # typed as unions of unknowns, so the frame / column they return is stated.
+    day_rows = cast("pd.DataFrame", panel[panel["trading_day"] == trading_day])
     if day_rows.empty:
         raise MissingSourceError(
             f"source {source.name!r} returned a panel with NO rows for {trading_day} "
@@ -276,7 +279,7 @@ def run_daily(
             "feed — not an empty market, and not something to carry forward."
         )
 
-    observed = sorted(str(t) for t in day_rows["ticker"].unique())
+    observed = sorted(str(t) for t in cast("pd.Series", day_rows["ticker"]).unique())
     expected = sorted(set(expected_symbols))
     coverage_ratio: float = len(observed) / len(expected)
     absent = sorted(set(expected) - set(observed))
@@ -287,7 +290,7 @@ def run_daily(
     if absent:
         ctx.record_rejected("no close on the trading day", len(absent))
 
-    panel_sessions = int(panel["trading_day"].nunique())
+    panel_sessions = int(cast("pd.Series", panel["trading_day"]).nunique())
     ctx.record_metric(
         {
             "name": "panel_depth_trading_days",
@@ -378,8 +381,12 @@ def run_daily(
             lookback_days=lookback_days,
             symbols=extra_panel_symbols,
         )
-        extra_day_rows = extra_panel[extra_panel["trading_day"] == trading_day]
-        extra_observed_today = {str(t) for t in extra_day_rows["ticker"].unique()}
+        extra_day_rows = cast(
+            "pd.DataFrame", extra_panel[extra_panel["trading_day"] == trading_day]
+        )
+        extra_observed_today = {
+            str(t) for t in cast("pd.Series", extra_day_rows["ticker"]).unique()
+        }
         extra_missing_today = sorted(set(extra_panel_symbols) - extra_observed_today)
         if extra_missing_today:
             raise MissingSourceError(
@@ -451,7 +458,7 @@ def run_daily(
         schema_version="feature_registry.v1",
     )
 
-    coverage = {
+    coverage: dict[str, object] = {
         "schema_version": "coverage.v1",
         "trading_day": trading_day.isoformat(),
         "source": source.name,
@@ -478,7 +485,7 @@ def run_daily(
     return coverage
 
 
-def _declared_in_window(store: Any, *, window_start: dt.date, end: dt.date) -> set[str]:
+def _declared_in_window(store: Store, *, window_start: dt.date, end: dt.date) -> set[str]:
     """Every symbol a declared universe RECORDED for a session inside
     ``(window_start, end)`` named — ``end`` itself excluded, since that day's
     declaration is the run's own ``expected_symbols``.
@@ -546,7 +553,7 @@ def _with_departed_history(
         lookback_days=lookback_days,
         symbols=sorted(candidates - already),
     )
-    tickers = sorted(str(t) for t in departed.panel["ticker"].unique())
+    tickers = sorted(str(t) for t in cast("pd.Series", departed.panel["ticker"]).unique())
     without = sorted(departed.without_history)
     for name, names, reason in (
         (
