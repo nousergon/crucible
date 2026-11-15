@@ -65,7 +65,7 @@ crash).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, cast
 
 from crucible.documents import UnreadableDocumentError, read_store_document
 from crucible.features.boundaries import DECLARED_SOURCE_BOUNDARIES, explain_dead_columns
@@ -634,7 +634,8 @@ def check_feature_layer_provenance(
             unreadable.append(day)
             continue
         record = outcome.document or {}
-        source = (record.get("point_in_time") or {}).get("source")
+        point_in_time = cast("dict[str, object]", record.get("point_in_time") or {})
+        source = point_in_time.get("source")
         found.setdefault(str(source), []).append(day)
 
     sources = {name: tuple(days) for name, days in sorted(found.items())}

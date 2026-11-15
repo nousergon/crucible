@@ -44,8 +44,8 @@ import socket
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator
-from typing import Any
+from collections.abc import Callable, Generator, Mapping
+from dataclasses import dataclass
 
 from crucible.documents import UnreadableDocumentError, load_store_document
 from crucible.keys import DAILY_CHAIN_LOCK_KEY
@@ -127,7 +127,7 @@ def default_holder(job: str) -> str:
     return f"{job}@{socket.gethostname()}:{os.getpid()}:{os.urandom(4).hex()}"
 
 
-def _read_lease(store: Store) -> tuple[str, dict[str, Any] | None]:
+def _read_lease(store: Store) -> tuple[str, dict[str, object] | None]:
     """``(token, document)`` at the lease key; ``(ETAG_ABSENT, None)`` if absent.
 
     A document that does not parse is returned as ``{}``: it has no expiry, so
@@ -143,7 +143,7 @@ def _read_lease(store: Store) -> tuple[str, dict[str, Any] | None]:
         return token, {}
 
 
-def _is_free(document: dict[str, Any] | None, now: dt.datetime) -> bool:
+def _is_free(document: dict[str, object] | None, now: dt.datetime) -> bool:
     if document is None or document.get("released_utc"):
         return True
     try:
@@ -189,7 +189,7 @@ def daily_chain_lock(
     poll_s: float = LOCK_POLL_S,
     clock: Callable[[], dt.datetime] = _now,
     sleep: Callable[[float], None] = time.sleep,
-) -> Iterator[str]:
+) -> Generator[str]:
     """Hold the fleet-wide daily-chain lease for the body of the ``with``.
 
     Acquire is a compare-and-swap on the lease key's version: create it when
@@ -235,14 +235,19 @@ def daily_chain_lock(
             )
         sleep(poll_s)
 
-    state = {"token": token, "lost": None}
+    @dataclass
+    class _LeaseState:
+        token: str
+        lost: str | None
+
+    state = _LeaseState(token=token, lost=None)
     guard = threading.Lock()
     stop = threading.Event()
 
     def _renew() -> None:
         while not stop.wait(lease.total_seconds() / _RENEW_FRACTION):
             with guard:
-                if state["lost"]:
+                if state.lost:
                     return
                 body = _lease_body(
                     holder=holder,
@@ -253,11 +258,9 @@ def daily_chain_lock(
                     lease=lease,
                 )
                 try:
-                    state["token"] = store.compare_and_swap(
-                        DAILY_CHAIN_LOCK_KEY, state["token"], body
-                    )
+                    state.token = store.compare_and_swap(DAILY_CHAIN_LOCK_KEY, state.token, body)
                 except PointerConflictError as exc:
-                    state["lost"] = str(exc)
+                    state.lost = str(exc)
                     print(f"daily-chain lease LOST by {holder}: {exc}", file=sys.stderr)
                     return
                 except Exception as exc:  # noqa: BLE001 - reported, retried next beat
@@ -278,7 +281,7 @@ def daily_chain_lock(
         stop.set()
         renewer.join()
         with guard:
-            lost = state["lost"]
+            lost = state.lost
             if not lost:
                 released = json.loads(
                     _lease_body(
@@ -294,7 +297,7 @@ def daily_chain_lock(
                 try:
                     store.compare_and_swap(
                         DAILY_CHAIN_LOCK_KEY,
-                        state["token"],
+                        state.token,
                         json.dumps(released, indent=2, sort_keys=True).encode("utf-8"),
                     )
                 except PointerConflictError as exc:
@@ -332,7 +335,7 @@ def run_serve_chain(
     run_mode: str | None,
     dry_run: bool = False,
     main: Callable[[list[str]], int] | None = None,
-    servers: dict[str, Any] | None = None,
+    servers: Mapping[str, object] | None = None,
 ) -> dict[str, int]:
     """Run `serve.daily --skip-if-ok` for every slot, in :data:`DAILY_CHAIN_SERVE_ORDER`.
 

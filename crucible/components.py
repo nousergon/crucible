@@ -26,10 +26,11 @@ late on a Friday or before a holiday.
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal, cast
 from zoneinfo import ZoneInfo
 
 import yaml
@@ -196,6 +197,7 @@ class Deadline:
         """
         assert_trading_day(trading_day, context=f"deadline anchor {self.anchor}")
         if self.anchor == "close_plus":
+            assert self.offset_hours is not None  # narrowed by __post_init__
             base = dt.datetime.combine(trading_day, REGULAR_CLOSE, tzinfo=NYSE_TZ)
             return (base + dt.timedelta(hours=float(self.offset_hours))).astimezone(dt.UTC)
         if self.anchor == "next_open_plus":
@@ -203,6 +205,7 @@ class Deadline:
             # Monday's open, and a Monday holiday moves it to Tuesday's, so a
             # weekend or a holiday raises no page without anyone muting it.
             session = next_trading_day(trading_day)
+            assert self.offset_hours is not None  # narrowed by __post_init__
             base = dt.datetime.combine(session, REGULAR_OPEN, tzinfo=NYSE_TZ)
             return (base + dt.timedelta(hours=float(self.offset_hours))).astimezone(dt.UTC)
         # next_calendar_day_at. Calendar, deliberately: this is a wall-clock
@@ -236,10 +239,10 @@ class Deadline:
         return f"{self.at.strftime('%H:%M')} ET the calendar day after trading day {day} ({every})"
 
     @classmethod
-    def from_yaml(cls, raw: dict[str, Any] | None) -> Deadline | None:
+    def from_yaml(cls, raw: Mapping[str, object] | None) -> Deadline | None:
         if raw is None:
             return None
-        at = raw.get("at")
+        at = cast("str | None", raw.get("at"))
         if "cadence" not in raw:
             # `raw["cadence"]`'s own KeyError would name the key and nothing
             # else. A deadline row that predates this field is the exact state
@@ -251,9 +254,9 @@ class Deadline:
                 "how eight weekly rows came to page ABSENCE four times a week."
             )
         return cls(
-            anchor=raw["anchor"],
-            cadence=raw["cadence"],
-            offset_hours=raw.get("offset_hours"),
+            anchor=cast("Anchor", raw["anchor"]),
+            cadence=cast("Cadence", raw["cadence"]),
+            offset_hours=cast("float | None", raw.get("offset_hours")),
             at=dt.time.fromisoformat(at) if at else None,
         )
 
@@ -272,7 +275,7 @@ class Component:
     lifecycle: str
     signals: dict[str, str | None]
     log_location: str
-    log_retention_days: int
+    log_retention_days: int | Literal["forever"]
     alert_channel: str
     console_surface: str
     artifact_retention: str
