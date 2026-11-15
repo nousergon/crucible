@@ -69,7 +69,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import NotRequired, Protocol, TypedDict, Unpack, cast
 
 from crucible.tags import TAG_KEY, TAG_VALUE
 
@@ -134,9 +134,60 @@ DEFAULT_CE_CALL_BUDGET = 25
 DEFAULT_CE_OPEN_WINDOW_TTL_SECONDS = 900
 
 
+class _TimePeriod(TypedDict):
+    Start: str
+    End: str
+
+
+class _TagValues(TypedDict):
+    Key: str
+    Values: list[str]
+
+
+class _TagFilter(TypedDict):
+    Tags: _TagValues
+
+
+class _CostRequest(TypedDict):
+    """The `ce:GetCostAndUsage` request shape this module builds."""
+
+    TimePeriod: _TimePeriod
+    Granularity: str
+    Metrics: NotRequired[list[str]]
+    Filter: NotRequired[_TagFilter]
+
+
+class _MetricAmount(TypedDict, total=False):
+    Amount: str
+    Unit: str
+
+
+class _PeriodTotal(TypedDict, total=False):
+    UnblendedCost: _MetricAmount
+
+
+class _ResultByTime(TypedDict, total=False):
+    TimePeriod: _TimePeriod
+    Total: _PeriodTotal
+    Estimated: bool
+
+
+class CostResponse(TypedDict, total=False):
+    """The part of a `ce:GetCostAndUsage` response this module reads."""
+
+    ResultsByTime: list[_ResultByTime]
+
+
+class SpendClient(Protocol):
+    """The one call every reader here makes: a Cost Explorer client, or
+    :class:`CollectorSpendClient` answering the same request shape."""
+
+    def get_cost_and_usage(self, **request: Unpack[_CostRequest]) -> CostResponse: ...
+
+
 @dataclass
 class _CacheEntry:
-    value: Any
+    value: object
     fetched_monotonic: float
     closed: bool
 
@@ -174,7 +225,7 @@ class CostExplorerCache:
         self._budget = budget
         self._ttl = open_window_ttl_seconds
         self._clock = clock
-        self._store: dict[tuple[Any, ...], _CacheEntry] = {}
+        self._store: dict[tuple[object, ...], _CacheEntry] = {}
         self._calls = 0
         self._lock = threading.Lock()
 
@@ -200,12 +251,16 @@ class CostExplorerCache:
         """
         return end < self._clock()
 
-    def get_or_fetch(self, key: tuple[Any, ...], *, closed: bool, fetch: Callable[[], Any]) -> Any:
+    def get_or_fetch[T](
+        self, key: tuple[object, ...], *, closed: bool, fetch: Callable[[], T]
+    ) -> T:
         with self._lock:
             entry = self._store.get(key)
             if entry is not None:
                 if entry.closed or (time.monotonic() - entry.fetched_monotonic) < self._ttl:
-                    return entry.value
+                    # One key is one request, so the cached value is what this
+                    # key's `fetch` returned when it was stored.
+                    return cast("T", entry.value)
             if self._calls >= self._budget:
                 raise CostExplorerBudgetExceededError(
                     f"Cost Explorer call budget of {self._budget} exhausted for this "
@@ -222,7 +277,7 @@ class CostExplorerCache:
             )
             return value
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self) -> dict[str, object]:
         """Every cached reading's key and closedness, for a caller that wants
         to persist this process's Cost Explorer activity onto a run manifest
         or other durable artifact, rather than re-deriving it from CloudTrail."""
@@ -286,7 +341,7 @@ class CostReading:
     def scope(self) -> str:
         return self.tag_filter or "the whole account"
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "start": self.start.isoformat(),
             "end": self.end.isoformat(),
@@ -317,7 +372,7 @@ class DailyReading:
     def total_usd(self) -> float:
         return sum(self.amounts_usd)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "start": self.start.isoformat(),
             "end": self.end.isoformat(),
@@ -352,7 +407,7 @@ class ClosedMonthReading:
     def scope(self) -> str:
         return self.tag_filter or "the whole account"
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "start": self.start.isoformat(),
             "end": self.end.isoformat(),
@@ -393,6 +448,46 @@ EXPENSES_URI_VAR = "CRUCIBLE_EXPENSES_URI"
 EXPENSES_MAX_AGE = dt.timedelta(hours=36)
 
 
+class _S3Body(Protocol):
+    def read(self) -> bytes: ...
+
+
+class _S3Reader(Protocol):
+    """The one S3 call :class:`CollectorSpendClient` makes."""
+
+    def get_object(self, *, Bucket: str, Key: str) -> Mapping[str, _S3Body]: ...
+
+
+class _SeriesDay(TypedDict):
+    date: str
+    estimated: NotRequired[bool]
+    by_system_usd: NotRequired[dict[str, float]]
+
+
+class _DailyBySystem(TypedDict, total=False):
+    tag_key: str
+    complete: bool
+    days: list[_SeriesDay]
+
+
+class _AwsDetail(TypedDict, total=False):
+    daily_by_system: _DailyBySystem
+    daily_by_system_error: str
+    cost_allocation: dict[str, object]
+
+
+class _Provider(TypedDict, total=False):
+    key: str
+    detail: _AwsDetail
+
+
+class _ExpensesRollup(TypedDict):
+    """The part of `expenses/latest.json` :class:`CollectorSpendClient` reads."""
+
+    as_of: str
+    providers: NotRequired[list[_Provider]]
+
+
 class CollectorSpendClient:
     """Answers this module's `get_cost_and_usage` request shapes from the
     expense collector's per-system daily series, with no Cost Explorer call
@@ -416,19 +511,20 @@ class CollectorSpendClient:
         self,
         uri: str,
         *,
-        s3: Any = None,
+        s3: _S3Reader | None = None,
         now: Callable[[], dt.datetime] | None = None,
         max_age: dt.timedelta = EXPENSES_MAX_AGE,
     ) -> None:
         if not uri.startswith("s3://") or "/" not in uri[len("s3://") :]:
             raise CostUnreadableError(f"{EXPENSES_URI_VAR} is not an s3://bucket/key URI: {uri!r}")
         self._bucket, self._key = uri[len("s3://") :].split("/", 1)
-        self._s3 = s3
+        # `object`, not `_S3Reader`: `_load` may store an untyped boto3 client here.
+        self._s3: object = s3
         self._now = now or (lambda: dt.datetime.now(dt.UTC))
         self._max_age = max_age
-        self._days: dict[dt.date, dict[str, Any]] | None = None
+        self._days: dict[dt.date, _SeriesDay] | None = None
         self._scope: str | None = None
-        self._allocation: dict[str, Any] | None = None
+        self._allocation: dict[str, object] | None = None
         self._allocated_amounts: dict[dt.date, float] | None = None
 
     @property
@@ -450,7 +546,7 @@ class CollectorSpendClient:
         scoped._allocated_amounts = None
         return scoped
 
-    def _load(self) -> dict[dt.date, dict[str, Any]]:
+    def _load(self) -> dict[dt.date, _SeriesDay]:
         if self._days is not None:
             return self._days
         import json  # noqa: PLC0415 - only this path parses the rollup
@@ -459,8 +555,9 @@ class CollectorSpendClient:
             import boto3  # noqa: PLC0415 - lazy for the reason default_client gives
 
             self._s3 = boto3.client("s3")
-        body = self._s3.get_object(Bucket=self._bucket, Key=self._key)["Body"].read()
-        doc = json.loads(body)
+        s3 = cast(_S3Reader, self._s3)
+        body = s3.get_object(Bucket=self._bucket, Key=self._key)["Body"].read()
+        doc: _ExpensesRollup = json.loads(body)
         as_of = dt.datetime.fromisoformat(doc["as_of"])
         if self._now() - as_of > self._max_age:
             raise CostUnreadableError(
@@ -566,7 +663,7 @@ class CollectorSpendClient:
         )
         return amount, bool(entry.get("estimated", False))
 
-    def get_cost_and_usage(self, **request: Any) -> dict[str, Any]:
+    def get_cost_and_usage(self, **request: Unpack[_CostRequest]) -> CostResponse:
         start = dt.date.fromisoformat(request["TimePeriod"]["Start"])
         end = dt.date.fromisoformat(request["TimePeriod"]["End"])
         granularity = request["Granularity"]
@@ -592,7 +689,7 @@ class CollectorSpendClient:
             segments.append((cursor, nxt))
             cursor = nxt
 
-        periods = []
+        periods: list[_ResultByTime] = []
         for seg_start, seg_end in segments:
             total, estimated, day = 0.0, False, seg_start
             while day < seg_end:
@@ -609,7 +706,7 @@ class CollectorSpendClient:
             )
         return {"ResultsByTime": periods}
 
-    def list_cost_allocation_tags(self, **request: Any) -> dict[str, Any]:
+    def list_cost_allocation_tags(self, **request: object) -> dict[str, list[dict[str, str]]]:
         """Activation, established from evidence rather than asked for.
 
         Cost Explorer indexes spend under a tag key only once Billing has
@@ -630,7 +727,7 @@ class CollectorSpendClient:
         )
 
 
-def default_client() -> Any:
+def default_client() -> CollectorSpendClient:
     """The spend source the gate reads: :class:`CollectorSpendClient` over
     the rollup `CRUCIBLE_EXPENSES_URI` names. Never a Cost Explorer client
     (`alpha-engine-config-I11707`).
@@ -648,7 +745,7 @@ def default_client() -> Any:
 
 
 def month_to_date_usd(
-    client: Any,
+    client: SpendClient,
     *,
     today: dt.date,
     tagged: bool,
@@ -684,7 +781,7 @@ def month_to_date_usd(
 
 
 def trailing_daily_usd(
-    client: Any,
+    client: SpendClient,
     *,
     today: dt.date,
     days: int,
@@ -722,7 +819,7 @@ def trailing_daily_usd(
 
 
 def closed_month_usd(
-    client: Any,
+    client: SpendClient,
     *,
     today: dt.date,
     tagged: bool,
@@ -753,7 +850,7 @@ def closed_month_usd(
 
 
 def _single_period(
-    client: Any,
+    client: SpendClient,
     *,
     start: dt.date,
     end: dt.date,
@@ -795,14 +892,14 @@ def _single_period(
 
 
 def _get_cost_and_usage(
-    client: Any,
+    client: SpendClient,
     *,
     start: dt.date,
     end: dt.date,
     granularity: str,
     tagged: bool,
     cache: CostExplorerCache | None,
-) -> dict[str, Any]:
+) -> CostResponse:
     """The cached, budgeted `ce:GetCostAndUsage` call shared by every reader.
 
     One request builder for both `_amounts` and `_single_period` — they
@@ -817,7 +914,7 @@ def _get_cost_and_usage(
     today) is memoized with a TTL. See `CostExplorerCache`.
     """
     cache = cache or default_cache()
-    request: dict[str, Any] = {
+    request: _CostRequest = {
         "TimePeriod": {"Start": start.isoformat(), "End": end.isoformat()},
         "Granularity": granularity,
         "Metrics": ["UnblendedCost"],
@@ -833,7 +930,7 @@ def _get_cost_and_usage(
         tagged,
     )
 
-    def fetch() -> dict[str, Any]:
+    def fetch() -> CostResponse:
         try:
             return client.get_cost_and_usage(**request)
         except Exception as exc:
@@ -855,7 +952,7 @@ def _get_cost_and_usage(
 
 
 def _amounts(
-    client: Any,
+    client: SpendClient,
     *,
     start: dt.date,
     end: dt.date,
