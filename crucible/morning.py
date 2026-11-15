@@ -89,7 +89,7 @@ import datetime as dt
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeGuard, cast
 from zoneinfo import ZoneInfo
 
 from nousergon_lib.gates import report
@@ -522,7 +522,7 @@ class MorningInputs:
     #: checkout: that would print the branch the job ran from as though it
     #: were `main`'s reading (`alpha-engine-config-I9902` builds the
     #: producer).
-    acceptance: dict[str, Any] | None
+    acceptance: dict[str, object] | None
     #: A presigned GET on `board/index.html`, or `None` when there is no page
     #: to link to (`BOARD_URL_UNAVAILABLE` says so in the message). The
     #: message is a POINTER; this is what it points at.
@@ -552,7 +552,17 @@ class MorningInputs:
     #: board is compared against it: a board rendered BEFORE the day's gate
     #: reading is stale however young it is.
     ladder_generated_utc: str | None = None
-    ladder_reason: str = "the ladder was not read by this caller"
+    ladder_reason: str | None = "the ladder was not read by this caller"
+
+
+def _is_object(value: object) -> TypeGuard[dict[str, object]]:
+    """A JSON object read from a stored document (string keys by construction)."""
+    return isinstance(value, dict)
+
+
+def _is_clause_list(value: object) -> TypeGuard[list[dict[str, object]]]:
+    """A board row's `clauses`: a list, whose entries the board writes as objects."""
+    return isinstance(value, list)
 
 
 def _client_error_code(exc: BaseException) -> str | None:
@@ -566,10 +576,15 @@ def _client_error_code(exc: BaseException) -> str | None:
     (`crucible.store`'s own precedent): `crucible --help` and every unit
     test that never touches S3 should not need the SDK on the import path.
     """
-    from botocore.exceptions import BotoCoreError, ClientError  # noqa: PLC0415 - lazy on purpose
+    from botocore.exceptions import (  # pyright: ignore[reportMissingTypeStubs]  # noqa: PLC0415 - lazy on purpose; dependency has no stubs
+        BotoCoreError,
+        ClientError,
+    )
 
     if isinstance(exc, ClientError):
-        return str(exc.response.get("Error", {}).get("Code", "")) or type(exc).__name__
+        # JSON-like error response boundary.
+        response = cast("dict[str, dict[str, object]]", exc.response)
+        return str(response.get("Error", {}).get("Code", "")) or type(exc).__name__
     if isinstance(exc, BotoCoreError):
         return type(exc).__name__
     return None
@@ -592,7 +607,7 @@ class _OneReader:
     def __init__(self, store: Store) -> None:
         self._store = store
 
-    def get_json(self, key: str) -> dict[str, Any]:
+    def get_json(self, key: str) -> dict[str, object]:
         return load_store_document(self._store, key)
 
 
@@ -872,12 +887,12 @@ def _phase_table_rows(board: dict[str, Any]) -> list[str]:
     out: list[str] = []
     for row in rows:
         clauses = row.get("clauses")
-        if isinstance(clauses, list) and clauses:
+        if _is_clause_list(clauses) and clauses:
             met = sum(1 for c in clauses if c.get("met"))
             unmet = [str(c.get("name", "?")) for c in clauses if not c.get("met")]
             holding = _md_cell(_plain_withhold(", ".join(unmet))) if unmet else ""
             out.append(f"| {row['id']} | {row['state']} | {met}/{len(clauses)} | {holding} |")
-        elif isinstance(clauses, list):
+        elif _is_clause_list(clauses):
             # Read, and it declares nothing. `0/0` would read as a measurement.
             out.append(
                 f"| {row['id']} | {row['state']} | no clauses | this gate measured nothing |"
@@ -944,7 +959,9 @@ def _moved_lines_plain(inputs: MorningInputs) -> list[str]:
     return lines
 
 
-def _defer_not_yet_due(was_row: dict[str, Any] | None, now_row: dict[str, Any] | None) -> bool:
+def _defer_not_yet_due(
+    was_row: dict[str, object] | None, now_row: dict[str, object] | None
+) -> bool:
     """`alpha-engine-config-I10872`'s schedule-phase predicate, over whole rows.
 
     A row whose `component_state` is RUNNING or ARMED in EITHER board is set
@@ -954,8 +971,8 @@ def _defer_not_yet_due(was_row: dict[str, Any] | None, now_row: dict[str, Any] |
     field existed) is always a move.
     """
     return not_yet_due(
-        was_row.get("component_state") if was_row else None,
-        now_row.get("component_state") if now_row else None,
+        cast("str | None", was_row.get("component_state")) if was_row else None,
+        cast("str | None", now_row.get("component_state")) if now_row else None,
     )
 
 
@@ -988,7 +1005,7 @@ def _moved_count(inputs: MorningInputs) -> str:
     return str(result.count)
 
 
-def _acceptance_line(reading: dict[str, Any] | None, *, denied_code: str | None) -> str:
+def _acceptance_line(reading: dict[str, object] | None, *, denied_code: str | None) -> str:
     """§12 rule 3's one progress figure — read, honestly absent, or denied.
 
     A reading missing any of the four fields the producer contract declares
@@ -1022,7 +1039,7 @@ def _acceptance_line(reading: dict[str, Any] | None, *, denied_code: str | None)
 
 
 def _acceptance_lines_plain(
-    reading: dict[str, Any] | None, *, denied_code: str | None
+    reading: dict[str, object] | None, *, denied_code: str | None
 ) -> list[str]:
     """The acceptance count, then the clause ids behind it, for the full update.
 
@@ -1221,7 +1238,7 @@ def render_message(
         clauses = row.get("clauses")
         fraction = (
             f"{sum(1 for c in clauses if c.get('met'))}/{len(clauses)}"
-            if isinstance(clauses, list) and clauses
+            if _is_clause_list(clauses) and clauses
             else "—"
         )
         state = report.escape(str(row.get("state")))
@@ -1281,7 +1298,8 @@ def _krepis_publish(*args: Any, **kwargs: Any) -> Any:
     every unit test and every laptop run import this module, and none of them
     should pull an SNS/HTTP client onto the import path.
     """
-    from krepis.alerts import publish  # noqa: PLC0415 - lazy on purpose
+    # krepis's signature carries a bare `dict` parameter.
+    from krepis.alerts import publish  # pyright: ignore[reportUnknownVariableType]  # noqa: PLC0415 - lazy on purpose
 
     return publish(*args, **kwargs)
 
@@ -1339,7 +1357,7 @@ def _tracker_repo() -> str:
 def deliver(
     message: str,
     *,
-    transport: Callable[..., Any] | None = None,
+    transport: Callable[..., object] | None = None,
     console_artifact: str | None = None,
 ) -> str:
     """Send ``message`` on the operator channel. Returns the destination.
@@ -1418,7 +1436,8 @@ def deliver(
         message,
         severity=DELIVERY_SEVERITY,
         source=DELIVERY_SOURCE,
-        console_artifact=console_artifact,
+        # The lib declares `str`; a caller naming no artifact passes `None` through unchanged.
+        console_artifact=console_artifact,  # pyright: ignore[reportArgumentType]
         destination=_operator_chat(),
         parse_mode="HTML",
         transport=transport if transport is not None else _krepis_publish,
@@ -1516,21 +1535,23 @@ _HISTORY_PHASE_IDS: tuple[str, ...] = tuple(p.id for p in PHASES)
 
 def _history_row_payload(
     inputs: MorningInputs, *, now: dt.datetime, comment_url: str
-) -> dict[str, Any]:
+) -> dict[str, object]:
     """The compact facts one delivery contributes to the history index.
 
     Built from the SAME `inputs` the full update and the headline render
     from — never a second read of the board — so the index cannot disagree
     with the comment it links to about what that day's board said.
     """
-    rows_by_id = {row.get("id"): row for row in inputs.board.get("rows", [])}
-    phases: list[dict[str, Any]] = []
+    rows_by_id = {
+        row.get("id"): row for row in cast("list[dict[str, object]]", inputs.board.get("rows", []))
+    }
+    phases: list[dict[str, object]] = []
     for phase in PHASES:
         row = rows_by_id.get(_PHASE_ROW_ID[phase.id])
         if row is None:
             continue
         clauses = row.get("clauses")
-        has_clauses = isinstance(clauses, list) and bool(clauses)
+        clause_rows = clauses if _is_clause_list(clauses) and clauses else None
         phases.append(
             {
                 # The BARE phase id ("phase0"), never the board's own
@@ -1539,8 +1560,10 @@ def _history_row_payload(
                 # whatever board.py happens to spell its row ids as.
                 "id": phase.id,
                 "state": row.get("state"),
-                "met": sum(1 for c in clauses if c.get("met")) if has_clauses else None,
-                "total": len(clauses) if has_clauses else None,
+                "met": (
+                    sum(1 for c in clause_rows if c.get("met")) if clause_rows is not None else None
+                ),
+                "total": len(clause_rows) if clause_rows is not None else None,
             }
         )
     parsed = (
@@ -1558,7 +1581,7 @@ def _history_row_payload(
     }
 
 
-def _read_history_rows(store: Store) -> list[tuple[str, dict[str, Any] | None, str]]:
+def _read_history_rows(store: Store) -> list[tuple[str, dict[str, object] | None, str]]:
     """Every `history_row.json` filed under `report.morning`'s manifest
     root, read through the guarded parser (`crucible.documents.read_document`
     — the one module allowed to parse store bytes as JSON, AGENTS.md rule 1).
@@ -1578,7 +1601,7 @@ def _read_history_rows(store: Store) -> list[tuple[str, dict[str, Any] | None, s
     same day replaces its row" means in practice.
     """
     prefix = runs_prefix(MORNING_JOB)
-    rows: list[tuple[str, dict[str, Any] | None, str]] = []
+    rows: list[tuple[str, dict[str, object] | None, str]] = []
     for key in sorted(store.list_keys(prefix)):
         if not key.endswith(f"/{HISTORY_ROW_BASENAME}"):
             continue
@@ -1595,7 +1618,7 @@ def _read_history_rows(store: Store) -> list[tuple[str, dict[str, Any] | None, s
     return rows
 
 
-def _phase_cell(phases: dict[str, dict[str, Any]], phase_id: str) -> str:
+def _phase_cell(phases: dict[str, dict[str, object]], phase_id: str) -> str:
     phase = phases.get(phase_id)
     if phase is None:
         return "—"
@@ -1614,7 +1637,7 @@ def render_history_body(store: Store, *, console_url: str | None = None) -> str:
     Read errors are named in their own row rather than dropped, for the same
     reason every other surface in this module never goes silent on a fault.
     """
-    latest: dict[str, dict[str, Any]] = {}
+    latest: dict[str, dict[str, object]] = {}
     faulted: dict[str, str] = {}
     for key, document, problem in _read_history_rows(store):
         # `key` segments: "runs", "report.morning", "{trading_day}", ...
@@ -1645,8 +1668,8 @@ def render_history_body(store: Store, *, console_url: str | None = None) -> str:
             )
             continue
         row = latest[day]
-        raw_phases = row.get("phases", [])
-        phases = {p["id"]: p for p in raw_phases if isinstance(p, dict)}
+        raw_phases = cast("list[object]", row.get("phases", []))
+        phases = {cast(str, p["id"]): p for p in raw_phases if _is_object(p)}
         # A day whose delivery recorded SOME phase facts, none of which match
         # a known phase id, is a LEGACY row -- written before this reader's
         # id-matching bug was fixed (`alpha-engine-config-I10123` follow-up:
