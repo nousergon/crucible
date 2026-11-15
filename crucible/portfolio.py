@@ -1264,6 +1264,13 @@ def solve_target_weights(
             budget=_optional_float(turnover_meta, "turnover_constraint_cap"),
             hard_exit=forced,
         )
+        # The governor asserts the cap the step was actually held to, which a
+        # forced move may have raised (see `_step_toward_aim`).
+        stepped_cap = aim_meta.get("turnover_budget_cap")
+        if turnover_meta.get("turnover_constraint_cap") is not None and isinstance(
+            stepped_cap, float
+        ):
+            turnover_meta["turnover_constraint_cap"] = stepped_cap
     weights, governor = _apply_turnover_governor(
         weights,
         w_prev,
@@ -2347,6 +2354,24 @@ def _step_toward_aim(
     # The day's budget still outranks the build: idle cash above the sleeve
     # is inside the mandatory floor, so an all-cash book always fits, but a
     # book held in the benchmark fill is built at the budget, as without k.
+    # The budget never starves a forced move (hard risk > timing). Pace 0 is
+    # exactly the forced moves -- cap trims, hard exits, and held names whose
+    # alpha went negative, each sold in full -- and the last of those is not in
+    # `_mandatory_turnover_floor`, which sees only the boxes. So the day's cap
+    # is raised to what pace 0 trades, the same rule that floor applies to the
+    # boxes: without it, a held name at the 25% position cap turning negative
+    # left no pace that fits a 20% budget and the governor raised, taking the
+    # whole session's book with it (alpha-engine-config-I13712).
+    configured_budget = budget
+    if budget is not None:
+        at_zero = step_at(0.0)
+        budget = max(float(budget), turnover(at_zero[0]) - at_zero[2])
+    budget_raised = (
+        configured_budget is not None
+        and budget is not None
+        and budget > float(configured_budget) + 1e-12
+    )
+
     applied = 1.0 if inception else rate
     step = step_at(applied)
     limited = not fits(step)
@@ -2376,6 +2401,10 @@ def _step_toward_aim(
         "aim_turnover_one_way": turnover(aim),
         "stepped_turnover_one_way": turnover(weights),
         "turnover_budget_cap": None if budget is None else float(budget),
+        "turnover_budget_configured_cap": (
+            None if configured_budget is None else float(configured_budget)
+        ),
+        "turnover_budget_raised_for_forced_moves": budget_raised,
         "cash_paced": not inception,
         "cash_held": float(prev[cash_idx]),
         "cash_aim": float(aim[cash_idx]),
