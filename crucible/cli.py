@@ -74,6 +74,7 @@ from crucible.track_a import add_track_a_arguments
 if TYPE_CHECKING:
     from crucible.migrate import V1ModelTree
     from crucible.runner import RunContext
+    from crucible.slots.arms import ArmSpec
     from crucible.store import Store
 
 __all__ = [
@@ -84,6 +85,8 @@ __all__ = [
     "build_parser",
     "is_stub",
     "main",
+    # The stub mechanism named in the module docstring; no job uses it today.
+    "_todo",
 ]
 
 
@@ -150,7 +153,7 @@ def _todo(job: str, track: str, note: str) -> Callable[[argparse.Namespace], int
     # CODE rather than from a list a track has to remember to edit. A
     # hard-coded exclusion list is itself the suppression-collection bug class
     # (§11.1): it goes stale in the direction of exempting more.
-    handler.is_stub = True  # type: ignore[attr-defined]
+    handler.__dict__["is_stub"] = True
     return handler
 
 
@@ -625,7 +628,7 @@ def _migrate_history(args: argparse.Namespace) -> int:
         )
     v1_store = read_only(store_from_uri(v1_uri), reason="migrate.history reads v1 read-only")
 
-    recipes = {}
+    recipes: dict[str, ArmSpec] = {}
     model_tree = None
     # `MIGRATABLE_SLOTS`, never a literal: `("u", "r")` was hardcoded here and
     # in the `run_migrate_history` call below, so the production path could not
@@ -1683,7 +1686,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return USAGE_EXIT_CODE
     finally:
-        if owns_ledger:
+        if owns_ledger and ledger is not None and provider_ledger is not None:
             # Rendered on the failure path too, deliberately: a rehearsal
             # that got three keys in and then raised is telling the operator
             # both things, and printing only on success would hide the half

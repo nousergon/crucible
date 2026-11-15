@@ -27,21 +27,47 @@ This module is a binding, not an implementation: the loop is
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, TypedDict, Unpack
 
 from crucible.config import Settings
 from crucible.keys import signals_key
 from crucible.slots.cycle import run_grade, run_produce, run_produce_history
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from nousergon_lib.arena.engine import ServingPrecondition
+    from nousergon_lib.arena.window import ArmSeries
+
     from crucible.runner import RunContext
+    from crucible.slots.arms import ArmSpec
 
 __all__ = ["SLOT", "grade", "produce", "produce_history"]
 
 SLOT = "r"
 
 
-def produce(ctx: RunContext, *, settings: Settings, **kwargs: Any) -> dict[str, Any]:
+class _ProduceKwargs(TypedDict, total=False):
+    """The keywords `run_produce` and `run_produce_history` take beyond the binding's own."""
+
+    arm_name: str | None
+    feature_version: str
+
+
+class _GradeKwargs(TypedDict, total=False):
+    """The keywords :func:`crucible.slots.cycle.run_grade` takes beyond the binding's own."""
+
+    horizon_trading_days: int
+    feature_version: str
+    specs: Sequence[ArmSpec] | None
+    preconditions: dict[str, list[ServingPrecondition]] | None
+    series: dict[str, ArmSeries] | None
+    settled_dates: Sequence[str] | None
+
+
+def produce(
+    ctx: RunContext, *, settings: Settings, **kwargs: Unpack[_ProduceKwargs]
+) -> dict[str, object]:
     """Run every registered R arm's selection for one trading day."""
     return run_produce(
         ctx,
@@ -52,7 +78,9 @@ def produce(ctx: RunContext, *, settings: Settings, **kwargs: Any) -> dict[str, 
     )
 
 
-def produce_history(ctx: RunContext, *, settings: Settings, **kwargs: Any) -> dict[str, Any]:
+def produce_history(
+    ctx: RunContext, *, settings: Settings, **kwargs: Unpack[_ProduceKwargs]
+) -> dict[str, object]:
     """Produce the selected R arm for ONE historical session. Serves nothing.
 
     `experiment.backfill`'s per-session entry point
@@ -63,6 +91,8 @@ def produce_history(ctx: RunContext, *, settings: Settings, **kwargs: Any) -> di
     return run_produce_history(ctx, slot=SLOT, settings=settings, **kwargs)
 
 
-def grade(ctx: RunContext, *, settings: Settings, **kwargs: Any) -> dict[str, Any]:
+def grade(
+    ctx: RunContext, *, settings: Settings, **kwargs: Unpack[_GradeKwargs]
+) -> dict[str, object]:
     """Score every settled R selection and run the slot's arena cycle."""
     return run_grade(ctx, slot=SLOT, settings=settings, **kwargs)

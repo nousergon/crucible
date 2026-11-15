@@ -34,10 +34,13 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from nousergon_lib.arena import ArmRegister
+
     from crucible.features import PendingColumn
+    from crucible.slots.arms import ArmSpec
     from crucible.slots.inputs import InputRefusal
     from crucible.store import Store
 
@@ -83,7 +86,7 @@ def _catalog_columns() -> list[str]:
     return [feature.name for feature in CATALOG]
 
 
-def catalog_input_refusal(recipe: Any) -> InputRefusal | None:
+def catalog_input_refusal(recipe: ArmSpec) -> InputRefusal | None:
     """The catalogue refusal of one U/R ``recipe``, or ``None`` when it can run.
 
     The single-recipe face of :func:`crucible.slots.cycle.partition_by_catalog`
@@ -98,7 +101,7 @@ def catalog_input_refusal(recipe: Any) -> InputRefusal | None:
     return refused[0] if refused else None
 
 
-def catalog_refusal(recipe: Any) -> str | None:
+def catalog_refusal(recipe: ArmSpec) -> str | None:
     """Why a U/R ``recipe`` (an `ArmSpec`) cannot produce, or ``None``."""
     refusal = catalog_input_refusal(recipe)
     return refusal.reason if refusal else None
@@ -141,7 +144,7 @@ def pending_dependency(
     if refusal is None:
         return None
     produced = set(_catalog_columns() if catalog_columns is None else catalog_columns)
-    columns = []
+    columns: list[PendingColumn] = []
     for column in refusal.unresolvable:
         if column in produced or column not in PENDING_COLUMNS:
             return None
@@ -225,7 +228,9 @@ def release_arms(
     )
 
 
-def champion_refusal(arm_id: str, *, release: ReleaseArms, register: Any = None) -> str | None:
+def champion_refusal(
+    arm_id: str, *, release: ReleaseArms, register: ArmRegister | None = None
+) -> str | None:
     """Why the pointer's ``arm_id`` cannot produce under ``release``, or ``None``."""
     from crucible.slots import arm_name, get_slot, is_control_arm  # noqa: PLC0415 - avoids a cycle
 
