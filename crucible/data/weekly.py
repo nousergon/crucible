@@ -32,7 +32,7 @@ parameter that suppresses it.
 from __future__ import annotations
 
 import datetime as dt
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from crucible.calendar import assert_trading_day, is_trading_day
 from crucible.data.daily import DEFAULT_LOOKBACK_DAYS, run_daily
@@ -79,7 +79,7 @@ def run_weekly(
     point_in_time: PointInTimeSource,
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     expected_symbols: list[str] | None = None,
-) -> dict[str, Any]:
+) -> dict[str, object]:
     """Compile the week's last session, then assert the week has no gap.
 
     The order matters: the day is compiled FIRST, so a run whose own session

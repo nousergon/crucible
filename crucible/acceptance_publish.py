@@ -144,7 +144,7 @@ def acceptance_publish_body(ctx: RunContext, *, reading_path: Path) -> None:
 
 def acceptance_publish_handler(args: argparse.Namespace) -> int:
     """`crucible acceptance.publish --reading PATH [--store URI]`."""
-    from crucible.cli import _resolve_store
+    from crucible.cli import _resolve_store  # pyright: ignore[reportPrivateUsage]  # Shared CLI resolver.
     from crucible.runner import invocation_discriminator, run_job
 
     store = _resolve_store(args)

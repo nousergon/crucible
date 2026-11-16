@@ -1,15 +1,5 @@
 {
     "files": {
-        "./crucible/acceptance_publish.py": [
-            {
-                "code": "reportPrivateUsage",
-                "range": {
-                    "startColumn": 29,
-                    "endColumn": 43,
-                    "lineCount": 1
-                }
-            }
-        ],
         "./crucible/aggregation.py": [
             {
                 "code": "reportExplicitAny",
@@ -2666,16 +2656,6 @@
                 }
             }
         ],
-        "./crucible/data/heal.py": [
-            {
-                "code": "reportExplicitAny",
-                "range": {
-                    "startColumn": 15,
-                    "endColumn": 18,
-                    "lineCount": 1
-                }
-            }
-        ],
         "./crucible/data/point_in_time.py": [
             {
                 "code": "reportMissingTypeStubs",
@@ -4196,16 +4176,6 @@
                 "range": {
                     "startColumn": 75,
                     "endColumn": 81,
-                    "lineCount": 1
-                }
-            }
-        ],
-        "./crucible/data/weekly.py": [
-            {
-                "code": "reportExplicitAny",
-                "range": {
-                    "startColumn": 15,
-                    "endColumn": 18,
                     "lineCount": 1
                 }
             }
