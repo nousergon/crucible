@@ -68,14 +68,29 @@ import datetime as dt
 import json
 import re
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import TypedDict, cast
 
 from pydantic import ValidationError
 
 from crucible.gate import REVIEW_SCHEMA_VERSION
 from crucible.keys import REVIEWER_PATTERN, review_key
 from crucible.models import GitHubCommit, ReviewDocument
+from crucible.runner import RunContext
+
+
+class ReviewArtifact(TypedDict):
+    schema_version: str
+    phase: str
+    verdict: str
+    reviewer: str
+    authors: list[str]
+    pr_number: int
+    head_sha: str
+    summary: str
+    reviewed_at: str
+
 
 __all__ = [
     "COMMITS_ENDPOINT_CAP",
@@ -127,7 +142,7 @@ class ReviewError(RuntimeError):
     """
 
 
-def author_identities(commits: list[dict[str, Any]]) -> list[str]:
+def author_identities(commits: Sequence[object]) -> list[str]:
     """Every identity that authored ``commits``, lower-cased and sorted.
 
     Read out of the commits, never out of the dispatch. Three sources, unioned
@@ -204,12 +219,12 @@ def review_document(
     phase: str,
     verdict: str,
     reviewer: str,
-    commits: list[dict[str, Any]],
+    commits: Sequence[object],
     head_sha: str,
     pr_number: int,
     summary: str,
     reviewed_at: dt.datetime,
-) -> dict[str, Any]:
+) -> ReviewArtifact:
     """The artifact `crucible.gate._clause_independently_reviewed` reads.
 
     Every field it validates is produced here, so the producer and the consumer
@@ -225,7 +240,7 @@ def review_document(
             "not name what it reviewed grades nothing"
         )
     authors = author_identities(commits)
-    document = {
+    document: ReviewArtifact = {
         "schema_version": REVIEW_SCHEMA_VERSION,
         "phase": phase,
         "verdict": verdict,
@@ -252,7 +267,7 @@ def review_document(
     return document
 
 
-def record(ctx: Any, *, document: dict[str, Any]) -> str:
+def record(ctx: RunContext, *, document: ReviewArtifact) -> str:
     """File ``document`` through ``ctx`` and return its key.
 
     Takes a :class:`~crucible.runner.RunContext`, not a bare
@@ -299,14 +314,15 @@ def review_record_handler(args: argparse.Namespace) -> int:
     that may not record a verdict from ever holding a token that could write
     one.
     """
-    from crucible.cli import _resolve_store
+    # Internal job handlers share this store resolver; there is no public equivalent.
+    from crucible.cli import _resolve_store  # pyright: ignore[reportPrivateUsage]
     from crucible.runner import invocation_discriminator, run_job
 
     store = _resolve_store(args)
-    commits = json.loads(Path(args.commits).read_text(encoding="utf-8"))
+    commits = cast(list[object], json.loads(Path(args.commits).read_text(encoding="utf-8")))
     printed: list[str] = []
 
-    def job(ctx: Any) -> None:
+    def job(ctx: RunContext) -> None:
         document = review_document(
             phase=args.phase,
             verdict=args.verdict,
@@ -378,7 +394,7 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     try:
-        commits = json.loads(Path(args.commits).read_text(encoding="utf-8"))
+        commits = cast(list[object], json.loads(Path(args.commits).read_text(encoding="utf-8")))
         if args.command == "authors":
             print("\n".join(author_identities(commits)))
             return 0
