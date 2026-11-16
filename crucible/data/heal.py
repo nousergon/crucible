@@ -51,7 +51,7 @@ import datetime as dt
 import json
 import urllib.error
 import urllib.request
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from crucible.calendar import assert_trading_day, is_trading_day
 from crucible.data.daily import DEFAULT_LOOKBACK_DAYS, run_daily
@@ -152,7 +152,7 @@ def run_heal(
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     expected_symbols: list[str] | None = None,
     rehearsal: bool = False,
-) -> dict[str, Any]:
+) -> dict[str, object]:
     """Recompile every session in ``[start, end]``. Idempotent, and loud.
 
     No ``feature_version`` parameter, for the same reason `run_daily` has
@@ -236,7 +236,7 @@ def run_heal(
             "last_updated_utc": dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
     )
-    result = {
+    result: dict[str, object] = {
         "schema_version": "heal.v1",
         "gap": gap,
         "from": start.isoformat(),
