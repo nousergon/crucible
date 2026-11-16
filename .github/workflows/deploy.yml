@@ -464,6 +464,39 @@ jobs:
         run: |
           uv run python -m crucible.deploy record --run-mode live --sha '${{ needs.build.outputs.sha }}' --store "$STORE_URI" --outcome '${{ job.status }}' --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
 
+      # alpha-engine-config-I13712. A fix that lands should resume the week it
+      # was for, not wait for the next 07:00 ET firing of the weekly schedule.
+      # After the flip and its deploy manifest, ask the crucible-v2 dispatcher
+      # to resume the weekly arc. `only_if_failed` makes that a no-op for any
+      # week whose arc manifest does not READ `failed`: an `ok` week launches
+      # nothing, and an absent one is the Saturday firing's to start (its
+      # inputs land at 05:00 ET), never a deploy's. The dispatcher decides;
+      # this step only asks. A launched box runs `weekly --skip-if-ok`, which
+      # resumes from the first stage that is not `ok`, or files an `ok` no-op
+      # when another arc holds the weekly-arc lease.
+      #
+      # Last, so a failure here can only follow a deploy that already flipped
+      # and recorded `ok`; it turns the job red and `notify-main-failure`
+      # reports it. Skipped until `CRUCIBLE_DISPATCHER_FUNCTION` is set (a
+      # repository variable: the function name is an infrastructure
+      # identifier and this repo is public). Set it only once the deploy role
+      # holds `lambda:InvokeFunction` on the dispatcher (nous-ergon-ops
+      # crucible-v2.yaml), or every deploy turns red on AccessDenied.
+      - name: Ask the dispatcher to resume the week if its arc reads failed
+        if: ${{ success() && vars.CRUCIBLE_DISPATCHER_FUNCTION != '' }}
+        env:
+          DISPATCHER_FUNCTION: ${{ vars.CRUCIBLE_DISPATCHER_FUNCTION }}
+          SHA: ${{ needs.build.outputs.sha }}
+        run: |
+          payload="$(jq -nc --arg by "deploy:${SHA}" '{job: "weekly", args: "--skip-if-ok", only_if_failed: true, requested_by: $by}')"
+          aws lambda invoke --function-name "$DISPATCHER_FUNCTION" \
+            --cli-binary-format raw-in-base64-out --payload "$payload" out.json > meta.json
+          cat out.json; echo
+          if jq -e '.FunctionError' meta.json > /dev/null; then
+            echo "::error::the dispatcher raised for the weekly resume: $(cat out.json)"
+            exit 1
+          fi
+
   # A failed DEPLOY on main means live no longer matches main — and unlike a
   # failed test it blocks nothing and is green to the next author, so nothing
   # announces it. Measured 2026-08-12: a router config sat undeployed for 16
@@ -679,6 +712,39 @@ jobs:
         if: always()
         run: |
           uv run python -m crucible.deploy record --run-mode live --sha '${{ needs.build.outputs.sha }}' --store "$STORE_URI" --outcome '${{ job.status }}' --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+      # alpha-engine-config-I13712. A fix that lands should resume the week it
+      # was for, not wait for the next 07:00 ET firing of the weekly schedule.
+      # After the flip and its deploy manifest, ask the crucible-v2 dispatcher
+      # to resume the weekly arc. `only_if_failed` makes that a no-op for any
+      # week whose arc manifest does not READ `failed`: an `ok` week launches
+      # nothing, and an absent one is the Saturday firing's to start (its
+      # inputs land at 05:00 ET), never a deploy's. The dispatcher decides;
+      # this step only asks. A launched box runs `weekly --skip-if-ok`, which
+      # resumes from the first stage that is not `ok`, or files an `ok` no-op
+      # when another arc holds the weekly-arc lease.
+      #
+      # Last, so a failure here can only follow a deploy that already flipped
+      # and recorded `ok`; it turns the job red and `notify-main-failure`
+      # reports it. Skipped until `CRUCIBLE_DISPATCHER_FUNCTION` is set (a
+      # repository variable: the function name is an infrastructure
+      # identifier and this repo is public). Set it only once the deploy role
+      # holds `lambda:InvokeFunction` on the dispatcher (nous-ergon-ops
+      # crucible-v2.yaml), or every deploy turns red on AccessDenied.
+      - name: Ask the dispatcher to resume the week if its arc reads failed
+        if: ${{ success() && vars.CRUCIBLE_DISPATCHER_FUNCTION != '' }}
+        env:
+          DISPATCHER_FUNCTION: ${{ vars.CRUCIBLE_DISPATCHER_FUNCTION }}
+          SHA: ${{ needs.build.outputs.sha }}
+        run: |
+          payload="$(jq -nc --arg by "deploy:${SHA}" '{job: "weekly", args: "--skip-if-ok", only_if_failed: true, requested_by: $by}')"
+          aws lambda invoke --function-name "$DISPATCHER_FUNCTION" \
+            --cli-binary-format raw-in-base64-out --payload "$payload" out.json > meta.json
+          cat out.json; echo
+          if jq -e '.FunctionError' meta.json > /dev/null; then
+            echo "::error::the dispatcher raised for the weekly resume: $(cat out.json)"
+            exit 1
+          fi
 
   # A failed DEPLOY on main means live no longer matches main — and unlike a
   # failed test it blocks nothing and is green to the next author, so nothing

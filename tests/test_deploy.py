@@ -1091,6 +1091,25 @@ class TestTheWorkflowItself:
         }
         assert minting == {"release", "release-staging"}
 
+    def test_a_deploy_asks_the_dispatcher_to_resume_only_a_failed_week(
+        self, workflow: dict
+    ) -> None:
+        """alpha-engine-config-I13712: after the flip and the deploy manifest,
+        the release asks the dispatcher to resume the weekly arc, and only a
+        week whose arc READS failed may launch anything (`only_if_failed`)."""
+        steps = workflow["jobs"]["release"]["steps"]
+        names = [step.get("name", "") for step in steps]
+        resume = steps[-1]
+        assert resume["name"] == "Ask the dispatcher to resume the week if its arc reads failed"
+        assert names.index("Record the deploy manifest") == len(steps) - 2
+        assert "vars.CRUCIBLE_DISPATCHER_FUNCTION != ''" in resume["if"]
+        assert "success()" in resume["if"]
+        assert "only_if_failed: true" in resume["run"]
+        assert 'args: "--skip-if-ok"' in resume["run"]
+        assert "--date" not in resume["run"], (
+            "the dispatcher binds the week; a deploy never names one"
+        )
+
     def test_the_staging_release_is_the_prod_release_against_the_staging_store(
         self, workflow: dict
     ) -> None:
