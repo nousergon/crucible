@@ -50,7 +50,7 @@ from __future__ import annotations
 import datetime as dt
 import re
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Literal, Protocol, TypedDict, cast
 
 from crucible.keys import RELEASES_ROOT
 from crucible.release import (
@@ -68,6 +68,26 @@ __all__ = [
 ]
 
 ReleaseLockState = Literal["MET", "UNMET", "UNMEASURABLE"]
+
+
+class _HeadObjectOutput(TypedDict, total=False):
+    LastModified: dt.datetime
+
+
+class _Retention(TypedDict, total=False):
+    Mode: str
+    RetainUntilDate: dt.datetime
+
+
+class _GetObjectRetentionOutput(TypedDict, total=False):
+    Retention: _Retention
+
+
+class _S3Client(Protocol):
+    def head_object(self, *, Bucket: str, Key: str) -> _HeadObjectOutput: ...
+
+    def get_object_retention(self, *, Bucket: str, Key: str) -> _GetObjectRetentionOutput: ...
+
 
 #: A key under `releases/{sha}/` that is a published release IDENTITY
 #: object — the wheel or `release.json` — and nothing else. Never a
@@ -199,9 +219,10 @@ def _release_object_keys(store: Store) -> list[str]:
 
 
 def _read_one(store: S3Store, key: str) -> ReleaseLockReading:
-    from botocore.exceptions import ClientError  # noqa: PLC0415 - lazy, mirrors crucible.store
+    from botocore.exceptions import ClientError  # pyright: ignore[reportMissingTypeStubs]  # noqa: PLC0415 - lazy, mirrors crucible.store
 
-    s3_key = store._s3_key(key)
+    s3_key = store._s3_key(key)  # pyright: ignore[reportPrivateUsage] - backend-specific sweep by design
+    client = cast(_S3Client, store.client)
 
     # `HeadObject` first, but ONLY for `LastModified` — the baseline the
     # retention-shorter-than-policy comparison needs. Never read
@@ -211,9 +232,9 @@ def _read_one(store: S3Store, key: str) -> ReleaseLockReading:
     # genuinely unlocked object unless the lock fields are never trusted
     # from this call at all.
     try:
-        head = store.client.head_object(Bucket=store.bucket, Key=s3_key)
+        head = client.head_object(Bucket=store.bucket, Key=s3_key)
     except ClientError as exc:
-        code = store._error_code(exc)
+        code = store._error_code(exc)  # pyright: ignore[reportPrivateUsage] - backend-specific sweep by design
         return ReleaseLockReading(
             key,
             "UNMEASURABLE",
@@ -225,9 +246,9 @@ def _read_one(store: S3Store, key: str) -> ReleaseLockReading:
     last_modified = head.get("LastModified")
 
     try:
-        retention_response = store.client.get_object_retention(Bucket=store.bucket, Key=s3_key)
+        retention_response = client.get_object_retention(Bucket=store.bucket, Key=s3_key)
     except ClientError as exc:
-        code = store._error_code(exc)
+        code = store._error_code(exc)  # pyright: ignore[reportPrivateUsage] - backend-specific sweep by design
         if code == "AccessDenied":
             return ReleaseLockReading(
                 key,
@@ -373,7 +394,9 @@ def _causes_summary(findings: list[ReleaseLockReading]) -> str:
     return "Cause: " + "; ".join(f"{count} x {cause}" for cause, count in ranked) + "."
 
 
-def release_lock_metric(findings: list[ReleaseLockReading], *, now: dt.datetime) -> dict[str, Any]:
+def release_lock_metric(
+    findings: list[ReleaseLockReading], *, now: dt.datetime
+) -> dict[str, object]:
     """A MetricRecord over `findings`.
 
     BREACH beats `unmeasurable` beats OK — a single unlocked object must
