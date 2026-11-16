@@ -1219,6 +1219,23 @@ def build_parser() -> argparse.ArgumentParser:
                     "JSON; write nothing. Exit 0 = would run, 3 = would refuse."
                 ),
             )
+            # alpha-engine-config-I13712. Opt-in and declared in the dispatch's
+            # own argv (nous-ergon-ops `crucible-v2.yaml`), as for data.daily:
+            # without it the arc behaves exactly as before.
+            sub.add_argument(
+                "--skip-if-ok",
+                dest="skip_if_ok",
+                action="store_true",
+                help=(
+                    "Resume rather than redo. Without --date, bind to the week owed "
+                    "(the last session on or before the Friday before the latest "
+                    "Saturday). If the arc's manifest for that day already reads `ok`, "
+                    "file an `ok` no-op manifest and run nothing; otherwise skip each "
+                    "leading stage whose own manifest reads `ok` and run from the first "
+                    "that does not. Held under the weekly-arc lease: if another arc "
+                    "holds it, file an `ok` no-op and run nothing."
+                ),
+            )
         if spec.name == "release.pin":
             sub.add_argument("sha", metavar="RELEASE_SHA")
             sub.add_argument("--target", choices=["current", "trader"], default="current")

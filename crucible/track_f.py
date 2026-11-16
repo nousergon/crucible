@@ -30,18 +30,22 @@ at all.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import json
 import os
 import subprocess
 import sys
 import traceback
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, cast
 
 from krepis.metrics import derive_status
 
 from crucible import gate as gate_module
+from crucible.components import NYSE_TZ
+from crucible.daily_chain import DailyChainLockTimeout, already_ok, daily_chain_lock
 from crucible.documents import (
     UnreadableDocumentError,
     load_document_bytes,
@@ -69,16 +73,25 @@ from crucible.gate import (
     render_closing_comment,
     tracker_adapter,
 )
-from crucible.keys import closing_record_key, manifest_key, weekly_summary_key
+from crucible.keys import (
+    WEEKLY_ARC_LOCK_KEY,
+    calendar_day_discriminator,
+    closing_record_key,
+    manifest_key,
+    weekly_summary_key,
+)
 from crucible.runmode import RUN_MODE_LIVE
 from crucible.runner import RunContext, run_job
 from crucible.store import ETAG_ABSENT, Store, open_store, read_only, resolve_store_uri
 from crucible.weekly import (
+    ARC_JOB,
     PREFLIGHT_REFUSED_EXIT_CODE,
     ArcStageFailed,
     Stage,
     arc_stages,
+    arc_trading_day,
     preflight,
+    resumable_stages,
     run_arc,
 )
 from crucible.weekly_notice import send_notice
@@ -297,12 +310,118 @@ def weekly_handler(args: argparse.Namespace) -> int:
         return 0 if verdict["verdict"] == "producible" else PREFLIGHT_REFUSED_EXIT_CODE
     dry_run = bool(getattr(args, "dry_run", False))
     store = open_store(store_uri, dry_run=dry_run)
+    if not getattr(args, "skip_if_ok", False):
+        return _run_weekly_arc(args, store, store_uri, dry_run=dry_run, resume=False)
 
+    # `--skip-if-ok` (alpha-engine-config-I13712): the arc has several
+    # starters now — the Saturday firing, the same schedule's Sunday-to-Friday
+    # morning retries, and a re-dispatch after a fix lands — so every one of
+    # them but the first must find the week done, and a rerun must RESUME.
+    # Without `--date`, a retry binds to the week it is retrying
+    # (`arc_trading_day`), never to the session that closed last night.
+    if getattr(args, "date", None) is None:
+        args.trading_day = arc_trading_day()
+    day = args.trading_day.isoformat()
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(
+                daily_chain_lock(
+                    store,
+                    job=ARC_JOB,
+                    trading_day=day,
+                    key=WEEKLY_ARC_LOCK_KEY,
+                    wait=dt.timedelta(0),
+                )
+            )
+        except DailyChainLockTimeout as exc:
+            return _weekly_noop(args, store, dry_run=dry_run, suffix="arc-running", detail=str(exc))
+        # Decided INSIDE the lease, so the answer cannot change between
+        # reading it and acting on it. Only the canonical key counts: a no-op
+        # manifest is filed under a discriminator and proves nothing ran.
+        if already_ok(store, ARC_JOB, day):
+            return _weekly_noop(
+                args,
+                store,
+                dry_run=dry_run,
+                suffix="already-ok",
+                detail=(
+                    f"{manifest_key(ARC_JOB, day)} already reads `ok`; --skip-if-ok leaves it "
+                    "as it is. This firing had nothing to do, which is a complete result."
+                ),
+            )
+        return _run_weekly_arc(args, store, store_uri, dry_run=dry_run, resume=True)
+
+
+def _weekly_noop(
+    args: argparse.Namespace, store: Store, *, dry_run: bool, suffix: str, detail: str
+) -> int:
+    """`weekly --skip-if-ok` found nothing to do: file one `ok` no-op manifest.
+
+    Filed under a discriminator led by the calendar day it ran on, so it can
+    never overwrite the arc's canonical manifest, and a dispatch that ended
+    here is still cleared by a manifest of its own
+    (`evaluate_dispatch_absence`). Same shape as `data.daily --skip-if-ok`.
+    ``suffix`` says which: the week is `already-ok`, or another starter's arc
+    holds the lease (`arc-running`) and will file the week's verdict itself.
+    """
+
+    def _noop(ctx: RunContext) -> None:
+        ctx.record_metric(
+            {
+                "name": f"weekly.{suffix.replace('-', '_')}_noop",
+                "module": "crucible.track_f",
+                "metric_type": "gauge",
+                "value": 1.0,
+                "unit": "count",
+                "n_floor": 0,
+                "status": "OK",
+                "status_reason": detail,
+                "source_path": manifest_key(ARC_JOB, ctx.trading_day.isoformat()),
+                "last_updated_utc": ctx.started.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        )
+
+    ctx = run_job(
+        "weekly",
+        _noop,
+        store=store,
+        trading_day=args.trading_day,
+        transient_retry=False,
+        dry_run=dry_run,
+        run_mode=getattr(args, "run_mode", None),
+        discriminator=calendar_day_discriminator(_exchange_today(), suffix=suffix),
+    )
+    print(json.dumps({"run_id": ctx.run_id, "outputs": [], "detail": detail}, indent=2))
+    return 0
+
+
+def _exchange_today() -> dt.date:
+    """The NYSE calendar date now: the no-op's discriminator names the day it ran."""
+    return dt.datetime.now(dt.UTC).astimezone(NYSE_TZ).date()
+
+
+def _run_weekly_arc(
+    args: argparse.Namespace,
+    store: Store,
+    store_uri: str | None,
+    *,
+    dry_run: bool,
+    resume: bool,
+) -> int:
+    """Run the arc under `run_job`. With ``resume``, the leading stages whose own
+    manifests already read `ok` for the day are not run again
+    (:func:`crucible.weekly.resumable_stages`), and the arc manifest records
+    which stages were resumed and which this run ran."""
     resolved: list[dt.date] = []
 
     def body(ctx: RunContext) -> None:
         resolved.append(ctx.trading_day)
         planned = arc_stages(ctx.trading_day)
+        resumed = (
+            resumable_stages(ctx.trading_day, planned, store=store, run_mode=ctx.run_mode)
+            if resume
+            else []
+        )
         # `dry_run` is passed to `run_arc` so every stage's own argv carries
         # `--dry-run` too (alpha-engine-config-I9922 N1) — each stage is a
         # fresh `crucible.cli.main` invocation with no shared `args`, so
@@ -314,7 +433,13 @@ def weekly_handler(args: argparse.Namespace) -> int:
         # re-resolve would let the arc manifest and its stage manifests
         # disagree about the same week.
         try:
-            ran = run_arc(ctx.trading_day, store=store_uri, dry_run=dry_run, run_mode=ctx.run_mode)
+            ran = run_arc(
+                ctx.trading_day,
+                store=store_uri,
+                dry_run=dry_run,
+                run_mode=ctx.run_mode,
+                resumed=resumed,
+            )
         except Exception as exc:
             # A failed arc files its summary too (`alpha-engine-config-I13055`),
             # marked failed, then re-raises unchanged: the failure is still the
@@ -343,6 +468,8 @@ def weekly_handler(args: argparse.Namespace) -> int:
                 "last_updated_utc": ctx.started.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
         )
+        if resume:
+            ctx.record_metric(_resume_metric(ctx, resumed, ran))
 
     # `transient_retry=False`, deliberately. Every stage already runs through
     # its own `run_job` and owns the declared one-retry ladder (§11 risk 2), so
@@ -364,6 +491,29 @@ def weekly_handler(args: argparse.Namespace) -> int:
         if resolved and not dry_run:
             _send_weekly_notice(store, resolved[-1])
     return 0
+
+
+def _resume_metric(
+    ctx: RunContext, resumed: Sequence[Stage], completed: Sequence[Stage]
+) -> dict[str, object]:
+    """Which stages a `--skip-if-ok` arc RESUMED (found `ok`, did not run) and
+    which it ran (`alpha-engine-config-I13712`), in the arc's own manifest."""
+    ran_here = [stage.label for stage in completed[len(resumed) :]]
+    return {
+        "name": "arc_stages_resumed",
+        "module": "crucible.weekly",
+        "metric_type": "gauge",
+        "value": float(len(resumed)),
+        "unit": "count",
+        "n_floor": 0,
+        "status": "OK",
+        "status_reason": (
+            f"resumed (already ok, not rerun): {[stage.label for stage in resumed] or 'none'}; "
+            f"ran: {ran_here or 'none'}"
+        ),
+        "source_path": manifest_key("weekly", ctx.trading_day.isoformat()),
+        "last_updated_utc": ctx.started.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
 
 
 def _record_failed_weekly_summary(

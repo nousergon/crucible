@@ -45,6 +45,16 @@ def flag_value(args: Any, flag: str) -> str | None:
     return None
 
 
+def _has_flag(args: object, flag: str) -> bool:
+    """Whether ``flag`` is one of the dispatch argv's tokens (positional, via shlex)."""
+    if not isinstance(args, str):
+        return False
+    try:
+        return flag in shlex.split(args)
+    except ValueError:
+        return False
+
+
 def dispatch_target_trading_day(job: str, args: Any, dispatched_at: dt.datetime) -> dt.date:
     """The trading day a dispatch's manifest will actually be keyed under.
 
@@ -79,6 +89,13 @@ def dispatch_target_trading_day(job: str, args: Any, dispatched_at: dt.datetime)
     the box with the usage exit code the wrapper reports as one.
     """
     ordered = ("--to", "--date") if job in RANGE_BOUND_JOBS else ("--date", "--to")
+    if job == "weekly" and flag_value(args, "--date") is None and _has_flag(args, "--skip-if-ok"):
+        # alpha-engine-config-I13712: `weekly --skip-if-ok` with no `--date`
+        # binds to the week it is retrying, not to the last session that
+        # closed (on a Tuesday that would be Monday). Same function the box calls.
+        from crucible.weekly import arc_trading_day  # noqa: PLC0415 - weekly imports the registry
+
+        return arc_trading_day(dispatched_at)
     for flag in ordered:
         explicit = flag_value(args, flag)
         if explicit is None:
