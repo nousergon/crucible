@@ -50,7 +50,12 @@ dependencies = [
     # that keeps `ib_paper` out of staging, read by `crucible#445`'s
     # staging-only `simulated` session mode. Ruled 2026-10-28: this pin moves
     # after the Sat 10-31 weekly, ahead of the trader's crucible pin on 11-03.
-    "nousergon-lib[github-app,gates]==0.124.190",
+    #
+    # 0.124.222 carries `Tracker.find_or_create_issue(labels=..., include_closed=...)`
+    # (nousergon-lib-PR555, alpha-engine-config-I13712): report.morning files
+    # each exhausted weekly-arc backstop as an `incident` issue, once per week,
+    # even after a human closed it.
+    "nousergon-lib[github-app,gates]==0.124.222",
     # Trading calendar, dual-date resolution, structured logging, alerts.
     #
     # `[openai]` is NOT optional here (alpha-engine-config-I10473). krepis
@@ -143,7 +148,7 @@ dependencies = [
 # path it never exercises. `crucible data.daily --source arctic` states the
 # missing extra by name when it is absent — it never falls back to a
 # different source, which would silently change what the run measured.
-arcticdb = ["nousergon-lib[arcticdb]==0.124.190"]
+arcticdb = ["nousergon-lib[arcticdb]==0.124.222"]
 
 [project.scripts]
 crucible = "crucible.cli:main"

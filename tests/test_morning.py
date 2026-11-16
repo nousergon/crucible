@@ -56,6 +56,7 @@ from crucible.keys import (
     morning_report_key,
     morning_trigger_key,
     morning_update_key,
+    weekly_backstop_exhausted_key,
 )
 from crucible.morning import (
     ACCEPTANCE_NOT_ON_ANY_ARTIFACT,
@@ -335,13 +336,13 @@ def _stub_tracker(
     visible here exactly as it would be at GitHub."""
     calls: dict[str, list[Any]] = {"find": [], "create": [], "post": [], "update_body": []}
 
-    def _find(self: Any, title: str) -> int | None:
+    def _find(self: Any, title: str, **_: Any) -> int | None:
         calls["find"].append((self.config.repo, title))
         if find_raises is not None:
             raise find_raises
         return existing_issue
 
-    def _create(self: Any, *, title: str, body: str) -> int:
+    def _create(self: Any, *, title: str, body: str, **_: Any) -> int:
         calls["create"].append((self.config.repo, title, body))
         if create_raises is not None:
             raise create_raises
@@ -1340,6 +1341,41 @@ class TestTheJob:
         manifest = json.loads(LocalStore(tmp_path).get_bytes(keys[0]))
         message_key = _message_output(manifest)["key"]
         assert sent["console_artifact"].endswith(message_key)
+
+    def test_an_exhausted_weekly_backstop_is_filed_after_the_delivery(self, tmp_path, monkeypatch):
+        """alpha-engine-config-I13712: an exhausted backstop marker becomes one
+        `incident` issue, filed AFTER the day's message so a tracker fault there
+        cannot cost the delivery, and recorded as a metric on the manifest."""
+        _seed(tmp_path, previous=_board())
+        week = (DAY - dt.timedelta(days=4)).isoformat()
+        LocalStore(tmp_path).put_bytes(
+            weekly_backstop_exhausted_key(week),
+            json.dumps(
+                {"week": week, "attempts": 3, "failed_stage": "experiment.grade", "reason": "r"}
+            ).encode(),
+        )
+        calls = _stub_tracker(monkeypatch, existing_issue=None)
+        transport = _Transport()
+        monkeypatch.setattr("crucible.morning._krepis_publish", transport)
+        monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+        monkeypatch.delenv("CRUCIBLE_TRIGGER", raising=False)
+
+        assert morning_handler(_args(tmp_path, dry_run=False)) == 0
+
+        assert len(transport.calls) == 1
+        titles = [title for _, title, _ in calls["create"]]
+        assert titles == [
+            ROLLING_ISSUE_TITLE,
+            f"[incident] crucible-v2 weekly arc {week} failed at experiment.grade",
+        ]
+        keys = [
+            k
+            for k in LocalStore(tmp_path).list_keys(f"runs/{MORNING_JOB}/")
+            if k.endswith("run.json")
+        ]
+        manifest = json.loads(LocalStore(tmp_path).get_bytes(keys[0]))
+        (metric,) = [m for m in manifest["metrics"] if m["name"] == "weekly_backstop_incidents"]
+        assert metric["value"] == 1.0
 
     def test_tracker_repo_override_is_honoured_end_to_end(self, tmp_path, monkeypatch):
         """`alpha-engine-config-I10458`: an override repo is used for the

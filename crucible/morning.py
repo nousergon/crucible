@@ -97,7 +97,7 @@ from nousergon_lib.gates.report import UndeliveredError, wire_length
 
 from crucible.calendar import previous_trading_day
 from crucible.console.classify import not_yet_due
-from crucible.documents import load_store_document, read_document
+from crucible.documents import load_store_document, read_document, read_listed_document
 from crucible.gate import LADDER_KEY, PHASES, TRACKER_REPO, tracker_adapter
 from crucible.keys import (
     BOARD_CURRENT_KEY,
@@ -111,7 +111,9 @@ from crucible.keys import (
     morning_trigger_key,
     morning_update_key,
     parse_acceptance_reading,
+    parse_weekly_backstop_exhausted_key,
     runs_prefix,
+    weekly_backstop_prefix,
 )
 from crucible.required import optional_env
 from crucible.store import PRESIGN_MAX_S, LocalStore, S3Store, Store, open_store
@@ -155,6 +157,10 @@ __all__ = [
     "run_report",
     "store_uri",
     "wire_length",
+    "BACKSTOP_INCIDENT_WINDOW_DAYS",
+    "INCIDENT_LABEL",
+    "file_weekly_backstop_incidents",
+    "weekly_backstop_incident_title",
 ]
 
 #: The CLI job name. One string, used by the handler, the registry row, the
@@ -1504,6 +1510,103 @@ def _find_or_create_rolling_issue() -> int:
     )
 
 
+#: The label every weekly-backstop incident carries (alpha-engine-config-I13712).
+INCIDENT_LABEL = "incident"
+
+#: How far back an exhausted marker is still filed. A marker is filed the first
+#: morning after it is written; the window only bounds how many title searches
+#: one morning makes as markers accumulate, so it is generous on purpose.
+BACKSTOP_INCIDENT_WINDOW_DAYS = 35
+
+
+def weekly_backstop_incident_title(week: str, stage: str | None) -> str:
+    """The incident's title, and so its dedup key: one per week."""
+    return f"[incident] crucible-v2 weekly arc {week} failed at {stage or 'an unnamed stage'}"
+
+
+def file_weekly_backstop_incidents(store: Store, *, trading_day: dt.date) -> list[tuple[str, int]]:
+    """File every recent exhausted weekly-arc backstop as an `incident` issue.
+
+    `alpha-engine-config-I13712`. The crucible-v2 dispatcher relaunches a
+    failed weekly arc from its weekday `data-daily` firing at most three
+    times, then writes ONE `exhausted.json` for that week and stops. This is
+    the deterministic half that turns the marker into a tracked incident: one
+    issue per week, titled by :func:`weekly_backstop_incident_title`, labelled
+    :data:`INCIDENT_LABEL`, found-or-created by exact title INCLUDING closed
+    issues -- a week a human already closed is never filed again.
+
+    Returns ``(week, issue number)`` per marker filed or found. RAISES on an
+    unreadable marker or any tracker fault, so the run reads `failed` and
+    `alerts.sweep` pages, rather than an incident silently going unfiled.
+    """
+    oldest = trading_day - dt.timedelta(days=BACKSTOP_INCIDENT_WINDOW_DAYS)
+    adapter = None
+    filed: list[tuple[str, int]] = []
+    for key in sorted(store.list_keys(weekly_backstop_prefix())):
+        week = parse_weekly_backstop_exhausted_key(key)
+        if week is None or dt.date.fromisoformat(week) < oldest:
+            continue
+        read = read_listed_document(store, key)
+        if read.document is None:
+            raise RuntimeError(f"weekly backstop marker {key} could not be read: {read.problem}")
+        marker = read.document
+        stage = marker.get("failed_stage")
+        stage = stage if isinstance(stage, str) and stage else None
+        title = weekly_backstop_incident_title(week, stage)
+        body = "\n".join(
+            [
+                f"The crucible-v2 weekly arc for the week of {week} reads `failed`, and the "
+                f"dispatcher's weekday backstop relaunched it {marker.get('attempts')} times "
+                "without an `ok` arc, so it has stopped relaunching.",
+                "",
+                f"- Failed stage: `{stage or 'unknown'}`",
+                f"- Store marker: `{key}`",
+                "",
+                "Last reason recorded on the arc manifest:",
+                "",
+                "```",
+                str(marker.get("reason") or "(none recorded)")[-2000:],
+                "```",
+                "",
+                "Filed by `crucible report.morning` from the weekly backstop marker.",
+            ]
+        )
+        if adapter is None:
+            adapter = tracker_adapter(_tracker_repo())
+        number = adapter.find_or_create_issue(
+            title=title, body=body, labels=[INCIDENT_LABEL], include_closed=True
+        )
+        filed.append((week, number))
+    return filed
+
+
+def _record_backstop_incidents(
+    record_metric: Callable[[dict[str, object]], None],
+    store: Store,
+    *,
+    trading_day: dt.date,
+    now: dt.datetime,
+) -> None:
+    filed = file_weekly_backstop_incidents(store, trading_day=trading_day)
+    record_metric(
+        {
+            "name": "weekly_backstop_incidents",
+            "module": "crucible.morning",
+            "metric_type": "operational",
+            "value": float(len(filed)),
+            "unit": "count",
+            "n_floor": 0,
+            "status": "OK",
+            "status_reason": (
+                "; ".join(f"{week} -> {_tracker_repo()}#{number}" for week, number in filed)
+                or "no exhausted weekly backstop in the window"
+            ),
+            "source_path": weekly_backstop_prefix(),
+            "last_updated_utc": now.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+    )
+
+
 #: The basename of one delivery's compact history facts
 #: (`crucible.keys.morning_history_row_key`). Declared here, once, so the
 #: writer below and the index reader cannot disagree about what they are
@@ -1820,6 +1923,11 @@ def morning_handler(args: argparse.Namespace) -> int:
                         "last_updated_utc": now.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
                     }
                 )
+                # An incident is not a delivery: it is filed on a morning
+                # that sends nothing too (alpha-engine-config-I13712).
+                _record_backstop_incidents(
+                    ctx.record_metric, store, trading_day=ctx.trading_day, now=now
+                )
                 return
         inputs = read_inputs(store, trading_day=ctx.trading_day, now=now, console_url=console_url)
         update = render_full_update(inputs, now=now)
@@ -1920,6 +2028,10 @@ def morning_handler(args: argparse.Namespace) -> int:
         # condition pages on it) rather than silently leaving a stale index.
         history_body = render_history_body(store, console_url=console_url)
         adapter.update_issue_body(issue_number, history_body)
+        # LAST, after everything delivered: a fault filing an incident fails
+        # the run loudly but cannot cost the day's message
+        # (alpha-engine-config-I13712).
+        _record_backstop_incidents(ctx.record_metric, store, trading_day=ctx.trading_day, now=now)
 
     run_job(
         MORNING_JOB,
