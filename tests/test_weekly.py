@@ -26,9 +26,12 @@ from crucible.weekly import (
     ARCTIC_LIBRARY_JOBS,
     PREFLIGHT_REFUSED_EXIT_CODE,
     ArcStageFailed,
+    Stage,
     arc_stages,
+    arc_trading_day,
     failed_stage_job,
     preflight,
+    resumable_stages,
     run_arc,
 )
 
@@ -669,3 +672,264 @@ class TestPreflightAsksTheArcsOwnRefusal:
         v2.put_bytes(champion_key("r"), b"{not json")
         with pytest.raises(Exception):  # noqa: B017, PT011 - any raise; never a verdict
             preflight(FRIDAY, store=str(v2.root))
+
+
+# -- alpha-engine-config-I13712: the arc resumes and finds a done week done --
+
+
+class TestArcTradingDay:
+    """A retry fired on any morning binds to the week it is retrying."""
+
+    @pytest.mark.parametrize(
+        ("now", "expected"),
+        [
+            # The Saturday firing binds to Friday, exactly as it always has.
+            (dt.datetime(2026, 11, 14, 7, 0), dt.date(2026, 11, 13)),
+            # Sunday and Monday morning retries: still that Friday.
+            (dt.datetime(2026, 11, 15, 7, 0), dt.date(2026, 11, 13)),
+            (dt.datetime(2026, 11, 16, 7, 0), dt.date(2026, 11, 13)),
+            # Tuesday: `resolve_trading_day` would say Monday, a different week.
+            (dt.datetime(2026, 11, 17, 7, 0), dt.date(2026, 11, 13)),
+            # Friday morning, and Friday evening after the close: the week that
+            # closed today is not owed until Saturday.
+            (dt.datetime(2026, 11, 20, 7, 0), dt.date(2026, 11, 13)),
+            (dt.datetime(2026, 11, 20, 17, 0), dt.date(2026, 11, 13)),
+            # A Friday holiday closes the week on Thursday (2026-07-03, 2026-12-25).
+            (dt.datetime(2026, 7, 4, 7, 0), dt.date(2026, 7, 2)),
+            (dt.datetime(2026, 7, 7, 7, 0), dt.date(2026, 7, 2)),
+            (dt.datetime(2026, 12, 26, 7, 0), dt.date(2026, 12, 24)),
+            # The day after Thanksgiving is a half session, so still the Friday.
+            (dt.datetime(2026, 11, 28, 7, 0), dt.date(2026, 11, 27)),
+        ],
+    )
+    def test_binds_to_the_last_session_of_the_week_owed(
+        self, now: dt.datetime, expected: dt.date
+    ) -> None:
+        assert arc_trading_day(now) == expected
+
+    def test_an_aware_instant_is_read_on_the_exchange_calendar(self) -> None:
+        # 03:00Z on a Saturday is still Friday evening in New York.
+        assert arc_trading_day(dt.datetime(2026, 11, 14, 3, 0, tzinfo=dt.UTC)) == dt.date(
+            2026, 11, 6
+        )
+
+
+def _file_manifest(store: LocalStore, stage_job: str, slot: str | None, *, ok: bool, mode: str):
+    """A real, schema-valid stage manifest, written the way a stage writes it."""
+    from crucible.runner import run_job
+
+    def body(_ctx: object) -> None:
+        if not ok:
+            raise ValueError("the stage failed")
+
+    try:
+        run_job(
+            stage_job,
+            body,
+            store=store,
+            trading_day=FRIDAY,
+            transient_retry=False,
+            discriminator=slot,
+            run_mode=mode,
+        )
+    except ValueError:
+        assert not ok
+
+
+class TestResumableStages:
+    def test_the_leading_ok_stages_and_none_after_the_first_that_is_not(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        stages = arc_stages(FRIDAY)
+        _file_manifest(store, stages[0].job, stages[0].slot, ok=True, mode=RUN_MODE_LIVE)
+        _file_manifest(store, stages[1].job, stages[1].slot, ok=False, mode=RUN_MODE_LIVE)
+        # An `ok` manifest AFTER the failed stage: computed from inputs the
+        # rerun is about to replace, so it is not resumed over.
+        _file_manifest(store, stages[2].job, stages[2].slot, ok=True, mode=RUN_MODE_LIVE)
+        assert resumable_stages(FRIDAY, stages, store=store, run_mode=RUN_MODE_LIVE) == stages[:1]
+
+    def test_a_stage_filed_under_another_run_mode_is_not_done(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        stages = arc_stages(FRIDAY)
+        _file_manifest(store, stages[0].job, stages[0].slot, ok=True, mode=RUN_MODE_REPLAY)
+        assert resumable_stages(FRIDAY, stages, store=store, run_mode=RUN_MODE_LIVE) == []
+
+    def test_an_unreadable_manifest_is_not_done(self, tmp_path) -> None:
+        from crucible.keys import manifest_key
+
+        store = LocalStore(tmp_path)
+        stages = arc_stages(FRIDAY)
+        store.put_bytes(
+            manifest_key(stages[0].job, FRIDAY.isoformat(), discriminator=stages[0].slot),
+            b'{"status": "ok"}',
+        )
+        assert resumable_stages(FRIDAY, stages, store=store, run_mode=RUN_MODE_LIVE) == []
+
+
+class TestRunArcResumes:
+    def test_resumed_stages_are_not_run_and_are_returned_first(self) -> None:
+        seen: list[str] = []
+
+        def fake_main(argv: list[str]) -> int:
+            seen.append(
+                argv[0] + ("[" + argv[argv.index("--slot") + 1] + "]" if "--slot" in argv else "")
+            )
+            return 0
+
+        stages = arc_stages(FRIDAY)
+        done = run_arc(
+            FRIDAY, store=None, run_mode=RUN_MODE_LIVE, main=fake_main, resumed=stages[:2]
+        )
+        assert done == stages
+        assert seen == [stage.label for stage in stages[2:]]
+
+    def test_a_resumed_set_that_is_not_a_prefix_is_refused_before_any_stage(self) -> None:
+        def fake_main(argv: list[str]) -> int:
+            raise AssertionError(f"no stage may run: {argv}")
+
+        stages = arc_stages(FRIDAY)
+        with pytest.raises(ValueError, match="not a prefix"):
+            run_arc(FRIDAY, store=None, run_mode=RUN_MODE_LIVE, main=fake_main, resumed=stages[1:2])
+
+    def test_a_failure_after_a_resume_names_the_stage_and_counts_the_resumed_as_completed(
+        self,
+    ) -> None:
+        stages = arc_stages(FRIDAY)
+
+        def fake_main(argv: list[str]) -> int:
+            return 1
+
+        with pytest.raises(ArcStageFailed) as caught:
+            run_arc(FRIDAY, store=None, run_mode=RUN_MODE_LIVE, main=fake_main, resumed=stages[:1])
+        assert caught.value.stage == stages[1]
+        assert caught.value.completed == tuple(stages[:1])
+
+    def test_the_producibility_precheck_still_runs_on_a_full_resume(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from crucible import weekly
+
+        def refuse(*_a: object, **_k: object) -> None:
+            raise UnproducibleChampionError("pointer names an arm this release cannot produce")
+
+        monkeypatch.setattr(weekly, "assert_arc_champions_producible", refuse)
+        stages = arc_stages(FRIDAY)
+        with pytest.raises(UnproducibleChampionError):
+            run_arc(
+                FRIDAY,
+                store=None,
+                run_mode=RUN_MODE_LIVE,
+                main=lambda _argv: 0,
+                resumed=stages,
+            )
+
+
+class TestWeeklySkipIfOk:
+    """`crucible weekly --skip-if-ok`, end to end through `crucible.cli.main`."""
+
+    @pytest.fixture
+    def arc(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> LocalStore:
+        from crucible import track_f
+
+        monkeypatch.setattr(track_f, "send_notice", lambda *_a, **_k: "")
+        monkeypatch.setenv(RUN_MODE_ENV, RUN_MODE_LIVE)
+        return LocalStore(tmp_path / "store")
+
+    def _weekly(self, store: LocalStore, *extra: str) -> int:
+        from crucible.cli import main
+
+        return main(["weekly", "--store", str(store.root), "--skip-if-ok", *extra])
+
+    def test_an_ok_week_dispatches_nothing_and_files_a_noop(
+        self, monkeypatch: pytest.MonkeyPatch, arc: LocalStore
+    ) -> None:
+        from crucible import track_f
+        from crucible.keys import manifest_key
+        from crucible.runner import run_job
+
+        run_job("weekly", lambda _ctx: None, store=arc, trading_day=FRIDAY, run_mode=RUN_MODE_LIVE)
+        before = arc.get_bytes(manifest_key("weekly", FRIDAY.isoformat()))
+
+        def no_arc(*_a: object, **_k: object) -> list[Stage]:
+            raise AssertionError("an ok week must dispatch no stage")
+
+        monkeypatch.setattr(track_f, "run_arc", no_arc)
+        monkeypatch.setattr(track_f, "arc_trading_day", lambda: FRIDAY)
+        assert self._weekly(arc) == 0
+        assert arc.get_bytes(manifest_key("weekly", FRIDAY.isoformat())) == before
+        noops = [
+            k for k in arc.list_keys(f"runs/weekly/{FRIDAY.isoformat()}/") if "already-ok" in k
+        ]
+        assert len(noops) == 1, noops
+        assert json.loads(arc.get_bytes(noops[0]))["status"] == "ok"
+
+    def test_a_failed_week_resumes_from_the_first_stage_not_ok(
+        self, monkeypatch: pytest.MonkeyPatch, arc: LocalStore
+    ) -> None:
+        from crucible import track_f
+        from crucible.keys import manifest_key
+
+        stages = arc_stages(FRIDAY)
+        _file_manifest(arc, stages[0].job, stages[0].slot, ok=True, mode=RUN_MODE_LIVE)
+        _file_manifest(arc, stages[1].job, stages[1].slot, ok=False, mode=RUN_MODE_LIVE)
+        captured: dict[str, object] = {}
+
+        def fake_run_arc(day: dt.date, **kwargs: object) -> list[Stage]:
+            captured.update(kwargs)
+            for stage in stages[1:]:
+                _file_manifest(arc, stage.job, stage.slot, ok=True, mode=RUN_MODE_LIVE)
+            return stages
+
+        monkeypatch.setattr(track_f, "run_arc", fake_run_arc)
+        assert self._weekly(arc, "--date", FRIDAY.isoformat()) == 0
+        assert captured["resumed"] == stages[:1]
+        manifest = json.loads(arc.get_bytes(manifest_key("weekly", FRIDAY.isoformat())))
+        assert manifest["status"] == "ok"
+        resumed = next(m for m in manifest["metrics"] if m["name"] == "arc_stages_resumed")
+        assert resumed["value"] == 1.0
+        assert stages[0].label in resumed["status_reason"]
+        assert stages[1].label in resumed["status_reason"].split("ran:")[1]
+
+    def test_an_arc_already_running_is_left_alone(
+        self, monkeypatch: pytest.MonkeyPatch, arc: LocalStore
+    ) -> None:
+        from crucible import track_f
+        from crucible.daily_chain import daily_chain_lock
+        from crucible.keys import WEEKLY_ARC_LOCK_KEY
+
+        def no_arc(*_a: object, **_k: object) -> list[Stage]:
+            raise AssertionError("a second arc must not start while one holds the lease")
+
+        monkeypatch.setattr(track_f, "run_arc", no_arc)
+        with daily_chain_lock(
+            arc, job="weekly", trading_day=FRIDAY.isoformat(), key=WEEKLY_ARC_LOCK_KEY
+        ):
+            assert self._weekly(arc, "--date", FRIDAY.isoformat()) == 0
+        running = [
+            k for k in arc.list_keys(f"runs/weekly/{FRIDAY.isoformat()}/") if "arc-running" in k
+        ]
+        assert len(running) == 1, running
+
+    def test_the_weekly_lease_is_not_the_daily_chains(self) -> None:
+        from crucible.keys import DAILY_CHAIN_LOCK_KEY, WEEKLY_ARC_LOCK_KEY
+
+        assert WEEKLY_ARC_LOCK_KEY != DAILY_CHAIN_LOCK_KEY
+
+    def test_without_the_flag_nothing_is_skipped(
+        self, monkeypatch: pytest.MonkeyPatch, arc: LocalStore
+    ) -> None:
+        """An operator's deliberate rerun of an `ok` week still runs, in full."""
+        from crucible import track_f
+        from crucible.cli import main
+        from crucible.runner import run_job
+
+        run_job("weekly", lambda _ctx: None, store=arc, trading_day=FRIDAY, run_mode=RUN_MODE_LIVE)
+        captured: dict[str, object] = {}
+
+        def fake_run_arc(day: dt.date, **kwargs: object) -> list[Stage]:
+            captured.update(kwargs)
+            return []
+
+        monkeypatch.setattr(track_f, "run_arc", fake_run_arc)
+        monkeypatch.setattr(track_f, "arc_stages", lambda _day: [])
+        assert main(["weekly", "--store", str(arc.root), "--date", FRIDAY.isoformat()]) == 0
+        assert captured["resumed"] == []

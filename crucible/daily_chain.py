@@ -127,18 +127,20 @@ def default_holder(job: str) -> str:
     return f"{job}@{socket.gethostname()}:{os.getpid()}:{os.urandom(4).hex()}"
 
 
-def _read_lease(store: Store) -> tuple[str, dict[str, object] | None]:
+def _read_lease(
+    store: Store, key: str = DAILY_CHAIN_LOCK_KEY
+) -> tuple[str, dict[str, object] | None]:
     """``(token, document)`` at the lease key; ``(ETAG_ABSENT, None)`` if absent.
 
     A document that does not parse is returned as ``{}``: it has no expiry, so
     it is treated as EXPIRED and replaced by compare-and-swap on its own token.
     A corrupt lease must not wedge every daily run forever.
     """
-    token = store.etag(DAILY_CHAIN_LOCK_KEY)
+    token = store.etag(key)
     if token == ETAG_ABSENT:
         return token, None
     try:
-        return token, load_store_document(store, DAILY_CHAIN_LOCK_KEY)
+        return token, load_store_document(store, key)
     except (KeyError, UnreadableDocumentError):
         return token, {}
 
@@ -189,8 +191,14 @@ def daily_chain_lock(
     poll_s: float = LOCK_POLL_S,
     clock: Callable[[], dt.datetime] = _now,
     sleep: Callable[[float], None] = time.sleep,
+    key: str = DAILY_CHAIN_LOCK_KEY,
 ) -> Generator[str]:
     """Hold the fleet-wide daily-chain lease for the body of the ``with``.
+
+    ``key`` names the lease. It defaults to the daily chain's; the weekly arc
+    holds the same mechanism under its own key (`crucible.keys.WEEKLY_ARC_LOCK_KEY`,
+    `alpha-engine-config-I13712`), so an arc that runs for hours never holds
+    up a session's serve chain.
 
     Acquire is a compare-and-swap on the lease key's version: create it when
     absent, replace it when it is released or expired. Two runs racing for a
@@ -208,7 +216,7 @@ def daily_chain_lock(
     deadline = clock() + wait
     acquired = clock()
     while True:
-        token, document = _read_lease(store)
+        token, document = _read_lease(store, key)
         now = clock()
         if _is_free(document, now):
             acquired = now
@@ -221,14 +229,14 @@ def daily_chain_lock(
                 lease=lease,
             )
             try:
-                token = store.compare_and_swap(DAILY_CHAIN_LOCK_KEY, token, body)
+                token = store.compare_and_swap(key, token, body)
             except PointerConflictError:
                 continue
             break
         if now >= deadline:
             raise DailyChainLockTimeout(
                 f"{job} for {trading_day} waited {wait} for the daily-chain lease "
-                f"({DAILY_CHAIN_LOCK_KEY}) and it is still held by "
+                f"({key}) and it is still held by "
                 f"{(document or {}).get('holder')!r} for {(document or {}).get('job')!r} "
                 f"until {(document or {}).get('expires_utc')!r}. No manifest was written; "
                 "re-dispatch once the holder has finished."
@@ -258,7 +266,7 @@ def daily_chain_lock(
                     lease=lease,
                 )
                 try:
-                    state.token = store.compare_and_swap(DAILY_CHAIN_LOCK_KEY, state.token, body)
+                    state.token = store.compare_and_swap(key, state.token, body)
                 except PointerConflictError as exc:
                     state.lost = str(exc)
                     print(f"daily-chain lease LOST by {holder}: {exc}", file=sys.stderr)
@@ -296,7 +304,7 @@ def daily_chain_lock(
                 released["released_utc"] = _utc(clock())
                 try:
                     store.compare_and_swap(
-                        DAILY_CHAIN_LOCK_KEY,
+                        key,
                         state.token,
                         json.dumps(released, indent=2, sort_keys=True).encode("utf-8"),
                     )
@@ -304,7 +312,7 @@ def daily_chain_lock(
                     lost = str(exc)
         if lost and not failed:
             raise DailyChainLockLost(
-                f"{job} for {trading_day} lost the daily-chain lease ({DAILY_CHAIN_LOCK_KEY}) "
+                f"{job} for {trading_day} lost the daily-chain lease ({key}) "
                 f"while it held it, so another writer may have overlapped it: {lost}"
             )
 

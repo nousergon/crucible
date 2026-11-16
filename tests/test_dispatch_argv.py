@@ -72,3 +72,19 @@ def test_dispatch_target_trading_day_falls_back_on_an_invalid_explicit_date(
     )
 
     assert actual == dt.date(2026, 11, 13)
+
+
+def test_a_weekly_retry_binds_to_the_week_it_is_retrying() -> None:
+    """alpha-engine-config-I13712: the weekly schedule fires every morning with
+    `--skip-if-ok` and no `--date`. A Tuesday firing retries the week that
+    closed the previous Friday, so its manifest lands under that Friday, not
+    under Monday, the session the wall clock would name."""
+    tuesday = dt.datetime(2026, 11, 17, 12, 0, tzinfo=dt.UTC)
+    assert dispatch_argv.dispatch_target_trading_day("weekly", "--skip-if-ok", tuesday) == dt.date(
+        2026, 11, 13
+    )
+    # An explicit --date still wins, and a plain weekly keeps the wall clock.
+    assert dispatch_argv.dispatch_target_trading_day(
+        "weekly", "--skip-if-ok --date 2026-11-06", tuesday
+    ) == dt.date(2026, 11, 6)
+    assert dispatch_argv.dispatch_target_trading_day("weekly", "", tuesday) == dt.date(2026, 11, 16)

@@ -71,6 +71,7 @@ __all__ = [
     "TRADER_SHADOW_BOOKS_PREFIX",
     "TRIGGER_RE",
     "TRIGGER_UNKNOWN",
+    "WEEKLY_ARC_LOCK_KEY",
     "acceptance_reading_key",
     "arena_cycle_key",
     "arm_id_from_segment",
@@ -1488,6 +1489,16 @@ MONEY_PATH_CLAIMS_PREFIX = "runs/_money_path/claims/"
 #: :data:`MONEY_PATH_CLAIMS_PREFIX` is: every identity that writes these
 #: manifests is already granted it, and a lease is not a manifest.
 DAILY_CHAIN_LOCK_KEY = "runs/_locks/daily_chain.json"
+
+#: The lease a `weekly` arc run holds for its whole length
+#: (`alpha-engine-config-I13712`). The arc now has several starters — the
+#: Saturday firing, the Sunday-to-Friday morning retries of the same
+#: schedule, and a re-dispatch after a fix lands — and two arcs over one week
+#: would race every stage's manifest. Its own key, not
+#: :data:`DAILY_CHAIN_LOCK_KEY`: an arc runs for hours and must never hold up
+#: a session's serve chain. Dateless for the same reason that one is: there
+#: is one arc in flight at a time, whichever week it is resuming.
+WEEKLY_ARC_LOCK_KEY = "runs/_locks/weekly_arc.json"
 
 
 def money_path_claim_key(index: object) -> str:

@@ -33,11 +33,15 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from crucible.components import Component, load_registry
+from crucible.calendar import is_trading_day
+from crucible.components import NYSE_TZ, Component, load_registry
 from crucible.slots import SLOTS, dispatchable_slots
 
 __all__ = [
     "ARC_JOB",
+    "ArcStageFailed",
+    "arc_trading_day",
+    "resumable_stages",
     "ARC_SLOT_JOBS",
     "ARCTIC_LIBRARY_JOBS",
     "SELECT_NEWEST_VERDICT_JOBS",
@@ -171,6 +175,41 @@ class Stage:
     @property
     def label(self) -> str:
         return f"{self.job}[{self.slot}]" if self.slot else self.job
+
+
+def arc_trading_day(now: dt.datetime | None = None) -> dt.date:
+    """The trading day the weekly arc owed at ``now`` binds to.
+
+    The last NYSE session on or before the Friday that precedes the most
+    recent Saturday on or before ``now``'s exchange date: Friday normally,
+    Thursday in a week whose Friday is a holiday (2026-11-27 closes a week
+    early). Saturday is the anchor because the scheduled arc fires then.
+
+    `alpha-engine-config-I13712`. The arc's schedule now also fires Sunday
+    through Friday mornings, as a retry, and each of those firings must
+    resume the SAME week rather than a new one. `resolve_trading_day` cannot
+    answer that: on a Tuesday morning it returns Monday, and an arc bound to
+    Monday is a different, half-finished week. On Saturday through Monday the
+    two agree, so the Saturday firing binds exactly as it always has.
+
+    ``now`` naive is read as NYSE local time, as `resolve_trading_day` does.
+    """
+    moment = now if now is not None else dt.datetime.now(dt.UTC)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=NYSE_TZ)
+    today = moment.astimezone(NYSE_TZ).date()
+    # Saturday is weekday 5; this many days back reaches the latest Saturday.
+    saturday = today - dt.timedelta(days=(today.weekday() - 5) % 7)
+    day = saturday - dt.timedelta(days=1)
+    for _ in range(14):
+        if is_trading_day(day):
+            return day
+        day -= dt.timedelta(days=1)
+    raise ValueError(
+        f"no NYSE session in the two weeks before {saturday.isoformat()}; the calendar "
+        "is broken, and guessing a trading day for the arc would bind it to a week "
+        "that never traded."
+    )
 
 
 def _arc_rows(registry: dict[str, Component]) -> list[Component]:
@@ -311,6 +350,45 @@ def preflight(
     return {**verdict, "verdict": "producible", "reason": None}
 
 
+def _stage_ok(store: object, stage: Stage, trading_day: str, run_mode: str) -> bool:
+    """Whether ``stage``'s own manifest for ``trading_day`` is a valid `ok`
+    filed under ``run_mode``.
+
+    Absent, `failed`, unreadable, non-conforming or another run mode all read
+    as NOT done, so the stage runs: the same safe direction as
+    `crucible.daily_chain.already_ok`. A replay arc never resumes over a live
+    stage, or the other way round, because the two are different weeks of
+    evidence that happen to share a key.
+    """
+    from crucible.manifest import read_manifest  # noqa: PLC0415 - avoids a cycle
+
+    try:
+        document = read_manifest(store, stage.job, trading_day, discriminator=stage.slot)
+    except Exception:  # noqa: BLE001 - every unreadable shape means "not done"; see docstring
+        return False
+    return document.get("status") == "ok" and document.get("run_mode") == run_mode
+
+
+def resumable_stages(
+    trading_day: dt.date, stages: Sequence[Stage], *, store: object, run_mode: str
+) -> list[Stage]:
+    """The leading stages whose own manifests already read `ok` for ``trading_day``.
+
+    `alpha-engine-config-I13712`. A rerun of a failed arc resumes: it skips
+    these and runs from the first stage that is not done. A PREFIX, never a
+    set: once one stage runs again, every stage after it runs again too,
+    because each reads what the ones before it wrote, and a later stage's old
+    `ok` manifest was computed from inputs the rerun may just have replaced.
+    """
+    day = trading_day.isoformat()
+    done: list[Stage] = []
+    for stage in stages:
+        if not _stage_ok(store, stage, day, run_mode):
+            break
+        done.append(stage)
+    return done
+
+
 class ArcStageFailed(RuntimeError):
     """A stage exited non-zero. Carries which one, so the arc's own manifest
     `reason` names a job rather than a traceback in a module nobody opens.
@@ -366,8 +444,18 @@ def run_arc(
     main: object | None = None,
     dry_run: bool = False,
     arctic_library: str | None = None,
+    resumed: Sequence[Stage] = (),
 ) -> list[Stage]:
     """Run every stage for ``trading_day``. Raises on the first failure.
+
+    Returns every stage that is complete for the day, in order: ``resumed``
+    first, then the stages this call ran.
+
+    ``resumed`` is a prefix of the arc (:func:`resumable_stages`,
+    `alpha-engine-config-I13712`): those stages already filed `ok` for this
+    day and are not run again. Anything other than a prefix of
+    :func:`arc_stages` raises before stage 1, since skipping a stage in the
+    middle would run its successors over an input nobody rewrote.
 
     ``run_mode`` is required and threaded onto every stage's argv. It is the
     ARC's own resolved mode, passed down rather than re-resolved per stage:
@@ -406,9 +494,15 @@ def run_arc(
 
         main = cli_main
     stages = arc_stages(trading_day, registry)
+    if list(resumed) != stages[: len(resumed)]:
+        raise ValueError(
+            f"resumed stages {[s.label for s in resumed]} are not a prefix of the "
+            f"weekly arc for {trading_day.isoformat()}; refusing to skip a stage "
+            "whose successors would then run over an input nobody rewrote."
+        )
     assert_arc_champions_producible(trading_day, stages, store=store)
-    ran: list[Stage] = []
-    for stage in stages:
+    ran: list[Stage] = list(resumed)
+    for stage in stages[len(resumed) :]:
         try:
             code = main(  # type: ignore[operator]
                 stage.argv(
