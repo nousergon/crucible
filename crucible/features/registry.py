@@ -28,7 +28,7 @@ import json
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import TypedDict, cast, overload
 
 from pydantic import ValidationError
 
@@ -102,6 +102,14 @@ _NORMALIZED_UNIT_BY_SUFFIX: dict[str, str] = {
 #: these is a normalized value wearing the unnormalized suffix, the mirror
 #: image of the bug this registry exists to catch.
 _NORMALIZED_UNIT_WORDS: frozenset[str] = frozenset(_NORMALIZED_UNIT_BY_SUFFIX.values())
+
+type JsonValue = str | int | float | bool | None | dict[str, JsonValue] | list[JsonValue]
+
+
+class RegistryPayload(TypedDict):
+    schema_version: str
+    feature_version: str
+    features: list[dict[str, JsonValue]]
 
 
 @dataclass(frozen=True)
@@ -185,7 +193,7 @@ class FeatureSpec:
                 "at least one (plan §4.12)"
             )
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, JsonValue]:
         # `market_wide` IS written here (`alpha-engine-config-I10114`): the
         # document at `features/{version}/registry.json` is the declared
         # producer/consumer contract for the feature layer, and a reader of
@@ -954,16 +962,30 @@ def feature_names(catalog: tuple[FeatureSpec, ...] = CATALOG) -> tuple[str, ...]
 
 
 @lru_cache(maxsize=1)
-def load_registry_schema() -> dict[str, Any]:
+def load_registry_schema() -> dict[str, JsonValue]:
     """The v1 feature-registry schema, as a dict.
 
     Cached: the validator is constructed per process and the file never
     changes under a running one.
     """
-    return json.loads(FEATURE_REGISTRY_SCHEMA_PATH.read_text(encoding="utf-8"))
+    # JSON decoding is the untyped boundary; the schema root is an object.
+    return cast(
+        dict[str, JsonValue],
+        json.loads(FEATURE_REGISTRY_SCHEMA_PATH.read_text(encoding="utf-8")),
+    )
 
 
-def validate_registry_payload(payload: dict[str, Any]) -> dict[str, Any]:
+@overload
+def validate_registry_payload(payload: RegistryPayload) -> RegistryPayload: ...
+
+
+@overload
+def validate_registry_payload(payload: dict[str, JsonValue]) -> dict[str, JsonValue]: ...
+
+
+def validate_registry_payload(
+    payload: RegistryPayload | dict[str, JsonValue],
+) -> RegistryPayload | dict[str, JsonValue]:
     """Refuse a registry document that does not conform. Returns it on success.
 
     Raises rather than warning: this is the producer side of the contract,
@@ -995,7 +1017,7 @@ def validate_registry_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def registry_payload(catalog: tuple[FeatureSpec, ...] = CATALOG) -> dict[str, Any]:
+def registry_payload(catalog: tuple[FeatureSpec, ...] = CATALOG) -> RegistryPayload:
     """The registry as it is written to `features/{version}/registry.json`.
 
     Validated against `schemas/feature_registry.v1.json` on the way out, so
@@ -1012,7 +1034,7 @@ def registry_payload(catalog: tuple[FeatureSpec, ...] = CATALOG) -> dict[str, An
     )
 
 
-def _hashed_dict(spec: FeatureSpec) -> dict[str, Any]:
+def _hashed_dict(spec: FeatureSpec) -> dict[str, JsonValue]:
     """The fields `feature_version()` hashes: `to_dict()` minus `market_wide`.
 
     `market_wide` joined `to_dict()` after `feature_version()` had already
@@ -1069,7 +1091,7 @@ def render_catalog_markdown(catalog: tuple[FeatureSpec, ...] = CATALOG) -> str:
         "| Column | Unit | Window (sessions) | Cross-sectional | Expression | Inputs |\n"
         "|---|---|---|---|---|---|"
     )
-    rows = []
+    rows: list[str] = []
     for spec in catalog:
         window = "—" if spec.window_trading_days is None else str(spec.window_trading_days)
         rows.append(

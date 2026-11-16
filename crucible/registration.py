@@ -33,12 +33,17 @@ about what "a registrable recipe" means.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, cast
 
-from crucible.slots.arms import load_arm_specs
+from crucible.slots.arms import ArmSpec, load_arm_specs
 from crucible.slots.inputs import InputRefusal
+from crucible.store import Store
+
+if TYPE_CHECKING:
+    from crucible.slots.producibility import PendingDependency
 
 __all__ = ["RecipeLoad", "load_registrable_recipes"]
 
@@ -59,17 +64,17 @@ class RecipeLoad:
     slot: str
     #: The wrappers `crucible.slots.arms.register_arms` folds into a register.
     #: Each carries its own `arm_id` — the hash of its own spec.
-    specs: tuple[Any, ...]
+    specs: tuple[ArmSpec, ...]
     refusals: tuple[InputRefusal, ...]
     #: `MetricRecord`-shaped rows, one per refusal, for the manifest of
     #: whatever job loaded the slot. For U and R these are the catalogue
     #: refusals `experiment.run` files (`alpha-engine-config-I11030`).
-    refusal_metrics: tuple[dict[str, Any], ...]
+    refusal_metrics: tuple[dict[str, object], ...]
     #: The registrable recipes that cannot produce yet, BY DESIGN, and the
     #: declared producer each waits on
     #: (`crucible.slots.producibility.PendingDependency`). Each is also in
     #: ``specs``. U and R only.
-    waiting: tuple[Any, ...] = ()
+    waiting: tuple[PendingDependency, ...] = ()
 
     @property
     def names(self) -> tuple[str, ...]:
@@ -90,7 +95,7 @@ def load_registrable_recipes(
     slot: str,
     *,
     strategy_dir: Path | str | None = None,
-    store: Any = None,
+    store: Store | None = None,
     today: str | None = None,
 ) -> RecipeLoad:
     """Every recipe filed for ``slot``, split into what registers and what does not.
@@ -119,6 +124,13 @@ def load_registrable_recipes(
         )
 
         loaded = load_model_recipes(directory, store=None if directory is not None else store)
+        return RecipeLoad(
+            slot=slot,
+            # The M adapter returns register-compatible ArmSpec wrappers.
+            specs=cast(tuple[ArmSpec, ...], tuple(registration_specs(loaded))),
+            refusals=tuple(loaded.refused),
+            refusal_metrics=tuple(loaded.refusal_metrics(slot=slot)),
+        )
     elif slot == "s":
         from crucible.slots.strategy import (  # noqa: PLC0415 - heavy import, one call site
             load_strategy_slot,
@@ -136,6 +148,13 @@ def load_registrable_recipes(
             register=register,
             today=today,
         )
+        return RecipeLoad(
+            slot=slot,
+            # The S adapter returns register-compatible ArmSpec wrappers.
+            specs=cast(tuple[ArmSpec, ...], tuple(registration_specs(loaded))),
+            refusals=tuple(loaded.refused),
+            refusal_metrics=tuple(loaded.refusal_metrics(slot=slot)),
+        )
     else:
         # `load_arm_specs` takes the strategy ROOT and appends `arms/{slot}`
         # itself; `load_model_recipes` takes the leaf directory. The two are
@@ -144,15 +163,9 @@ def load_registrable_recipes(
             slot, store=store, strategy_dir=Path(strategy_dir) if strategy_dir else None
         )
         return _partition_ranked(slot, specs)
-    return RecipeLoad(
-        slot=slot,
-        specs=tuple(registration_specs(loaded)),
-        refusals=tuple(loaded.refused),
-        refusal_metrics=tuple(loaded.refusal_metrics(slot=slot)),
-    )
 
 
-def _partition_ranked(slot: str, specs: list[Any]) -> RecipeLoad:
+def _partition_ranked(slot: str, specs: Sequence[ArmSpec]) -> RecipeLoad:
     """A U/R slot's recipes, split by the SAME catalogue partition
     `experiment.run` applies before it produces anything.
 
@@ -191,8 +204,8 @@ def _partition_ranked(slot: str, specs: list[Any]) -> RecipeLoad:
         pending_dependency,
     )
 
-    registrable: list[Any] = []
-    waiting: list[Any] = []
+    registrable: list[ArmSpec] = []
+    waiting: list[PendingDependency] = []
     refused: list[InputRefusal] = []
     for spec in specs:
         refusal = catalog_input_refusal(spec)

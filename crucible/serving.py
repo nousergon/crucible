@@ -56,7 +56,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Protocol, cast
 
 from pydantic import ValidationError
 
@@ -103,6 +103,12 @@ PREDICTIONS_FEED_SLOT = "m"
 #: check is not applied — a handful of names can legitimately share a sign.
 MIN_NAMES_FOR_SIGN_CHECK = 50
 
+type JsonValue = str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]
+
+
+class _OutputRecorder(Protocol):
+    def record_output(self, key: str, payload: bytes, schema_version: str = "v1") -> None: ...
+
 
 class PredictionsFeedContractError(RuntimeError):
     """The feed exists at the trader's key and must not be served.
@@ -135,14 +141,14 @@ class PredictionsFeed:
     #: `alpha-engine-config-I11791`: the champion's per-name std fields and
     #: their method, republished verbatim from the source document. Empty
     #: when the source carries none — the feed never computes one.
-    uncertainty: dict[str, Any] = field(default_factory=dict)
+    uncertainty: dict[str, JsonValue] = field(default_factory=dict)
 
     @property
     def predicted_alpha_std(self) -> dict[str, float] | None:
         """The TOTAL std the executor's conviction gate reads, or ``None``."""
-        return self.uncertainty.get("predicted_alpha_std")
+        return cast(dict[str, float] | None, self.uncertainty.get("predicted_alpha_std"))
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, JsonValue]:
         return {
             "schema_version": self.schema_version,
             "slot": self.slot,
@@ -161,7 +167,7 @@ class PredictionsFeed:
         return json.dumps(self.to_dict(), indent=2, sort_keys=True).encode("utf-8")
 
 
-def _validate(payload: dict[str, Any]) -> PredictionsFeedDocument:
+def _validate(payload: dict[str, JsonValue]) -> PredictionsFeedDocument:
     try:
         return PredictionsFeedDocument.model_validate(payload)
     except ValidationError as exc:
@@ -179,7 +185,7 @@ def publish_predictions_feed(
     *,
     trading_day: str,
     slot: str = PREDICTIONS_FEED_SLOT,
-    ctx: Any = None,
+    ctx: _OutputRecorder | None = None,
     strategy_dir: Path | str | None = None,
 ) -> str | None:
     """Republish the champion's cross-section at the trader's key; return it.
@@ -235,7 +241,7 @@ def publish_promoted_feed(
     store: Store,
     *,
     pointer: ChampionPointer,
-    ctx: Any = None,
+    ctx: _OutputRecorder | None = None,
     strategy_dir: Path | str | None = None,
 ) -> str:
     """Republish the feed for a pointer `promote` has JUST written; return the key.
@@ -293,7 +299,7 @@ def servable_source(store: Store, *, arm_id: str, trading_day: str) -> str:
 
 def _load_source(
     store: Store, *, arm_id: str, trading_day: str, named_by: str | None = None
-) -> tuple[str, dict[str, Any]]:
+) -> tuple[str, dict[str, JsonValue]]:
     # Imported here, not at module scope: `crucible.slots.cycle` imports the
     # grading stack, and `crucible.promote` — this module's caller — is on
     # the import path of the CLI's fastest job. A local import keeps the
@@ -313,7 +319,8 @@ def _load_source(
         ) from exc
 
     try:
-        document = load_document_bytes(source_key, payload)
+        # The shared JSON reader is intentionally untyped; this is its JSON boundary.
+        document = cast(dict[str, JsonValue], load_document_bytes(source_key, payload))
     except UnreadableDocumentError as exc:
         raise PredictionsFeedContractError(
             f"{source_key!r} is not readable JSON and is the document the trader's "
@@ -330,7 +337,7 @@ def _publish(
     arm_id: str,
     trading_day: str,
     slot: str,
-    ctx: Any,
+    ctx: _OutputRecorder | None,
     strategy_dir: Path | str | None,
 ) -> str:
     source_key, document = _load_source(
@@ -358,7 +365,10 @@ def _publish(
         champion=arm_id,
         feature_version=str(document["feature_version"]),
         source_key=source_key,
-        predicted_alpha={str(k): float(v) for k, v in document["predicted_alpha"].items()},
+        predicted_alpha={
+            str(k): float(cast(str | int | float | bool, v))
+            for k, v in cast(dict[str, JsonValue], document["predicted_alpha"]).items()
+        },
         uncertainty=_uncertainty_fields(document),
     )
     _validate(feed.to_dict())
@@ -406,26 +416,28 @@ _UNCERTAINTY_KEYS: tuple[str, ...] = (
 )
 
 
-def _uncertainty_fields(document: dict[str, Any]) -> dict[str, Any]:
+def _uncertainty_fields(document: dict[str, JsonValue]) -> dict[str, JsonValue]:
     """The source's std fields, verbatim, for whichever of them it carries.
 
     `alpha-engine-config-I11791`. A republication, like everything else here:
     the std the trader reads is the std the champion's produce run wrote and
     its grade calibrated, never one this module derives.
     """
-    out: dict[str, Any] = {}
+    out: dict[str, JsonValue] = {}
     for key in _UNCERTAINTY_KEYS:
         if key not in document:
             continue
         value = document[key]
         out[key] = (
-            {str(k): float(v) for k, v in value.items()} if isinstance(value, dict) else value
+            {str(k): float(cast(str | int | float | bool, v)) for k, v in value.items()}
+            if isinstance(value, dict)
+            else value
         )
     return out
 
 
 def _assert_source_is_this_session(
-    document: dict[str, Any], source_key: str, arm_id: str, trading_day: str
+    document: dict[str, JsonValue], source_key: str, arm_id: str, trading_day: str
 ) -> None:
     """The point-in-time guard, restated on the serving path.
 
@@ -489,7 +501,7 @@ def read_predictions_feed(store: Store, trading_day: str) -> PredictionsFeed:
         raw = load_document_bytes(key, payload)
     except UnreadableDocumentError as exc:
         raise PredictionsFeedContractError(f"{key!r} is not readable JSON: {exc}") from exc
-    document = _validate(raw)
+    document = _validate(cast(dict[str, JsonValue], raw))
     if document.trading_day != trading_day:
         raise PredictionsFeedContractError(
             f"{key!r} carries trading_day {document.trading_day!r}, not {trading_day!r}. "
@@ -506,7 +518,8 @@ def read_predictions_feed(store: Store, trading_day: str) -> PredictionsFeed:
         predicted_alpha=dict(document.predicted_alpha),
         schema_version=document.schema_version,
         uncertainty={
-            key: (dict(value) if isinstance(value, dict) else value)
+            # Pydantic has validated these fields; cast recovers that boundary's mapping type.
+            key: (cast(dict[str, JsonValue], value) if isinstance(value, dict) else value)
             for key in _UNCERTAINTY_KEYS
             if (value := getattr(document, key)) is not None
         },

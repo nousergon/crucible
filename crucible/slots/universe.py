@@ -28,21 +28,53 @@ This module is a binding, not an implementation: the loop is
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, TypedDict, Unpack
 
 from crucible.config import Settings
 from crucible.keys import universe_members_key
 from crucible.slots.cycle import run_grade, run_produce, run_produce_history, run_serve_daily
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from nousergon_lib.arena.engine import ServingPrecondition
+    from nousergon_lib.arena.window import ArmSeries
+
     from crucible.runner import RunContext
+    from crucible.slots.arms import ArmSpec
 
 __all__ = ["SLOT", "grade", "produce", "produce_history", "serve_daily"]
 
 SLOT = "u"
 
 
-def produce(ctx: RunContext, *, settings: Settings, **kwargs: Any) -> dict[str, Any]:
+class _ProduceKwargs(TypedDict, total=False):
+    """The keywords `run_produce` and `run_produce_history` take beyond the binding's own."""
+
+    arm_name: str | None
+    feature_version: str
+
+
+class _ServeDailyKwargs(TypedDict, total=False):
+    """The keywords `run_serve_daily` takes beyond the binding's own."""
+
+    feature_version: str
+
+
+class _GradeKwargs(TypedDict, total=False):
+    """The keywords :func:`crucible.slots.cycle.run_grade` takes beyond the binding's own."""
+
+    horizon_trading_days: int
+    feature_version: str
+    specs: Sequence[ArmSpec] | None
+    preconditions: dict[str, list[ServingPrecondition]] | None
+    series: dict[str, ArmSeries] | None
+    settled_dates: Sequence[str] | None
+
+
+def produce(
+    ctx: RunContext, *, settings: Settings, **kwargs: Unpack[_ProduceKwargs]
+) -> dict[str, object]:
     """Run every registered U arm's cut for one trading day."""
     return run_produce(
         ctx,
@@ -53,7 +85,9 @@ def produce(ctx: RunContext, *, settings: Settings, **kwargs: Any) -> dict[str, 
     )
 
 
-def produce_history(ctx: RunContext, *, settings: Settings, **kwargs: Any) -> dict[str, Any]:
+def produce_history(
+    ctx: RunContext, *, settings: Settings, **kwargs: Unpack[_ProduceKwargs]
+) -> dict[str, object]:
     """Produce the selected U arm for ONE historical session. Serves nothing.
 
     `experiment.backfill`'s per-session entry point
@@ -64,7 +98,9 @@ def produce_history(ctx: RunContext, *, settings: Settings, **kwargs: Any) -> di
     return run_produce_history(ctx, slot=SLOT, settings=settings, **kwargs)
 
 
-def serve_daily(ctx: RunContext, *, settings: Settings, **kwargs: Any) -> dict[str, Any]:
+def serve_daily(
+    ctx: RunContext, *, settings: Settings, **kwargs: Unpack[_ServeDailyKwargs]
+) -> dict[str, object]:
     """`serve.daily --slot u`: publish the U champion's cut for ONE session.
 
     `alpha-engine-config-I12021`. The S slot's eligibility mask on a session
@@ -81,6 +117,8 @@ def serve_daily(ctx: RunContext, *, settings: Settings, **kwargs: Any) -> dict[s
     )
 
 
-def grade(ctx: RunContext, *, settings: Settings, **kwargs: Any) -> dict[str, Any]:
+def grade(
+    ctx: RunContext, *, settings: Settings, **kwargs: Unpack[_GradeKwargs]
+) -> dict[str, object]:
     """Score every settled U cut and run the slot's arena cycle."""
     return run_grade(ctx, slot=SLOT, settings=settings, **kwargs)

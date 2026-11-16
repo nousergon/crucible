@@ -52,6 +52,7 @@ weight anything reads; recording one would be a field nothing honours.
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import datetime as dt
 import json
@@ -60,7 +61,7 @@ import re
 from collections.abc import Mapping, Sequence
 from functools import cache
 from pathlib import Path
-from typing import Any
+from typing import TypedDict, cast
 
 from jsonschema import Draft202012Validator
 
@@ -103,6 +104,26 @@ _RULING_RE = re.compile(RULING_REFERENCE_PATTERN)
 _RULED_AT_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(:[0-9]{2})?Z$")
 _HTTPS_RE = re.compile(r"^https://\S+$")
 
+type JsonValue = str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]
+
+
+class BenchDocument(TypedDict):
+    schema_version: str
+    slot: str
+    weight: int
+    disposition: str
+    ruled_by: str
+    ruled_at: str
+    ruling_ref: str
+    tracker: str
+    reason: str
+    evidence: list[str]
+    champion_at_bench: str
+    effective_trading_day: str
+    reexam_date: str
+    filed_by: str
+    filed_at_utc: str
+
 
 class SlotBenchError(ValueError):
     """A bench record exists and cannot be honoured as what it claims to be.
@@ -118,13 +139,19 @@ class BenchRulingRequiredError(SlotBenchError):
 
 @cache
 def _validator() -> Draft202012Validator:
-    schema = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
+    schema = cast("dict[str, object]", json.loads(_SCHEMA_PATH.read_text(encoding="utf-8")))
     Draft202012Validator.check_schema(schema)
     return Draft202012Validator(schema)
 
 
-def _validate(document: Mapping[str, Any], *, source: str) -> None:
-    errors = sorted(_validator().iter_errors(document), key=lambda e: list(e.path))
+def _validate(document: Mapping[str, object], *, source: str) -> None:
+    # jsonschema's recursive JSON type cannot express a validated Mapping protocol.
+    errors = sorted(
+        _validator().iter_errors(  # pyright: ignore[reportUnknownMemberType] - jsonschema yields untyped ValidationError objects
+            cast("JsonValue", document)
+        ),
+        key=lambda e: list(e.path),
+    )
     if errors:
         paths = "; ".join(
             f"{'/'.join(str(part) for part in e.path) or '<root>'}: {e.message}" for e in errors
@@ -145,7 +172,7 @@ class SlotBench:
 
     key: str
     digest: str
-    document: Mapping[str, Any]
+    document: BenchDocument
 
     @property
     def slot(self) -> str:
@@ -214,7 +241,9 @@ def read_slot_bench(store: Store, slot: str) -> SlotBench | None:
             f"{key} records slot {document['slot']!r}; a bench filed at another slot's key "
             "is not this slot's ruling."
         )
-    return SlotBench(key=key, digest=payload_digest(document), document=document)
+    return SlotBench(
+        key=key, digest=payload_digest(document), document=cast("BenchDocument", document)
+    )
 
 
 def active_bench(store: Store, slot: str, trading_day: str) -> SlotBench | None:
@@ -257,7 +286,7 @@ def bench_document(
     filed_by: str,
     filed_at_utc: str,
     filed_on: str,
-) -> dict[str, Any]:
+) -> BenchDocument:
     """Build and validate one `slot_bench.v1` document, or refuse.
 
     Every ruling field is checked by name BEFORE the schema runs, so the
@@ -276,7 +305,7 @@ def bench_document(
             "keeps the pointer and its feed in force and zeroes only the alpha; with no "
             "pointer there is nothing for it to keep."
         )
-    document = {
+    document: BenchDocument = {
         "schema_version": SLOT_BENCH_SCHEMA_VERSION,
         "slot": slot,
         "weight": 0,
@@ -335,12 +364,12 @@ def bench_document(
     return document
 
 
-def bench_record_bytes(document: Mapping[str, Any]) -> bytes:
+def bench_record_bytes(document: Mapping[str, object]) -> bytes:
     """The stored bytes: indented, sorted keys — the digest is over the canonical form."""
     return json.dumps(dict(document), indent=2, sort_keys=True).encode("utf-8")
 
 
-def add_bench_arguments(parser: Any) -> None:
+def add_bench_arguments(parser: argparse.ArgumentParser) -> None:
     """The `crucible bench` flag surface, beside the handler that reads it."""
     parser.add_argument(
         "--slot",
@@ -401,7 +430,7 @@ def add_bench_arguments(parser: Any) -> None:
     )
 
 
-def bench_handler(args: Any) -> int:
+def bench_handler(args: argparse.Namespace) -> int:
     """`crucible bench --slot m --ruled-by … --ruled-at … --ruling-ref … --tracker …
     --reason … --evidence … --effective … --reexam …`.
 
