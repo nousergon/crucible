@@ -60,7 +60,7 @@ import argparse
 import datetime as dt
 import json
 from dataclasses import asdict, dataclass
-from typing import Literal
+from typing import Literal, Protocol, TypedDict, cast
 
 from crucible.release import (
     RELEASE_OBJECT_LOCK_RETENTION,
@@ -69,7 +69,7 @@ from crucible.release import (
     release_prefix,
     retention_meets_target,
 )
-from crucible.release_lock_sweep import _RELEASE_OBJECT_RE
+from crucible.release_lock_sweep import _RELEASE_OBJECT_RE  # pyright: ignore[reportPrivateUsage] - this is the sweep's canonical identity-object pattern
 from crucible.runner import RunContext, run_job
 from crucible.store import S3Store, Store, open_store
 
@@ -96,6 +96,27 @@ RETENTION_EXTENDED: Literal["extended"] = "extended"
 RETENTION_UNCHANGED: Literal["unchanged"] = "unchanged"
 
 RetentionAction = Literal["applied", "extended", "unchanged"]
+
+
+class _Retention(TypedDict):
+    Mode: str
+    RetainUntilDate: dt.datetime
+
+
+class _RetentionResponse(TypedDict, total=False):
+    Retention: _Retention
+
+
+class _Error(TypedDict, total=False):
+    Code: str
+
+
+class _ErrorResponse(TypedDict, total=False):
+    Error: _Error
+
+
+class _ClientError(Protocol):
+    response: _ErrorResponse
 
 
 class ReleaseHasNoRecordError(RuntimeError):
@@ -150,12 +171,18 @@ def _current_retention(store: S3Store, s3_key: str) -> tuple[str | None, dt.date
     this job apply a *second*, possibly weaker, lock over one it simply could
     not see — the opposite of a repair.
     """
-    from botocore.exceptions import ClientError  # noqa: PLC0415 - lazy, mirrors crucible.store
+    from botocore.exceptions import ClientError  # pyright: ignore[reportMissingTypeStubs]  # noqa: PLC0415 - botocore ships no type information; lazy, mirrors crucible.store
 
     try:
-        resp = store.client.get_object_retention(Bucket=store.bucket, Key=s3_key)
+        # S3Store.client is the untyped SDK boundary.
+        resp = cast(
+            _RetentionResponse,
+            store.client.get_object_retention(Bucket=store.bucket, Key=s3_key),
+        )
     except ClientError as exc:
-        if store._error_code(exc) == "NoSuchObjectLockConfiguration":
+        # botocore has no type information for ClientError.response.
+        error = cast(_ClientError, exc).response.get("Error", {})
+        if error.get("Code", "") == "NoSuchObjectLockConfiguration":
             return None, None
         raise
     retention = resp.get("Retention") or {}
@@ -169,7 +196,7 @@ def _plan_one(store: S3Store, key: str) -> tuple[RetentionApplyResult, dict[str,
     a ``None`` plan, which is what makes a dry run and the idempotent-rerun
     case share this exact function with the real apply path.
     """
-    s3_key = store._s3_key(key)
+    s3_key = store._s3_key(key)  # pyright: ignore[reportPrivateUsage] - Object Lock needs the backend key
     head = store.client.head_object(Bucket=store.bucket, Key=s3_key)
     last_modified = head["LastModified"]
     target_mode, target_retain_until = release_object_lock_params(store, now=last_modified)
