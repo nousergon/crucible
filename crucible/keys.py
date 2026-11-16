@@ -72,6 +72,8 @@ __all__ = [
     "TRIGGER_RE",
     "TRIGGER_UNKNOWN",
     "WEEKLY_ARC_LOCK_KEY",
+    "WEEKLY_BACKSTOP_EXHAUSTED_NAME",
+    "WEEKLY_BACKSTOP_ROOT",
     "acceptance_reading_key",
     "arena_cycle_key",
     "arm_id_from_segment",
@@ -138,6 +140,7 @@ __all__ = [
     "parse_fault_injection_key",
     "parse_manifest_key",
     "parse_migration_key",
+    "parse_weekly_backstop_exhausted_key",
     "predictions_key",
     "reopen_record_key",
     "retirement_log_key",
@@ -162,6 +165,8 @@ __all__ = [
     "trader_reconciliation_key",
     "universe_members_key",
     "verdict_key",
+    "weekly_backstop_exhausted_key",
+    "weekly_backstop_prefix",
 ]
 
 #: `:` is legal in an S3 key and hostile in every path-shaped tool that
@@ -435,6 +440,47 @@ def parse_dispatch_exit_key(key: str) -> tuple[str, str] | None:
         return None
     _, _, job, filename = parts
     return job, filename[: -len(DISPATCH_EXIT_SUFFIX)]
+
+
+#: Where the crucible-v2 dispatcher's weekday weekly-arc backstop keeps its
+#: append-only markers (`alpha-engine-config-I13712`): one directory per owed
+#: week, holding `attempt-<n>.json` per relaunch and, once it has stopped
+#: relaunching, ONE `exhausted.json`. Written by the dispatcher Lambda, never
+#: by this package; five segments deep, so :func:`parse_dispatch_key` and
+#: :func:`parse_dispatch_exit_key` refuse every key under it.
+WEEKLY_BACKSTOP_ROOT = f"{DISPATCH_ROOT}weekly-backstop/"
+WEEKLY_BACKSTOP_EXHAUSTED_NAME = "exhausted.json"
+
+
+def _is_iso_date(value: str) -> bool:
+    try:
+        return dt.date.fromisoformat(value).isoformat() == value
+    except ValueError:
+        return False
+
+
+def weekly_backstop_prefix() -> str:
+    """`runs/_dispatch/weekly-backstop/` — every week's backstop markers."""
+    return WEEKLY_BACKSTOP_ROOT
+
+
+def weekly_backstop_exhausted_key(week: str) -> str:
+    """`runs/_dispatch/weekly-backstop/{week}/exhausted.json` — the incident
+    marker the backstop writes once per week after its last relaunch."""
+    if not _is_iso_date(week):
+        raise ValueError(f"week {week!r} must be an ISO date (YYYY-MM-DD)")
+    return f"{WEEKLY_BACKSTOP_ROOT}{week}/{WEEKLY_BACKSTOP_EXHAUSTED_NAME}"
+
+
+def parse_weekly_backstop_exhausted_key(key: str) -> str | None:
+    """The inverse of :func:`weekly_backstop_exhausted_key`: the week, or
+    ``None`` for any other key (an `attempt-<n>.json`, a malformed date)."""
+    if not key.startswith(WEEKLY_BACKSTOP_ROOT):
+        return None
+    parts = key[len(WEEKLY_BACKSTOP_ROOT) :].split("/")
+    if len(parts) != 2 or parts[1] != WEEKLY_BACKSTOP_EXHAUSTED_NAME or not _is_iso_date(parts[0]):
+        return None
+    return parts[0]
 
 
 def arm_key_segment(arm_id: str) -> str:
