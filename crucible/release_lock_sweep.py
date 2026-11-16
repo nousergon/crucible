@@ -88,6 +88,7 @@ class _S3Client(Protocol):
 
     def get_object_retention(self, *, Bucket: str, Key: str) -> _GetObjectRetentionOutput: ...
 
+
 #: A key under `releases/{sha}/` that is a published release IDENTITY
 #: object — the wheel or `release.json` — and nothing else. Never a
 #: provenance record (one per publish ATTEMPT, never lock-checked:
