@@ -484,6 +484,13 @@ jobs:
       # crucible-v2.yaml), or every deploy turns red on AccessDenied.
       - name: Ask the dispatcher to resume the week if its arc reads failed
         if: ${{ success() && vars.CRUCIBLE_DISPATCHER_FUNCTION != '' }}
+        # The release is already live and recorded when this runs, so its
+        # failure must not paint the release red. It is a request, not part of
+        # the release: a refused or failed invoke leaves an error annotation on
+        # the run, and the 07:00 ET weekly firing retries the week anyway.
+        # Measured 2026-11-16: the variable was set before the deploy role held
+        # lambda:InvokeFunction, and two successful releases read as failed.
+        continue-on-error: true
         env:
           DISPATCHER_FUNCTION: ${{ vars.CRUCIBLE_DISPATCHER_FUNCTION }}
           SHA: ${{ needs.build.outputs.sha }}
@@ -733,6 +740,13 @@ jobs:
       # crucible-v2.yaml), or every deploy turns red on AccessDenied.
       - name: Ask the dispatcher to resume the week if its arc reads failed
         if: ${{ success() && vars.CRUCIBLE_DISPATCHER_FUNCTION != '' }}
+        # The release is already live and recorded when this runs, so its
+        # failure must not paint the release red. It is a request, not part of
+        # the release: a refused or failed invoke leaves an error annotation on
+        # the run, and the 07:00 ET weekly firing retries the week anyway.
+        # Measured 2026-11-16: the variable was set before the deploy role held
+        # lambda:InvokeFunction, and two successful releases read as failed.
+        continue-on-error: true
         env:
           DISPATCHER_FUNCTION: ${{ vars.CRUCIBLE_DISPATCHER_FUNCTION }}
           SHA: ${{ needs.build.outputs.sha }}
