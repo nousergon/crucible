@@ -1104,6 +1104,9 @@ class TestTheWorkflowItself:
         assert names.index("Record the deploy manifest") == len(steps) - 2
         assert "vars.CRUCIBLE_DISPATCHER_FUNCTION != ''" in resume["if"]
         assert "success()" in resume["if"]
+        assert resume.get("continue-on-error") is True, (
+            "the release is live before this step; a failed request must not mark it failed"
+        )
         assert "only_if_failed: true" in resume["run"]
         assert 'args: "--skip-if-ok"' in resume["run"]
         assert "--date" not in resume["run"], (
