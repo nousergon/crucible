@@ -134,10 +134,32 @@ class TestEvaluateOverdueBreaks:
         _write(store, FRIDAY, [_row(EXCEPTION_SCORE_METRIC, "OK", "0 overdue")])
         assert evaluate_back_office_breaks(store, now=SATURDAY_NIGHT) == []
 
-    def test_an_unfiled_score_is_not_an_overdue_reading(self, tmp_path: pathlib.Path) -> None:
+    @pytest.mark.parametrize("with_overdue_row", [False, True])
+    def test_an_unfiled_score_pages(
+        self, tmp_path: pathlib.Path, *, with_overdue_row: bool
+    ) -> None:
         store = LocalStore(tmp_path)
-        _write(store, FRIDAY, [_row(EXCEPTION_SCORE_METRIC, "FAIL", "NOT filed"), "junk"])
+        metrics: list[object] = [_row(EXCEPTION_SCORE_METRIC, "FAIL", "HeadObject 403")]
+        if with_overdue_row:
+            metrics.extend(_overdue("OK", "nothing overdue"))
+        _write(store, FRIDAY, metrics)
         _write(store, THURSDAY, [], run_id="01JG0000000000000000000RC0")
+        (page,) = evaluate_back_office_breaks(store, now=SATURDAY_NIGHT)
+        assert "exception_score_filed: HeadObject 403" in page.reason
+
+    def test_any_failed_back_office_step_pages_with_its_reason(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        store = LocalStore(tmp_path)
+        _write(store, FRIDAY, [_row("performance_statement", "FAIL", "statement NOT filed")])
+        (page,) = evaluate_back_office_breaks(store, now=SATURDAY_NIGHT)
+        assert "performance_statement: statement NOT filed" in page.reason
+
+    def test_a_broker_row_failing_is_not_a_back_office_break(self, tmp_path: pathlib.Path) -> None:
+        """The broker's breaks fail the reconcile run and page under its own
+        job; the back-office label must not page them a second time."""
+        store = LocalStore(tmp_path)
+        _write(store, FRIDAY, [_row("order_intent_reconciliation_breaks", "FAIL", "2 breaks")])
         assert evaluate_back_office_breaks(store, now=SATURDAY_NIGHT) == []
 
     def test_a_manifest_with_no_metric_list_is_skipped(self, tmp_path: pathlib.Path) -> None:
@@ -214,7 +236,7 @@ class TestEvaluateOverdueBreaks:
         the lookback never slides, so the incident keeps one identity."""
         store = LocalStore(tmp_path)
         day = FRIDAY
-        days = []
+        days: list[dt.date] = []
         for _ in range(OVERDUE_LOOKBACK_TRADING_DAYS + 5):
             days.append(day)
             day = previous_trading_day(day)
@@ -287,6 +309,69 @@ class TestTheSweepPagesAnOverdueQueue:
         assert len(self._rows(store, second)) == 1
         sent = [c for c in transport.calls if BACK_OFFICE_JOB in c.message]
         assert len(sent) == 1  # re-observed by the second sweep, never re-sent
+
+    @staticmethod
+    def _queue(day: dt.date, items: list[tuple[str, str, int]]) -> list[object]:
+        """The producer's wording: the day and every age move each trading day."""
+        named = "; ".join(f"{pid} ({opened}, {age} trading days)" for pid, opened, age in items)
+        return _overdue(
+            reason=(
+                f"{len(items)} back-office queue items on {day.isoformat()} are older than "
+                f"3 trading days with no decision, oldest first: {named}"
+            )
+        )
+
+    def test_a_new_member_of_a_standing_backlog_is_sent_once(
+        self, tmp_path: pathlib.Path, transport: CapturingTransport
+    ) -> None:
+        store = LocalStore(tmp_path)
+        _write(store, THURSDAY, self._queue(THURSDAY, [("prop-1", "2026-08-21", 4)]))
+        sweep(store, now=SATURDAY_NIGHT, transport=transport, sweep_run_id="Z" * 26)
+
+        both = [("prop-1", "2026-08-21", 5), ("prop-2", "2026-08-24", 4)]
+        _write(store, FRIDAY, self._queue(FRIDAY, both))
+        later = SATURDAY_NIGHT + dt.timedelta(days=1)
+        sweep(store, now=later, transport=transport, sweep_run_id="Y" * 26)
+        last = sweep(store, now=later, transport=transport, sweep_run_id="X" * 26)
+
+        sent = [call for call in transport.calls if BACK_OFFICE_JOB in call.message]
+        assert len(sent) == 2
+        assert "prop-2 (2026-08-24, 4 trading days)" in sent[-1].message
+        (row,) = self._rows(store, last)
+        assert row["observations"] == 3  # one incident, one row, updated in place
+
+    def test_an_unchanged_backlog_ageing_a_day_is_not_re_sent(
+        self, tmp_path: pathlib.Path, transport: CapturingTransport
+    ) -> None:
+        store = LocalStore(tmp_path)
+        _write(store, THURSDAY, self._queue(THURSDAY, [("prop-1", "2026-08-21", 4)]))
+        sweep(store, now=SATURDAY_NIGHT, transport=transport, sweep_run_id="Z" * 26)
+        _write(store, FRIDAY, self._queue(FRIDAY, [("prop-1", "2026-08-21", 5)]))
+        later = SATURDAY_NIGHT + dt.timedelta(days=1)
+        sweep(store, now=later, transport=transport, sweep_run_id="Y" * 26)
+
+        sent = [call for call in transport.calls if BACK_OFFICE_JOB in call.message]
+        assert len(sent) == 1
+
+    def test_a_newly_failing_step_in_a_standing_streak_is_sent(
+        self, tmp_path: pathlib.Path, transport: CapturingTransport
+    ) -> None:
+        store = LocalStore(tmp_path)
+        _write(store, THURSDAY, self._queue(THURSDAY, [("prop-1", "2026-08-21", 4)]))
+        sweep(store, now=SATURDAY_NIGHT, transport=transport, sweep_run_id="Z" * 26)
+        friday = self._queue(FRIDAY, [("prop-1", "2026-08-21", 5)])
+        friday.append(_row("ledger_book_of_record", "FAIL", "roll-forward broke"))
+        _write(store, FRIDAY, friday)
+        sweep(
+            store,
+            now=SATURDAY_NIGHT + dt.timedelta(days=1),
+            transport=transport,
+            sweep_run_id="Y" * 26,
+        )
+
+        sent = [call for call in transport.calls if BACK_OFFICE_JOB in call.message]
+        assert len(sent) == 2
+        assert "ledger_book_of_record: roll-forward broke" in sent[-1].message
 
     def test_an_unreadable_streak_start_still_pages_the_latest_day(
         self, tmp_path: pathlib.Path

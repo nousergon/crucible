@@ -30,10 +30,11 @@ healthy, and that includes the thing whose job is to notice silence.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
@@ -2375,17 +2376,29 @@ EXCEPTION_OVERDUE_METRIC = "exception_queue_overdue"
 #: only when the dedicated row is absent, so a trader PINNED before that row
 #: existed still pages.
 EXCEPTION_SCORE_METRIC = "exception_score_filed"
-#: Every row whose FAIL is a back-office break that must not stay silent
-#: (I13129: "each check raises a break when it fails rather than staying
-#: silent"). `ledger_book_of_record` (step 5d) is FAIL when the ledger did not
-#: post or a 1h check broke: roll-forward, completeness, break aging, period
-#: lock, the daily rebuild. `month_rebuild` (5g) is FAIL when a published
-#: close, statement or fee bill does not rebuild from raw. Its WATCH (a gap
-#: booked to suspense) is not here: that gap is a queue item, and ages there.
+#: Every row a back-office step (crucible-trader steps 5b-5h) files, whose
+#: FAIL is a back-office break that must not stay silent (I13129: "each check
+#: raises a break when it fails rather than staying silent"; I13598: an
+#: unfiled score paged nobody for three days). Each step reports a row and
+#: none raises. `ledger_book_of_record` (step 5d) is FAIL when the ledger did
+#: not post or a 1h check broke: roll-forward, completeness, break aging,
+#: period lock, the daily rebuild. `month_rebuild` (5g) is FAIL when a
+#: published close, statement or fee bill does not rebuild from raw. Its WATCH
+#: (a gap booked to suspense) is not here: that gap is a queue item, and ages
+#: there. The broker rows the same manifest carries (steps 3-5a) are NOT here:
+#: a broker break fails the reconcile run itself and pages under its job, and
+#: "the broker disagrees" is a different thing to go and do (see
+#: :data:`BACK_OFFICE_JOB`).
 BACK_OFFICE_FAIL_METRICS: tuple[str, ...] = (
     EXCEPTION_OVERDUE_METRIC,
+    EXCEPTION_SCORE_METRIC,
+    "exception_records_filed",
+    "exception_proposals_filed",
     "ledger_book_of_record",
+    "benchmark_closes_capture",
+    "performance_statement",
     "month_rebuild",
+    "books_worm_retention",
 )
 #: How far back the sweep looks for the latest reading, and the longest run of
 #: days with no reading the walk back to a failing streak's first day crosses.
@@ -2464,7 +2477,7 @@ def evaluate_back_office_breaks(
     ledger (5d: roll-forward, completeness, break aging, period lock, daily
     rebuild) and rebuilds a published month from raw (5g). Each reports a
     metric row and none raises, by design, so the reconcile verdict stays
-    the broker's. That left all three silent: the manifest exists (no
+    the broker's. That left failed steps silent: the manifest exists (no
     ABSENCE) and its status says nothing about them (no FAILURE). The rows
     paged nobody; :data:`BACK_OFFICE_FAIL_METRICS` lists which now do.
 
@@ -2540,8 +2553,7 @@ def evaluate_back_office_breaks(
                 "    Resolution: an overdue item needs agree or correct on the back-office "
                 "review page (a deferral keeps it queued); a ledger or rebuild failure "
                 "needs its cause found in that day's trader/ledger/ documents. Confirm "
-                f"the next {TRADER_RECONCILE_JOB} manifest has none of "
-                f"{', '.join(BACK_OFFICE_FAIL_METRICS)} at FAIL."
+                f"the next {TRADER_RECONCILE_JOB} manifest has no back-office row at FAIL."
             ),
             run_id=run_id,
             synthetic=synthetic,
@@ -2907,9 +2919,10 @@ def topic_arn(*, legacy: bool = False) -> str | None:
 def send(
     group: PageGroup,
     *,
-    alert_id: str,
+    alert_id: str | None,
     legacy: bool = False,
     transport: Callable[..., Any] | None = None,
+    dedup_key: str | None = None,
 ) -> tuple[bool, str]:
     """Deliver one page group through `krepis.alerts`. Returns ``(sent, destination)``.
 
@@ -2945,7 +2958,7 @@ def send(
             if group.synthetic
             else f"crucible-v2/{group.condition}"
         ),
-        dedup_key=incident_key(group),
+        dedup_key=dedup_key or incident_key(group),
         dedup_window_min=None,
         sns_topic_arn=topic_arn(legacy=legacy),
         raise_on_total_failure=True,
@@ -3075,7 +3088,10 @@ def emit(
     is not silence — the existing row's `observations` and
     `last_observed_utc` advance, so "still open, seen by three sweeps" is
     readable from the artifact, and the incident is counted once against the
-    ceiling instead of once per sweep execution.
+    ceiling instead of once per sweep execution. The one exception is a
+    back-office incident that GAINS a member (:func:`_back_office_gain`): the
+    gain is sent as an update to the same incident, and no second row is
+    written.
 
     Suppressing HERE rather than relying on the transport's dedup marker is
     deliberate: the marker lives in another bucket and its absence is
@@ -3092,6 +3108,18 @@ def emit(
     for gp in groups:
         key = bus_key(gp)
         if store.exists(key):
+            update_key = _back_office_gain(store, key, gp)
+            if update_key is not None:
+                route_legacy = legacy or (
+                    bool(gp.synthetic) and synthetic_routing_active(on=moment)
+                )
+                send(
+                    gp,
+                    alert_id=_alert_id_for(gp, sweep_run_id),
+                    legacy=route_legacy,
+                    transport=transport,
+                    dedup_key=update_key,
+                )
             _record_reobservation(store, key, gp, stamp)
             keys.append(key)
             continue
@@ -3168,6 +3196,60 @@ def _record_reobservation(store: Store, key: str, group: PageGroup, stamp: str) 
     row["last_observed_utc"] = stamp
     row["members_now"] = _members(group)
     store.compare_and_swap(key, expected, _dump_row(row))
+
+
+#: One overdue queue item as the producer names it in a reason:
+#: ``<proposal_id> (<trading_day>, <age> trading days)``. The age is left out
+#: of the identity on purpose: it grows every trading day for the same item.
+_OVERDUE_ITEM = re.compile(r"([^\s;:,()]+) \((\d{4}-\d{2}-\d{2}), \d+ trading days\)")
+#: The overdue count: the dedicated row's ``<n> back-office queue items`` or
+#: the legacy score row's ``<n> overdue``.
+_OVERDUE_COUNT = re.compile(r"(\d+) (?:back-office queue items|overdue)\b")
+
+
+def _back_office_facts(members: Iterable[tuple[str, str]]) -> tuple[frozenset[str], int]:
+    """What a standing back-office incident is ABOUT, from its members'
+    ``(job, reason)``: the failing steps, the named overdue items, and the
+    overdue count. Dates, ages and wording that change for the same backlog
+    every trading day are not facts, so re-reading an unchanged queue on a
+    later day reads the same facts."""
+    facts: set[str] = set()
+    count = 0
+    for job, reason in members:
+        if job != BACK_OFFICE_JOB:
+            continue
+        headline = reason.split("\n", 1)[0].removeprefix("back-office break: ")
+        for segment in headline.split(" | "):
+            step, _, detail = segment.partition(": ")
+            facts.add(f"step:{step}")
+            facts.update(f"item:{item}@{day}" for item, day in _OVERDUE_ITEM.findall(detail))
+            if step in (EXCEPTION_OVERDUE_METRIC, EXCEPTION_SCORE_METRIC):
+                found = _OVERDUE_COUNT.search(detail)
+                if found is not None:
+                    count = max(count, int(found.group(1)))
+    return frozenset(facts), count
+
+
+def _back_office_gain(store: Store, key: str, group: PageGroup) -> str | None:
+    """`alpha-engine-config-I13598`: the update key when a standing back-office
+    incident GAINED a member since the last sweep (a newly failing step, a
+    newly named overdue item, or a larger overdue count), else None.
+
+    One incident per streak stays the rule; a gain is a visible update to it,
+    never a second incident, and the transport dedups the update on the facts
+    it carries, so a later sweep that reads the same facts sends nothing."""
+    now_facts, now_count = _back_office_facts((m.job, m.reason) for m in group.members)
+    if not now_facts:
+        return None
+    row = load_store_document(store, key)
+    previous = cast("list[dict[str, object]]", row["members_now"])
+    was_facts, was_count = _back_office_facts((str(m["job"]), str(m["reason"])) for m in previous)
+    if now_facts <= was_facts and now_count <= was_count:
+        return None
+    fingerprint = hashlib.sha256(
+        json.dumps([sorted(now_facts), now_count]).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"{incident_key(group)}:update:{fingerprint}"
 
 
 def _dump_row(row: dict[str, Any]) -> bytes:
