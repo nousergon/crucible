@@ -12,6 +12,7 @@ import configparser
 import importlib.util
 import io
 import re
+from typing import Protocol, cast
 
 import pytest
 import sqlalchemy as sa
@@ -33,12 +34,12 @@ def _config() -> Config:
     return cfg
 
 
-def _render(monkeypatch, *, downgrade: bool = False) -> str:
+def _render(monkeypatch: pytest.MonkeyPatch, *, downgrade: bool = False) -> str:
     monkeypatch.delenv(DSN_ENV, raising=False)
     cfg = _config()
     cfg.output_buffer = io.StringIO()
     if downgrade:
-        command.downgrade(cfg, "0001:base", sql=True)
+        command.downgrade(cfg, "0002:base", sql=True)
     else:
         command.upgrade(cfg, "head", sql=True)
     return cfg.output_buffer.getvalue()
@@ -48,12 +49,20 @@ def _norm(sql: str) -> str:
     return re.sub(r"\s+", " ", sql).strip()
 
 
-def _migration_module():
-    path = MIGRATIONS_DIR / "versions" / "0001_schema_v1.py"
-    spec = importlib.util.spec_from_file_location("crucible_state_0001", path)
+class _MigrationModule(Protocol):
+    TABLES: tuple[str, ...]
+    TABLE: str
+    SEED_KINDS: tuple[tuple[str, str, str], ...]
+
+
+def _migration_module(revision: str = "0001") -> _MigrationModule:
+    filename = {"0001": "0001_schema_v1.py", "0002": "0002_llm_trace_index.py"}[revision]
+    path = MIGRATIONS_DIR / "versions" / filename
+    spec = importlib.util.spec_from_file_location(f"crucible_state_{revision}", path)
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module
+    return cast("_MigrationModule", module)
 
 
 # --------------------------------------------------------------------------
@@ -61,9 +70,10 @@ def _migration_module():
 # --------------------------------------------------------------------------
 
 
-def test_history_has_one_head_and_it_is_0001() -> None:
+def test_history_has_one_head_and_it_is_0002() -> None:
     script = ScriptDirectory.from_config(_config())
-    assert script.get_heads() == ["0001"]
+    assert script.get_heads() == ["0002"]
+    assert script.get_revision("0002").down_revision == "0001"
     assert script.get_revision("0001").down_revision is None
 
 
@@ -73,7 +83,7 @@ def test_alembic_ini_carries_no_database_url() -> None:
     assert not parser.has_option("alembic", "sqlalchemy.url")
 
 
-def test_online_migration_refuses_without_a_dsn(monkeypatch) -> None:
+def test_online_migration_refuses_without_a_dsn(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(DSN_ENV, raising=False)
     with pytest.raises(SystemExit, match=DSN_ENV):
         command.upgrade(_config(), "head")
@@ -84,11 +94,11 @@ def test_online_migration_refuses_without_a_dsn(monkeypatch) -> None:
 # --------------------------------------------------------------------------
 
 
-def test_upgrade_creates_exactly_the_model_tables(monkeypatch) -> None:
+def test_upgrade_creates_exactly_the_model_tables(monkeypatch: pytest.MonkeyPatch) -> None:
     sql = _render(monkeypatch)
     created = set(re.findall(rf"CREATE TABLE {m.SCHEMA}\.(\w+) \(", sql))
     assert created == {t.name for t in m.metadata.sorted_tables}
-    assert set(_migration_module().TABLES) == created
+    assert set(_migration_module().TABLES) | {_migration_module("0002").TABLE} == created
     assert m.APPEND_ONLY_TABLES and set(m.APPEND_ONLY_TABLES) == created
 
 
@@ -98,8 +108,8 @@ def _elements(create_table_sql: str) -> set[str]:
     return {line.strip().rstrip(",") for line in body.splitlines() if line.strip()}
 
 
-def test_upgrade_ddl_matches_the_models_table_by_table(monkeypatch) -> None:
-    """Every column, type, default and constraint: 0001 is the models at v1.
+def test_upgrade_ddl_matches_the_models_table_by_table(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every column, type, default and constraint: history matches the models.
 
     Compared clause by clause, because Alembic orders a table's constraints
     differently from ``CreateTable``; the clauses themselves must be identical.
@@ -115,10 +125,40 @@ def test_upgrade_ddl_matches_the_models_table_by_table(monkeypatch) -> None:
             assert _norm(str(CreateIndex(index).compile(dialect=dialect))) in _norm(sql)
 
 
-def test_schema_is_plain_postgres(monkeypatch) -> None:
+def test_schema_is_plain_postgres(monkeypatch: pytest.MonkeyPatch) -> None:
     sql = _render(monkeypatch).upper()
     assert "CREATE EXTENSION" not in sql
     assert "NEON" not in sql
+
+
+def test_llm_trace_index_is_searchable_metadata_without_bodies() -> None:
+    table = m.llm_trace_index
+    assert [column.name for column in table.primary_key.columns] == ["trace_id", "span_id"]
+    assert {"call_site", "model", "route", "input_tokens", "output_tokens", "cost_usd"} <= set(
+        table.c.keys()
+    )
+    assert {"input_content_sha256", "output_content_sha256", "citations"} <= set(table.c.keys())
+    assert table.c.input_s3_key.nullable and table.c.output_s3_key.nullable
+    assert not ({"prompt", "response", "input_body", "output_body"} & set(table.c.keys()))
+    indexed = {column.name for index in table.indexes for column in index.columns}
+    assert {
+        "call_site",
+        "model",
+        "route",
+        "input_tokens",
+        "output_tokens",
+        "cost_usd",
+        "input_content_sha256",
+        "output_content_sha256",
+    } <= indexed
+
+
+def test_llm_trace_downgrade_refuses_to_discard_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    sql = _render(monkeypatch, downgrade=True)
+    refusal = sql.index("downgrade of 0002 refused")
+    drop = sql.index(f"DROP TABLE {m.SCHEMA}.llm_trace_index")
+    assert refusal < drop
+    assert f"EXISTS (SELECT 1 FROM {m.SCHEMA}.llm_trace_index)" in sql
 
 
 # --------------------------------------------------------------------------
@@ -131,7 +171,7 @@ def test_trial_key_is_the_ledgers_own_identity_as_of() -> None:
     pk = [c.name for c in m.trial.primary_key.columns]
     assert pk == ["slot", "arm_id", "as_of"]
     row = {"slot": "M", "arm_id": "arm", "as_of": "2026-10-22"}
-    assert ledger._identity(row) == tuple(row[c] for c in pk)
+    assert ledger._identity(row) == tuple(row[c] for c in pk)  # pyright: ignore[reportPrivateUsage]
     assert "cycle_date" not in m.trial.c
 
 
@@ -174,7 +214,7 @@ def test_money_and_quantity_columns_are_exact_decimals() -> None:
     assert hits >= 10
 
 
-def test_every_table_is_append_only(monkeypatch) -> None:
+def test_every_table_is_append_only(monkeypatch: pytest.MonkeyPatch) -> None:
     sql = _norm(_render(monkeypatch))
     assert f"CREATE FUNCTION {m.SCHEMA}.refuse_mutation() RETURNS trigger" in sql
     for name in m.APPEND_ONLY_TABLES:
@@ -188,7 +228,9 @@ def test_every_table_is_append_only(monkeypatch) -> None:
         ) in sql
 
 
-def test_journal_balance_is_checked_at_commit_on_both_tables(monkeypatch) -> None:
+def test_journal_balance_is_checked_at_commit_on_both_tables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     sql = _norm(_render(monkeypatch))
     for name in ("journal_entry", "posting"):
         assert (
@@ -227,10 +269,10 @@ def test_money_ledger_shapes_match_the_producer() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_downgrade_refuses_before_dropping_anything(monkeypatch) -> None:
+def test_downgrade_refuses_before_dropping_anything(monkeypatch: pytest.MonkeyPatch) -> None:
     sql = _render(monkeypatch, downgrade=True)
     refuse = sql.index("downgrade of 0001 refused")
-    first_drop = sql.index("DROP TABLE")
+    first_drop = sql.index(f"DROP TABLE {m.SCHEMA}.posting")
     assert refuse < first_drop
     for name in m.APPEND_ONLY_TABLES:
         assert f"EXISTS (SELECT 1 FROM {m.SCHEMA}.{name})" in sql
