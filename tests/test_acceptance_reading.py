@@ -536,7 +536,7 @@ def test_ratchets_unmet_phase_agrees_with_the_clauses_own_phase_kwarg() -> None:
 
     ratchet = json.loads(RATCHET.read_text())
     unmet: dict[str, str] = ratchet["unmet"]
-    assert set(unmet) | set(ratchet["met"]), "the acceptance ratchet must not be empty"
+    assert unmet, "the committed ratchet names no unmet clauses — nothing to check"
 
     source_path = ROOT / "tests" / "acceptance" / "test_plan_section_2_objectives.py"
     tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
