@@ -90,9 +90,11 @@ def test_receipt_is_bound_to_event_and_never_written_by_cron(tmp_path, monkeypat
     from importlib.resources import files
 
     from jsonschema import validate
-    validate(json.loads(written[0]["Body"]), json.loads(
-        files("crucible.schemas").joinpath("postclose_receipt.v1.json").read_text()
-    ))
+
+    validate(
+        json.loads(written[0]["Body"]),
+        json.loads(files("crucible.schemas").joinpath("postclose_receipt.v1.json").read_text()),
+    )
 
 
 def test_receipt_versioned_contract(tmp_path, monkeypatch):
@@ -103,9 +105,17 @@ def test_receipt_versioned_contract(tmp_path, monkeypatch):
 
     schema = json.loads(files("crucible.schemas").joinpath("postclose_receipt.v1.json").read_text())
     validator = Draft202012Validator(schema)
-    valid = {"schema_version": 1, "execution_arn": EXEC,
-             "workflow_run_id": "123", "outcome": "workflow_completed"}
+    valid = {
+        "schema_version": 1,
+        "execution_arn": EXEC,
+        "workflow_run_id": "123",
+        "outcome": "workflow_completed",
+    }
     validator.validate(valid)
-    for invalid in (dict(valid, schema_version=True), dict(valid, outcome="cron"),
-                    dict(valid, workflow_run_id=""), dict(valid, extra=1)):
+    for invalid in (
+        dict(valid, schema_version=True),
+        dict(valid, outcome="cron"),
+        dict(valid, workflow_run_id=""),
+        dict(valid, extra=1),
+    ):
         assert list(validator.iter_errors(invalid))
