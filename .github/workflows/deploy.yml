@@ -408,7 +408,9 @@ jobs:
           # The SAME wheelhouse, installed the same offline way on this
           # runner, is what the smoke below runs from — so the smoke grades
           # the dependency set a box installs, not this checkout's `uv sync`.
-          python3 -m venv /tmp/crucible-release-venv
+          # ubuntu-latest moved to 26.04, whose python3 is 3.14; build the smoke
+          # venv on the repo's .python-version (the box's CPython 3.12) instead.
+          uv venv --seed --python "$(cat .python-version)" /tmp/crucible-release-venv
           /tmp/crucible-release-venv/bin/python --version | grep -q "^Python 3\.12\." || { echo "::error::the smoke venv is not CPython 3.12, the box's interpreter"; exit 1; }
           /tmp/crucible-release-venv/bin/pip install --quiet --no-index --find-links "${proof}/wheelhouse" --require-hashes -r "${proof}/wheelhouse/requirements.lock.txt" -r "${proof}/crucible.requirements.txt"
           /tmp/crucible-release-venv/bin/python -c "import nousergon_lib.arcticdb, arcticdb"
@@ -664,7 +666,9 @@ jobs:
           # The SAME wheelhouse, installed the same offline way on this
           # runner, is what the smoke below runs from — so the smoke grades
           # the dependency set a box installs, not this checkout's `uv sync`.
-          python3 -m venv /tmp/crucible-release-venv
+          # ubuntu-latest moved to 26.04, whose python3 is 3.14; build the smoke
+          # venv on the repo's .python-version (the box's CPython 3.12) instead.
+          uv venv --seed --python "$(cat .python-version)" /tmp/crucible-release-venv
           /tmp/crucible-release-venv/bin/python --version | grep -q "^Python 3\.12\." || { echo "::error::the smoke venv is not CPython 3.12, the box's interpreter"; exit 1; }
           /tmp/crucible-release-venv/bin/pip install --quiet --no-index --find-links "${proof}/wheelhouse" --require-hashes -r "${proof}/wheelhouse/requirements.lock.txt" -r "${proof}/crucible.requirements.txt"
           /tmp/crucible-release-venv/bin/python -c "import nousergon_lib.arcticdb, arcticdb"
