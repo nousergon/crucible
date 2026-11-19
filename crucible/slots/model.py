@@ -523,6 +523,19 @@ def evaluate_behavioural_veto(
                 f"{name}=0: the model names nothing at high confidence, which is not a "
                 "conservative model, it is a model with no output to serve"
             )
+            slope = candidate.get("p_up_calibration_slope")
+            if slope is not None:
+                n = candidate["p_up_calibration_n"]
+                if slope < 0:
+                    reasons[-1] += (
+                        f"; its up-probability calibration slope is {slope:.2f} (n={n}): "
+                        "its top names are calibrated to underperform"
+                    )
+                else:
+                    base_rate = candidate["p_up_calibration_base_rate"]
+                    reasons[-1] += (
+                        f"; calibration slope {slope:.2f}, base rate {base_rate:.2f} (n={n})"
+                    )
 
     for name, floor in FLOOR_VETO_METRICS.items():
         cand = candidate.get(name)
@@ -5232,6 +5245,7 @@ class UpProbabilityCalibration:
     intercept: float
     n_pairs: int
     n_dates: int
+    base_rate: float
 
     def p_up(self, predicted_excess: np.ndarray) -> np.ndarray:
         """P(this name beats the cross-section) for each predicted excess."""
@@ -5295,6 +5309,7 @@ def calibrate_up_probability(settled: SettledCrossSections) -> UpProbabilityCali
         intercept=float(beta[0]),
         n_pairs=int(x.size),
         n_dates=settled.n_dates,
+        base_rate=float(y.mean()),
     )
 
 
@@ -5392,6 +5407,11 @@ def serving_metrics(
             "converge. `stdev_p_up` and `n_high_confidence` are read through that map and "
             "are absent rather than assumed"
         )
+
+    metrics["p_up_calibration_slope"] = calibration.slope
+    metrics["p_up_calibration_intercept"] = calibration.intercept
+    metrics["p_up_calibration_base_rate"] = calibration.base_rate
+    metrics["p_up_calibration_n"] = calibration.n_pairs
 
     names = sorted(predicted)
     values = np.array([predicted[n] for n in names], dtype="float64")
