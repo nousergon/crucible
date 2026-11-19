@@ -359,6 +359,10 @@ def cause_key(page: Page) -> str:
     if page.condition == "absence":
         return f"{prefix}absence:{page.trading_day.isoformat()}"
     haystack = page.reason.lower()
+    if page.job == BACK_OFFICE_JOB:
+        # Secondary evidence diagnostics do not change the primary break
+        # cause; otherwise a temporary read fault re-keys an unchanged queue.
+        haystack = haystack.split("\n    queue evidence unavailable:", 1)[0]
     for key, needle in CAUSE_MATCHERS:
         if needle.lower() in haystack:
             return f"{prefix}{key}:{page.trading_day.isoformat()}"
@@ -2394,9 +2398,11 @@ BACK_OFFICE_FAIL_METRICS: tuple[str, ...] = (
     EXCEPTION_SCORE_METRIC,
     "exception_records_filed",
     "exception_proposals_filed",
+    "exception_rule_clears_filed",
     "ledger_book_of_record",
     "benchmark_closes_capture",
     "performance_statement",
+    "month_end_close",
     "month_rebuild",
     "books_worm_retention",
 )
@@ -2435,8 +2441,109 @@ def _overdue_reading(manifest: Mapping[str, object]) -> tuple[bool, str] | None:
     return bool(failing), " | ".join(failing)
 
 
+def _complete_overdue_reason(store: Store, manifest: Mapping[str, object], reason: str) -> str:
+    """Recover names omitted by the producer's five-item headline limit.
+
+    The dated score must match this reading's day, timestamp, count and
+    visible identities. Missing/unreadable/mismatched evidence never erases
+    the manifest's failure: the incident records the cause of incompleteness.
+    Historical readings only anchor the streak and need no score read.
+    """
+    raw_rows = manifest.get("metrics")
+    if not isinstance(raw_rows, list):
+        return reason
+    rows = [
+        cast("dict[str, object]", r) for r in cast("list[object]", raw_rows) if isinstance(r, dict)
+    ]
+    row = next((r for r in rows if r.get("name") == EXCEPTION_OVERDUE_METRIC), None)
+    if row is None:
+        row = next(
+            (
+                r
+                for r in rows
+                if r.get("name") == EXCEPTION_SCORE_METRIC and r.get("status") == "WATCH"
+            ),
+            None,
+        )
+    if row is None:
+        return reason
+    detail = str(row.get("status_reason") or "")
+    count_match = _OVERDUE_COUNT.search(detail)
+    visible = set(_OVERDUE_ITEM.findall(detail))
+    if count_match is None or int(count_match.group(1)) <= len(visible):
+        return reason
+    count = int(count_match.group(1))
+
+    def unavailable(problem: str) -> str:
+        return f"{reason}\n    Queue evidence unavailable: {problem}"
+
+    key = f"trader/exception_scores/{manifest.get('trading_day')}.json"
+    if row.get("source_path") != key:
+        return unavailable("source_path does not name this session's dated score")
+    read = read_store_document(store, key)
+    if read.document is None:
+        # A secondary evidence read failed; the primary manifest failure
+        # survives and this incident explicitly records the read's cause.
+        return unavailable(read.problem or f"{key} is absent")
+    doc = cast("dict[str, object]", read.document)
+    if (
+        doc.get("schema_version") != "exception_score.v1"
+        or doc.get("trading_day") != manifest.get("trading_day")
+        or not isinstance(row.get("last_updated_utc"), str)
+        or doc.get("generated_at") != row.get("last_updated_utc")
+    ):
+        return unavailable(f"{key} does not match the manifest reading")
+    queue = doc.get("queue")
+    totals = doc.get("totals")
+    if not isinstance(queue, list) or not isinstance(totals, dict):
+        return unavailable(f"{key} has no valid queue and totals")
+    named: list[str] = []
+    identities: set[tuple[str, str]] = set()
+    for raw in cast("list[object]", queue):
+        if not isinstance(raw, dict):
+            return unavailable(f"{key} has a malformed queue item")
+        item = cast("dict[str, object]", raw)
+        if item.get("overdue") is False:
+            continue
+        pid, day, age = (
+            item.get("proposal_id"),
+            item.get("trading_day"),
+            item.get("age_trading_days"),
+        )
+        if (
+            item.get("overdue") is not True
+            or not isinstance(pid, str)
+            or re.fullmatch(r"[^\s;:,()]+", pid) is None
+            or not isinstance(day, str)
+            or re.fullmatch(r"\d{4}-\d{2}-\d{2}", day) is None
+            or type(age) is not int
+            or age < 0
+        ):
+            return unavailable(f"{key} has a malformed overdue identity")
+        try:
+            dt.date.fromisoformat(day)
+        except ValueError:
+            return unavailable(f"{key} has an invalid overdue trading day")
+        identity = (pid, day)
+        if identity in identities:
+            return unavailable(f"{key} repeats an overdue identity")
+        identities.add(identity)
+        named.append(f"{pid} ({day}, {age} trading days)")
+    if (
+        len(named) != count
+        or cast("dict[str, object]", totals).get("overdue") != count
+        or not visible <= identities
+    ):
+        return unavailable(f"{key} disagrees with the manifest's overdue members")
+    return f"{reason}; full overdue queue: {'; '.join(named)}"
+
+
 def _latest_overdue_reading(
-    store: Store, trading_day: dt.date, access_faults: list[str] | None
+    store: Store,
+    trading_day: dt.date,
+    access_faults: list[str] | None,
+    *,
+    with_members: bool = False,
 ) -> tuple[bool, str, str, str | None] | None:
     """The day's reading from its LATEST reconcile run that carries one, as
     ``(overdue, reason, run_id, synthetic)``; None when no run of the day does.
@@ -2452,6 +2559,7 @@ def _latest_overdue_reading(
             access_faults.append(listed.listing_problem)
         return None
     best: tuple[bool, str, str, str | None] | None = None
+    best_manifest: Mapping[str, object] | None = None
     for _key, manifest in listed.documents:
         reading = _overdue_reading(manifest)
         if reading is None:
@@ -2459,6 +2567,9 @@ def _latest_overdue_reading(
         run_id = str(manifest.get("run_id") or _UNPARSEABLE_RUN_ID)
         if best is None or run_id > best[2]:
             best = (reading[0], reading[1], run_id, manifest_synthetic_marker(manifest))
+            best_manifest = manifest
+    if best is not None and best[0] and with_members and best_manifest is not None:
+        return best[0], _complete_overdue_reason(store, best_manifest, best[1]), best[2], best[3]
     return best
 
 
@@ -2511,7 +2622,7 @@ def evaluate_back_office_breaks(
     latest: tuple[bool, str, str, str | None] | None = None
     latest_day = day
     for _ in range(OVERDUE_LOOKBACK_TRADING_DAYS):
-        latest = _latest_overdue_reading(store, day, access_faults)
+        latest = _latest_overdue_reading(store, day, access_faults, with_members=True)
         if unlistable():
             return []
         if latest is not None:
@@ -3174,11 +3285,12 @@ def _alert_id_for(group: PageGroup, sweep_run_id: str | None) -> str | None:
 def _record_reobservation(store: Store, key: str, group: PageGroup, stamp: str) -> None:
     """Advance an open incident's row instead of paging for it again.
 
-    `sent`, `destination`, `alert_id`, `members` and `rendered` describe the
-    page that was DELIVERED and are left alone — rewriting a delivery record
-    with facts from a later observation would make the row claim it sent
-    something it did not. `members_now`, `observations` and
-    `last_observed_utc` are the current picture.
+    `sent`, `destination`, `alert_id` and `members` describe the first
+    delivery and are left alone. `members_now`, `observations` and
+    `last_observed_utc` are the current picture. For back-office incidents,
+    the console-bound `rendered` becomes an explicitly captioned observation;
+    `rendered_initial` preserves the original delivery text. Other jobs keep
+    their existing rendered-message behavior.
 
     Conditional on the row's version. This is one key written by more than
     one execution — the fleet's last-writer-wins class — and a blind
@@ -3194,7 +3306,18 @@ def _record_reobservation(store: Store, key: str, group: PageGroup, stamp: str) 
     row = load_store_document(store, key)
     row["observations"] = int(row["observations"]) + 1
     row["last_observed_utc"] = stamp
+    _remember_back_office_members(row, group)
     row["members_now"] = _members(group)
+    if (
+        "rendered_initial" in row
+        or any(member.job == BACK_OFFICE_JOB for member in group.members)
+        or any(member["job"] == BACK_OFFICE_JOB for member in row["members"])
+    ):
+        # The console binds to rendered, not members_now. Preserve the
+        # original delivery text while making every later observation
+        # visible, explicitly distinguished from a delivery receipt.
+        row.setdefault("rendered_initial", row["rendered"])
+        row["rendered"] = "Current observation (not a delivery receipt):\n" + group.render()
     store.compare_and_swap(key, expected, _dump_row(row))
 
 
@@ -3230,6 +3353,61 @@ def _back_office_facts(members: Iterable[tuple[str, str]]) -> tuple[frozenset[st
     return frozenset(facts), count
 
 
+def _back_office_snapshot(
+    members: list[dict[str, object]],
+) -> tuple[frozenset[str], int, bool]:
+    facts, count = _back_office_facts((str(m["job"]), str(m["reason"])) for m in members)
+    incomplete = any(
+        m["job"] == BACK_OFFICE_JOB and "Queue evidence unavailable:" in str(m["reason"])
+        for m in members
+    )
+    return facts, count, incomplete
+
+
+def _remember_back_office_members(row: dict[str, object], group: PageGroup) -> None:
+    """Keep the last complete membership apart from the current observation.
+
+    This optional, additive bus field is only dedup memory, never a claim
+    that its members are still overdue. Older rows bootstrap from members_now.
+    An incomplete evidence read remains visible there, without making the
+    subsequent restoration of the same identities look like a gain.
+    """
+    prior = cast("list[dict[str, object]]", row["members_now"])
+    current = cast("list[dict[str, object]]", _members(group))
+    for members in (prior, current):
+        facts, count, incomplete = _back_office_snapshot(members)
+        if facts and not incomplete:
+            row["back_office_last_complete"] = {"facts": sorted(facts), "count": count}
+
+
+def _previous_back_office_facts(row: Mapping[str, object]) -> tuple[frozenset[str], int]:
+    previous = cast("list[dict[str, object]]", row["members_now"])
+    facts, count, incomplete = _back_office_snapshot(previous)
+    if not incomplete:
+        return facts, count
+    saved = row.get("back_office_last_complete")
+    if saved is None:
+        # Pre-upgrade rows have no extra memory; their original delivery
+        # still records identities that must not be reported as new again.
+        old, old_count, _ = _back_office_snapshot(cast("list[dict[str, object]]", row["members"]))
+    else:
+        if not isinstance(saved, dict):
+            raise ValueError("back_office_last_complete is not an object")
+        record = cast("dict[str, object]", saved)
+        raw_facts, old_count = record.get("facts"), record.get("count")
+        if (
+            not isinstance(raw_facts, list)
+            or not all(isinstance(f, str) for f in cast("list[object]", raw_facts))
+            or type(old_count) is not int
+            or old_count < 0
+        ):
+            raise ValueError("back_office_last_complete has invalid facts or count")
+        old = frozenset(cast("list[str]", raw_facts))
+    # Steps still come from the latest observation. Only unavailable queue
+    # identities and their count need the last complete reading.
+    return facts | frozenset(f for f in old if f.startswith("item:")), max(count, old_count)
+
+
 def _back_office_gain(store: Store, key: str, group: PageGroup) -> str | None:
     """`alpha-engine-config-I13598`: the update key when a standing back-office
     incident GAINED a member since the last sweep (a newly failing step, a
@@ -3242,8 +3420,7 @@ def _back_office_gain(store: Store, key: str, group: PageGroup) -> str | None:
     if not now_facts:
         return None
     row = load_store_document(store, key)
-    previous = cast("list[dict[str, object]]", row["members_now"])
-    was_facts, was_count = _back_office_facts((str(m["job"]), str(m["reason"])) for m in previous)
+    was_facts, was_count = _previous_back_office_facts(row)
     if now_facts <= was_facts and now_count <= was_count:
         return None
     fingerprint = hashlib.sha256(
