@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import datetime as dt
 
+import pytest
+
 from crucible.autonomy import ArchiveMissingError
 from crucible.board import HumanTouchReading, _read_human_touch_count, build_board
 from crucible.store import LocalStore
@@ -61,6 +63,11 @@ class TestNoArchiveConfigured:
 
 
 class TestAConfiguredArchive:
+    @pytest.fixture(autouse=True)
+    def isolated_archive_client(self, monkeypatch):
+        monkeypatch.setattr("crucible.board._autonomy_s3_client", lambda: object())
+        monkeypatch.setattr("crucible.autonomy.configured_day_cache", lambda client: None)
+
     def test_a_clean_month_reads_zero_and_measured(self, monkeypatch) -> None:
         monkeypatch.setenv("CRUCIBLE_CLOUDTRAIL_ARCHIVE", "s3://trail/prefix")
         monkeypatch.setattr("crucible.autonomy.count_operator_actions", lambda *a, **k: _counted(0))

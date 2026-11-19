@@ -175,42 +175,40 @@ def _unmeasurable(
 class TestAutonomy:
     """§2 row 1: 'Runs autonomously, minimal input'."""
 
-    def test_the_ruled_live_gate_two_live_saturdays_plus_five_replayed(self) -> None:
-        """The gate is **2 live + 5 replayed**, not 4 live.
+    def test_autonomy_calendar_readings_are_standing_slos(self, tmp_path, monkeypatch) -> None:
+        """Brian's September 13 ruling moved calendar floors off phase 2.
 
-        Plan §2 row 1 and the §6 phase table both still read "4 consecutive
-        Saturdays". §6.1 supersedes them and says so in terms: "Minimum live
-        gate: 2 consecutive first-attempt `ok` Saturdays, **not 4**" — the
-        four-Saturday soak becomes two live plus five replayed, on a path
-        whose inputs are point-in-time addressable, "stated here so the
-        shortcut is a ruling, not a drift". Adopted under the stated
-        assumption recorded on alpha-engine-config-I9751 at
-        2026-09-01T18:16Z — Brian's instruction was "begin work on crucible v2
-        per the plan", and §6.1 is the plan's own text on this gate. The phase-2
-        execution issue, alpha-engine-config-I9758, already carries it as its
-        closes-when: five unattended scheduler runs plus live Saturdays
-        2026-09-12 and 2026-09-19 first-attempt ok, then cutover.
-
-        This clause asserted 4 live Saturdays — two calendar weeks of soak
-        that was never required, and a calendar gate is the one cost no
-        amount of build speed can compress. An acceptance clause overstating
-        the ruled requirement is the same defect as one understating it: it
-        is not measuring what was decided.
+        The historical two-Saturday placeholder contradicted the recorded
+        ruling and could never measure implementation. Missing evidence must
+        remain red on the board while the seven delivery clauses still gate.
         """
-        clause = "plan §2 row 1 as superseded by §6.1 / §6 phase-2 exit gate"
-        requirement = (
-            "2 consecutive LIVE weekly runs, first attempt, status: ok, plus 5 "
-            "REPLAYED historical Saturdays (2026-08-01 … 08-29) also first-attempt "
-            "ok, each writing runs/weekly/{trading_day}/run.json, with zero "
-            "human-originated mutating calls on v2 resources over the window."
-        )
-        # Deliberately NOT "call the report handler and see whether it raises".
-        # It stopped raising the day track E landed `report`, which would have
-        # turned a phase-2 window clause green on a phase-1 job — a gate
-        # passing because a different feature shipped. The window is read from
-        # the run manifests of the two live plus five replayed Saturdays in
-        # the production store, and that is phase 2 (alpha-engine-config-I9758).
-        _unmet(clause, requirement, phase="phase2")
+        from crucible import gate as gate_module
+        from crucible.board import HumanTouchReading, _standing_rows
+        from crucible.store import LocalStore
+
+        def unavailable():
+            raise RuntimeError("No live cost or archive fixture")
+
+        monkeypatch.setattr(gate_module, "_ce_client", unavailable)
+        monkeypatch.setattr(gate_module, "_s3_client", unavailable)
+        store = LocalStore(tmp_path)
+        day = dt.date(2026, 9, 11)
+        result = gate_module.evaluate(store, gate="phase2", trading_day=day)
+        assert {c.name for c in result.clauses} == {
+            "replays_ok",
+            "pages_commissioned",
+            "two_page_conditions_on_real_channel",
+            "transient_retry_class_in_runner",
+            "fault_injection_against_scheduled_path",
+            "runbook_in_readme",
+            "aws_cost_within_ceiling",
+        }
+        for measured, count in ((True, 3), (False, 0)):
+            touch = HumanTouchReading("2026-09", count, (), "fixture", measured=measured)
+            rows = {r.id: r for r in _standing_rows(store, day.isoformat(), touch)}
+            assert rows["standing:human_touch_count"].red
+            assert rows["standing:live_saturdays_first_attempt_ok"].red
+            assert "standing:pages_within_ceiling" in rows
 
     def test_zero_human_mutating_calls_is_read_from_the_cloudtrail_archive(
         self,
@@ -623,12 +621,47 @@ class TestAttribution:
     def test_alpha_is_factor_neutral_not_raw_excess_return(self) -> None:
         """§10.3: raw 'alpha vs SPY' is mostly beta and sector tilt, and a
         champion promoted on it is promoted on exposure."""
-        clause = "plan §10 component 3"
-        requirement = (
-            "Each slot's return is decomposed into market beta, sector, size and "
-            "residual; the attribution table reports RESIDUAL alpha."
+        from crucible.attribution import (
+            AttributionFactorParams,
+            FactorDef,
+            attribution_metric_record,
+            compute_factor_attribution,
+            manifest_records_factor_attribution,
         )
-        _unmet(clause, requirement, phase="phase3")
+
+        factors = {
+            "market": [0.01, -0.005, 0.008, 0.002, -0.011, 0.006],
+            "sector": [0.004, 0.006, -0.002, 0.009, -0.003, 0.001],
+            "size": [-0.002, 0.001, 0.003, -0.004, 0.005, 0.002],
+        }
+        holding = [
+            2 * market + 0.5 * sector + 0.2 * size
+            for market, sector, size in zip(*factors.values(), strict=True)
+        ]
+        params = AttributionFactorParams(
+            factors={
+                name: FactorDef(category=category, proxy=name.upper())
+                for name, category in (("market", "beta"), ("sector", "sector"), ("size", "size"))
+            },
+            benchmark_proxy="MARKET",
+        )
+        evidence = compute_factor_attribution(
+            trading_day="2026-09-11",
+            window_sessions=6,
+            holding_returns={"ASSET": holding},
+            weights={"ASSET": 1.0},
+            factor_returns=factors,
+            params=params,
+            gross_return=sum(holding),
+            cost_bps_total=0,
+        )
+        assert sum(holding) - sum(factors["market"]) > 0
+        assert evidence["residual_alpha"] == pytest.approx(0, abs=1e-9)
+        assert set(evidence["category_totals"]) == {"beta", "sector", "size", "residual"}
+        assert sum(evidence["category_totals"].values()) == pytest.approx(sum(holding))
+        metric = attribution_metric_record(evidence, now_utc="2026-09-11T22:00:00Z")
+        assert metric["value"] == pytest.approx(0, abs=1e-9)
+        assert manifest_records_factor_attribution({"metrics": [metric]}) == evidence
 
 
 class TestAlerting:

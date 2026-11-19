@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Post-close reconcile dispatch hint v1",
+  "type": "object",
+  "required": ["schema_version", "state_machine_arn", "execution_arn", "status"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": 1},
+    "state_machine_arn": {"type": "string", "pattern": "^arn:aws:states:"},
+    "execution_arn": {"type": "string", "pattern": "^arn:aws:states:"},
+    "status": {"const": "SUCCEEDED"}
+  }
+}

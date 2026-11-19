@@ -1,15 +1,14 @@
 {
-  "note": "The acceptance gate's reading, committed as ID SETS — never as counts. CI compares every push:[main] run against them and fails on any difference, and the PR path compares the collected ids against their union so a rename or deletion is caught where it is made. Counts were the earlier defect twice over: a regression offset by a gain leaves a count unchanged, and a met clause could be renamed or deleted with a one-digit edit while everything read green. `unmeasurable` (alpha-engine-config-I9828, round 2) is a SUBSET of `unmet`'s keys, not a fourth bucket: the read itself failed (no credentials, no region, AccessDenied) rather than the property being read and found false. It stays inside `unmet` because crucible/gate.py's phase-0 clause (a different track — gate-side UNMEASURABLE Clause state: crucible-PR53, alpha-engine-config-I9869 round 2) reads this file's `met | unmet` as the full clause set — both fail the run and neither is ever a pass, but only the plain-unmet remainder is a statement about the system. Each `unmeasurable` VALUE is an object (`reason`, `blocked_on_class`, `last_moved`), not a bare string, so a clause moving into this bucket is a reviewable diff with a dated, typed record — never a string relocating silently between two JSON values. The suite being red by design is not the same thing as the run being red — the run is green while the reading is exactly what this file says.",
-  "unmet": {
-    "TestAutonomy::test_the_ruled_live_gate_two_live_saturdays_plus_five_replayed": "phase 2 — two live Saturdays (2026-09-12, 2026-09-19) plus five replayed",
-    "TestAttribution::test_alpha_is_factor_neutral_not_raw_excess_return": "phase 3 — factor-neutral residual alpha"
-  },
+  "note": "The acceptance gate's reading, committed as ID SETS \u2014 never as counts. CI compares every push:[main] run against them and fails on any difference, and the PR path compares the collected ids against their union so a rename or deletion is caught where it is made. Counts were the earlier defect twice over: a regression offset by a gain leaves a count unchanged, and a met clause could be renamed or deleted with a one-digit edit while everything read green. `unmeasurable` (alpha-engine-config-I9828, round 2) is a SUBSET of `unmet`'s keys, not a fourth bucket: the read itself failed (no credentials, no region, AccessDenied) rather than the property being read and found false. It stays inside `unmet` because crucible/gate.py's phase-0 clause (a different track \u2014 gate-side UNMEASURABLE Clause state: crucible-PR53, alpha-engine-config-I9869 round 2) reads this file's `met | unmet` as the full clause set \u2014 both fail the run and neither is ever a pass, but only the plain-unmet remainder is a statement about the system. Each `unmeasurable` VALUE is an object (`reason`, `blocked_on_class`, `last_moved`), not a bare string, so a clause moving into this bucket is a reviewable diff with a dated, typed record \u2014 never a string relocating silently between two JSON values. The suite being red by design is not the same thing as the run being red \u2014 the run is green while the reading is exactly what this file says.",
+  "unmet": {},
   "unmeasurable": {},
   "met": [
     "TestAlerting::test_the_absence_condition_reads_the_declared_deadline_table",
     "TestAlerting::test_the_weekly_alert_count_is_a_metric_with_a_ceiling",
     "TestAlerting::test_there_are_exactly_two_page_conditions",
+    "TestAttribution::test_alpha_is_factor_neutral_not_raw_excess_return",
     "TestAttribution::test_the_attribution_table_has_five_rows",
+    "TestAutonomy::test_autonomy_calendar_readings_are_standing_slos",
     "TestAutonomy::test_zero_human_mutating_calls_is_read_from_the_cloudtrail_archive",
     "TestControlArms::test_every_slot_declares_a_planted_and_a_null_control",
     "TestControlArms::test_the_grader_ranks_planted_above_real_above_null",
@@ -29,5 +28,5 @@
     "TestTransparency::test_every_llm_call_site_is_in_the_registry",
     "TestTransparency::test_explain_walks_a_verdict_back_to_what_produced_it"
   ],
-  "last_moved": "2026-09-03"
+  "last_moved": "2026-11-19"
 }
