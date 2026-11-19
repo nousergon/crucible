@@ -8,13 +8,21 @@ and started by nobody.
 
 from __future__ import annotations
 
+import ast
 import datetime as dt
 import json
 import re
+from pathlib import Path
 
 import pytest
 
-from crucible.components import DISPATCHES, Component, Deadline, load_registry
+from crucible.components import (
+    DISPATCH_VERIFIERS,
+    DISPATCHES,
+    Component,
+    Deadline,
+    load_registry,
+)
 from crucible.keys import champion_key
 from crucible.runmode import RUN_MODE_ENV, RUN_MODE_LIVE, RUN_MODE_REPLAY
 from crucible.slots import SLOTS, dispatchable_slots, get_slot
@@ -36,6 +44,59 @@ from crucible.weekly import (
 )
 
 FRIDAY = dt.date(2026, 8, 28)
+
+
+def _assert_dispatch_verifiers(
+    dispatches: tuple[str, ...], verifiers: dict[str, tuple[str, ...]]
+) -> None:
+    """Guard the vocabulary at its extension point."""
+    assert set(verifiers) == set(dispatches)
+    for dispatch, identifiers in verifiers.items():
+        assert identifiers, f"{dispatch} has no verifier"
+        for identifier in identifiers:
+            parts = identifier.split("::")
+            assert len(parts) in (2, 3), f"{dispatch}: {identifier!r} is not a pytest node id"
+            assert parts[0].endswith(".py") and all(parts[1:]), (
+                f"{dispatch}: {identifier!r} is not a fully qualified test identifier"
+            )
+
+
+def _assert_crucible_test_resolves(identifier: str) -> None:
+    path_text, *names = identifier.split("::")
+    tree = ast.parse(Path(path_text).read_text())
+    body = tree.body
+    for name in names:
+        node = next(
+            (
+                item
+                for item in body
+                if isinstance(item, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+                and item.name == name
+            ),
+            None,
+        )
+        assert node is not None, f"{identifier!r} does not resolve at {name!r}"
+        body = node.body
+
+
+class TestDispatchVerifierCoverage:
+    def test_every_dispatch_has_a_named_verifier(self) -> None:
+        """Keep the vocabulary and its verification evidence inseparable.
+
+        Crucible-side node ids are resolved below. Resolution of the
+        `nous-ergon-ops` ids is deferred until alpha-engine-config-I9878's
+        deliverable B makes that repository available in Crucible CI.
+        """
+        _assert_dispatch_verifiers(DISPATCHES, DISPATCH_VERIFIERS)
+        for identifiers in DISPATCH_VERIFIERS.values():
+            for identifier in identifiers:
+                if not identifier.startswith("nous-ergon-ops/"):
+                    _assert_crucible_test_resolves(identifier)
+
+    def test_an_unverified_dispatch_fails_the_guard(self) -> None:
+        """A vocabulary extension without evidence must make this guard red."""
+        with pytest.raises(AssertionError):
+            _assert_dispatch_verifiers(DISPATCHES + ("manual",), DISPATCH_VERIFIERS)
 
 
 @pytest.fixture(autouse=True)
