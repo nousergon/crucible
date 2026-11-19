@@ -71,6 +71,21 @@ def test_listing_unions_history_only(pair: Pair) -> None:
     assert list(store.list_keys("runs/")) == []
 
 
+def test_settled_shadows_read_through_for_grading(pair: Pair) -> None:
+    """The staging weekly grades shadows whose horizon settled weeks before it existed."""
+    primary, fallback, store = pair
+    old = "experiments/m-arm/2026-10-01/shadow.json"
+    own = "experiments/m-arm/2026-11-10/shadow.json"
+    fallback.put_bytes(old, b"prod")
+    fallback.put_bytes("experiments/m-arm/2026-11-12/shadow.json", b"prod")
+    primary.put_bytes(own, b"staging")
+    assert store.get_bytes(old) == b"prod"
+    assert sorted(store.list_keys("experiments/m-arm/")) == [old, own]
+    store.put_bytes("experiments/m-arm/2026-10-01/verdict.json", b"graded")
+    assert primary.exists("experiments/m-arm/2026-10-01/verdict.json")
+    assert not fallback.exists("experiments/m-arm/2026-10-01/verdict.json")
+
+
 def test_a_bad_cutoff_refuses(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="YYYY-MM-DD"):
         ReadThroughStore(LocalStore(tmp_path / "a"), LocalStore(tmp_path / "b"), before="11/07")
