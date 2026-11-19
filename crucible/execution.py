@@ -70,6 +70,7 @@ __all__ = [
     "EXECUTION_METRIC_NAME",
     "EXECUTION_N_FLOOR",
     "EXECUTION_SHORTFALL_SCHEMA_VERSION",
+    "EXECUTION_SHORTFALL_SCHEMA_V1",
     "FILL_SOURCE_BROKER",
     "FILL_SOURCE_SIMULATED_CLOSE",
     "SHADOW_BOOKS_SCHEMA_VERSION",
@@ -89,7 +90,8 @@ __all__ = [
     "weighted_shortfall_ci",
 ]
 
-EXECUTION_SHORTFALL_SCHEMA_VERSION = "execution_shortfall.v1"
+EXECUTION_SHORTFALL_SCHEMA_V1 = "execution_shortfall.v1"
+EXECUTION_SHORTFALL_SCHEMA_VERSION = "execution_shortfall.v2"
 SHADOW_BOOKS_SCHEMA_VERSION = "shadow_books.v1"
 
 #: The only decision-price basis the artifact admits: the price at the instant
@@ -208,7 +210,14 @@ def validate_execution_shortfall(
     The single validator both sides call: the trader before it writes, the
     report before it reduces. Returns the document as a plain dict.
     """
-    _schema_errors(document, EXECUTION_SHORTFALL_SCHEMA_VERSION, origin)
+    version = document.get("schema_version")
+    if version not in (EXECUTION_SHORTFALL_SCHEMA_V1, EXECUTION_SHORTFALL_SCHEMA_VERSION):
+        raise ExecutionArtifactError(
+            f"{origin}: unsupported execution-shortfall version {version!r}"
+        )
+    _schema_errors(document, str(version), origin)
+    if version == EXECUTION_SHORTFALL_SCHEMA_VERSION:
+        return _validate_execution_shortfall_v2(document, origin)
     doc = dict(document)
     outcome = doc["outcome"]
     orders = doc["orders"]
@@ -323,6 +332,146 @@ def validate_execution_shortfall(
     return doc
 
 
+def _validate_execution_shortfall_v2(
+    document: Mapping[str, Any],  # pyright: ignore[reportExplicitAny]
+    origin: str,
+) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]
+    """Validate the complete, execution-level v2 implementation-shortfall contract."""
+    doc = dict(document)
+    seen_orders: set[str] = set()
+    seen_executions: set[str] = set()
+    totals = {
+        name: 0.0
+        for name in (
+            "intended_decision_notional_usd",
+            "delay_usd",
+            "execution_usd",
+            "fees_usd",
+            "unfilled_opportunity_usd",
+            "gross_shortfall_usd",
+            "net_shortfall_usd",
+        )
+    }
+    for order in doc["orders"]:
+        oid = order["order_id"]
+        if oid in seen_orders:
+            raise ExecutionArtifactError(f"{origin}: order_id {oid!r} appears twice")
+        seen_orders.add(oid)
+        if order["decision_id"] != doc["decision_id"]:
+            raise ExecutionArtifactError(f"{origin}: order {oid!r} has an inconsistent decision_id")
+        if _utc(order["submitted_at_utc"]) < _utc(order["decided_at_utc"]):
+            raise ExecutionArtifactError(
+                f"{origin}: order {oid!r} was submitted before its decision"
+            )
+        executions = order["executions"]
+        filled = sum(float(execution["quantity"]) for execution in executions)
+        fee_values = [execution["fee_usd"] for execution in executions]
+        fees = sum(float(fee) for fee in fee_values if fee is not None)
+        for execution in executions:
+            eid = execution["execution_id"]
+            if eid in seen_executions:
+                raise ExecutionArtifactError(f"{origin}: execution_id {eid!r} appears twice")
+            seen_executions.add(eid)
+            if execution["order_id"] != oid:
+                raise ExecutionArtifactError(f"{origin}: execution {eid!r} names another order")
+        if not _close(filled, float(order["filled_quantity"])) or filled > order[
+            "intended_quantity"
+        ] * (1 + _REL_TOL):
+            raise ExecutionArtifactError(
+                f"{origin}: order {oid!r} filled quantity disagrees with its executions "
+                "or intention"
+            )
+        if (None in fee_values) != (order["fees_usd"] is None) or (
+            order["fees_usd"] is not None and not _close(fees, float(order["fees_usd"]))
+        ):
+            raise ExecutionArtifactError(
+                f"{origin}: order {oid!r} fees_usd disagrees with its executions"
+            )
+        status = order["status"]
+        intended_quantity = float(order["intended_quantity"])
+        status_ok = (
+            (status == "filled" and _close(filled, intended_quantity))
+            or (status == "partially_filled" and 0 < filled < intended_quantity)
+            or (status == "cancelled" and filled < intended_quantity)
+            or (status == "rejected" and filled == 0)
+        )
+        if not status_ok:
+            raise ExecutionArtifactError(
+                f"{origin}: order {oid!r} status is inconsistent with its quantities"
+            )
+
+        unavailable = (
+            order["arrival_price"] is None
+            or doc["terminal_mark"]["price"] is None
+            or None in fee_values
+        )
+        components = order["components"]
+        if unavailable:
+            if any(components[name] is not None for name in components):
+                raise ExecutionArtifactError(
+                    f"{origin}: order {oid!r} with missing observations carries cost components"
+                )
+            continue
+        sign = 1.0 if order["side"] == "buy" else -1.0
+        intended = float(order["intended_quantity"])
+        decision = float(order["decision_price"])
+        arrival = float(order["arrival_price"])
+        terminal = float(doc["terminal_mark"]["price"])
+        delay = sign * (arrival - decision) * intended
+        execution_cost = sum(
+            sign * (float(e["price"]) - arrival) * float(e["quantity"]) for e in executions
+        )
+        opportunity = sign * (terminal - decision) * (intended - filled)
+        gross = delay + execution_cost + opportunity
+        expected = {
+            "delay_usd": delay,
+            "execution_usd": execution_cost,
+            "fees_usd": fees,
+            "unfilled_opportunity_usd": opportunity,
+            "gross_shortfall_usd": gross,
+            "net_shortfall_usd": gross + fees,
+        }
+        for name, value in expected.items():
+            if components[name] is None or not _close(float(components[name]), value):
+                raise ExecutionArtifactError(
+                    f"{origin}: order {oid!r} component {name} is inconsistent"
+                )
+            totals[name] += value
+        totals["intended_decision_notional_usd"] += intended * decision
+
+    summary = doc["summary"]
+    complete = (
+        all(
+            o["arrival_price"] is not None
+            and all(e["fee_usd"] is not None for e in o["executions"])
+            for o in doc["orders"]
+        )
+        and doc["terminal_mark"]["price"] is not None
+    )
+    if bool(summary["complete"]) != complete:
+        raise ExecutionArtifactError(
+            f"{origin}: summary.complete is inconsistent with unavailable inputs"
+        )
+    if not complete:
+        if any(summary[name] is not None for name in totals):
+            raise ExecutionArtifactError(
+                f"{origin}: incomplete inputs cannot carry summary cost totals"
+            )
+        return doc
+    for name, value in totals.items():
+        if summary[name] is None or not _close(float(summary[name]), value):
+            raise ExecutionArtifactError(f"{origin}: summary.{name} disagrees with its orders")
+    denominator = totals["intended_decision_notional_usd"]
+    for name, dollars in (
+        ("gross_shortfall_bps", totals["gross_shortfall_usd"]),
+        ("net_shortfall_bps", totals["net_shortfall_usd"]),
+    ):
+        derived = dollars / denominator * 1e4 if denominator else None
+        if derived is None or summary[name] is None or not _close(float(summary[name]), derived):
+            raise ExecutionArtifactError(f"{origin}: summary.{name} is inconsistent")
+    return doc
+
+
 def _validate_order(order: Mapping[str, Any], origin: str) -> None:
     oid = order["order_id"]
     if _utc(order["submitted_at_utc"]) < _utc(order["decided_at_utc"]):
@@ -388,6 +537,13 @@ class ExecutionWindow:
     decision_notional_usd: float
     shortfall_usd: float
     band: dict[str, Any] | None
+    gross_shortfall_usd: float = field(default=0.0)
+    fees_usd: float = field(default=0.0)
+    delay_usd: float = field(default=0.0)
+    execution_usd: float = field(default=0.0)
+    unfilled_opportunity_usd: float = field(default=0.0)
+    complete: bool = field(default=True)
+    legacy_v1: tuple[str, ...] = field(default=())
     placeholder_band: bool = field(default=False)
     #: Sessions whose `computed` document says `fill_source: simulated_close`.
     #: Named, and never pooled into the orders above (`alpha-engine-config-I12685`).
@@ -433,6 +589,9 @@ def reduce_execution_window(store: Store, sessions: Sequence[str]) -> ExecutionW
     total_notional = 0.0
     total_decision_notional = 0.0
     total_shortfall = 0.0
+    total_gross = total_fees = total_delay = total_execution = total_opportunity = 0.0
+    complete = True
+    legacy_v1: list[str] = []
     band: dict[str, Any] | None = None
     for day in sessions:
         key = execution_shortfall_key(day)
@@ -453,6 +612,37 @@ def reduce_execution_window(store: Store, sessions: Sequence[str]) -> ExecutionW
                 f"{key} declares band {doc['band']} but an earlier session in the window "
                 f"declared {band}; one row cannot be graded against two red lines"
             )
+        if doc["schema_version"] == EXECUTION_SHORTFALL_SCHEMA_VERSION:
+            summary = doc["summary"]
+            if not summary["complete"]:
+                complete = False
+                not_computed.append((day, "complete execution-cost inputs are unavailable"))
+                continue
+            for order in doc["orders"]:
+                for execution in order["executions"]:
+                    bps.append(
+                        (float(execution["price"]) - float(order["decision_price"]))
+                        / float(order["decision_price"])
+                        * 1e4
+                        * (1.0 if order["side"] == "buy" else -1.0)
+                    )
+                    notional.append(float(execution["quantity"]) * float(order["decision_price"]))
+                    order_day.append(day)
+            total_decision_notional += float(summary["intended_decision_notional_usd"])
+            total_notional += sum(
+                float(e["quantity"]) * float(e["price"])
+                for o in doc["orders"]
+                for e in o["executions"]
+            )
+            total_gross += float(summary["gross_shortfall_usd"])
+            total_fees += float(summary["fees_usd"])
+            total_delay += float(summary["delay_usd"])
+            total_execution += float(summary["execution_usd"])
+            total_opportunity += float(summary["unfilled_opportunity_usd"])
+            total_shortfall += float(summary["net_shortfall_usd"])
+            continue
+        legacy_v1.append(day)
+        complete = False
         if doc["outcome"] == "no_orders":
             no_orders.append(day)
             continue
@@ -470,6 +660,8 @@ def reduce_execution_window(store: Store, sessions: Sequence[str]) -> ExecutionW
         total_notional += float(doc["summary"]["notional_usd"])
         total_decision_notional += float(doc["summary"]["decision_notional_usd"])
         total_shortfall += float(doc["summary"]["shortfall_usd"])
+        total_gross += float(doc["summary"]["shortfall_usd"])
+        total_execution += float(doc["summary"]["shortfall_usd"])
     return ExecutionWindow(
         sessions=tuple(sessions),
         sources=tuple(sources),
@@ -482,6 +674,13 @@ def reduce_execution_window(store: Store, sessions: Sequence[str]) -> ExecutionW
         notional_usd=total_notional,
         decision_notional_usd=total_decision_notional,
         shortfall_usd=total_shortfall,
+        gross_shortfall_usd=total_gross,
+        fees_usd=total_fees,
+        delay_usd=total_delay,
+        execution_usd=total_execution,
+        unfilled_opportunity_usd=total_opportunity,
+        complete=complete,
+        legacy_v1=tuple(legacy_v1),
         band=band,
         placeholder_band=bool(band and band["placeholder"]),
         simulated=tuple(simulated),

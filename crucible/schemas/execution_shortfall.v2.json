@@ -1,0 +1,78 @@
+{
+  "$id": "https://github.com/nousergon/crucible/schemas/execution_shortfall.v2.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "execution_shortfall.v2",
+  "description": "Complete implementation-shortfall contract. Unlike v1's filled-quantity-only scope, v2 preserves stable decision, order and execution identities; intended and filled quantities; nullable arrival and terminal observations; per-execution fees; and signed cost components against intended decision notional.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "trading_day", "decision_id", "band", "terminal_mark", "orders", "summary"],
+  "properties": {
+    "schema_version": {"const": "execution_shortfall.v2"},
+    "trading_day": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+    "decision_id": {"type": "string", "minLength": 1},
+    "band": {
+      "type": "object", "additionalProperties": false,
+      "required": ["baseline_bps", "upper_bps", "placeholder"],
+      "properties": {
+        "baseline_bps": {"type": "number"}, "upper_bps": {"type": "number"},
+        "placeholder": {"type": "boolean"}
+      }
+    },
+    "terminal_mark": {
+      "type": "object", "additionalProperties": false,
+      "required": ["price", "observed_at_utc", "horizon_seconds"],
+      "properties": {
+        "price": {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "observed_at_utc": {"type": ["string", "null"], "format": "date-time"},
+        "horizon_seconds": {"type": "integer", "minimum": 0}
+      }
+    },
+    "orders": {"type": "array", "items": {"$ref": "#/$defs/Order"}},
+    "summary": {"$ref": "#/$defs/Summary"}
+  },
+  "$defs": {
+    "Execution": {
+      "type": "object", "additionalProperties": false,
+      "required": ["execution_id", "order_id", "executed_at_utc", "quantity", "price", "fee_usd"],
+      "properties": {
+        "execution_id": {"type": "string", "minLength": 1}, "order_id": {"type": "string", "minLength": 1},
+        "executed_at_utc": {"type": "string", "format": "date-time"},
+        "quantity": {"type": "number", "exclusiveMinimum": 0}, "price": {"type": "number", "exclusiveMinimum": 0},
+        "fee_usd": {"type": ["number", "null"], "minimum": 0}
+      }
+    },
+    "Components": {
+      "type": "object", "additionalProperties": false,
+      "required": ["delay_usd", "execution_usd", "fees_usd", "unfilled_opportunity_usd", "gross_shortfall_usd", "net_shortfall_usd"],
+      "properties": {
+        "delay_usd": {"type": ["number", "null"]}, "execution_usd": {"type": ["number", "null"]},
+        "fees_usd": {"type": ["number", "null"]}, "unfilled_opportunity_usd": {"type": ["number", "null"]},
+        "gross_shortfall_usd": {"type": ["number", "null"]}, "net_shortfall_usd": {"type": ["number", "null"]}
+      }
+    },
+    "Order": {
+      "type": "object", "additionalProperties": false,
+      "required": ["decision_id", "order_id", "symbol", "side", "status", "decided_at_utc", "submitted_at_utc", "decision_price", "arrival_price", "intended_quantity", "filled_quantity", "executions", "fees_usd", "components"],
+      "properties": {
+        "decision_id": {"type": "string", "minLength": 1}, "order_id": {"type": "string", "minLength": 1},
+        "symbol": {"type": "string", "minLength": 1}, "side": {"enum": ["buy", "sell"]},
+        "status": {"enum": ["filled", "partially_filled", "cancelled", "rejected"]},
+        "decided_at_utc": {"type": "string", "format": "date-time"}, "submitted_at_utc": {"type": "string", "format": "date-time"},
+        "decision_price": {"type": "number", "exclusiveMinimum": 0}, "arrival_price": {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "intended_quantity": {"type": "number", "exclusiveMinimum": 0}, "filled_quantity": {"type": "number", "minimum": 0},
+        "executions": {"type": "array", "items": {"$ref": "#/$defs/Execution"}},
+        "fees_usd": {"type": ["number", "null"], "minimum": 0}, "components": {"$ref": "#/$defs/Components"}
+      }
+    },
+    "Summary": {
+      "type": "object", "additionalProperties": false,
+      "required": ["complete", "intended_decision_notional_usd", "delay_usd", "execution_usd", "fees_usd", "unfilled_opportunity_usd", "gross_shortfall_usd", "net_shortfall_usd", "gross_shortfall_bps", "net_shortfall_bps"],
+      "properties": {
+        "complete": {"type": "boolean"}, "intended_decision_notional_usd": {"type": ["number", "null"], "minimum": 0},
+        "delay_usd": {"type": ["number", "null"]}, "execution_usd": {"type": ["number", "null"]}, "fees_usd": {"type": ["number", "null"]},
+        "unfilled_opportunity_usd": {"type": ["number", "null"]}, "gross_shortfall_usd": {"type": ["number", "null"]},
+        "net_shortfall_usd": {"type": ["number", "null"]}, "gross_shortfall_bps": {"type": ["number", "null"]}, "net_shortfall_bps": {"type": ["number", "null"]}
+      }
+    }
+  }
+}
