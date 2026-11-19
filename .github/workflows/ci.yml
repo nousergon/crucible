@@ -281,8 +281,17 @@ jobs:
       # (alpha-engine-config/.github/workflows/pip-audit.yml,
       # crucible-backtester's `ci.yml`) rather than inventing a uv-specific
       # shortcut.
+      # pip-audit resolves the exported requirements in a venv built from the
+      # interpreter it runs under. ubuntu-latest moved to 26.04, whose python3
+      # is 3.14, and crucible requires <3.13, so a pip-audit run by the
+      # runner's python3 fails before auditing anything ("requires a different
+      # Python: 3.14.4"). Run it from a seeded venv on the repo's own
+      # .python-version instead.
       - name: Install pip-audit
-        run: python3 -m pip install --quiet --upgrade pip pip-audit
+        run: |
+          uv venv --seed --python "$(cat .python-version)" /tmp/pip-audit-venv
+          /tmp/pip-audit-venv/bin/python -m pip install --quiet --upgrade pip pip-audit
+          echo "/tmp/pip-audit-venv/bin" >> "$GITHUB_PATH"
 
       - name: Security audit (pip-audit)
         run: |
