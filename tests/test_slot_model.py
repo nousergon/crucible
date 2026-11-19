@@ -1775,3 +1775,83 @@ class TestTheVetoWindowIsNotGatedByTheRegistrationClock:
         )
         assert reason == "", reason
         assert "model_hit_rate_30d" in metrics
+
+
+class TestCalibrationReporting:
+    @pytest.mark.parametrize("direction", [-1, 1])
+    def test_fitted_metrics_describe_the_actual_fit(self, panel, direction) -> None:
+        from crucible.slots.model import (
+            SETTLED_WINDOW_DECISION_DATES,
+            SettledCrossSections,
+            calibrate_up_probability,
+            serving_metrics,
+        )
+
+        graded, predicted = TestTheVetoProducers()._graded(panel)
+        block = graded.settled.tail(SETTLED_WINDOW_DECISION_DATES)
+        block = SettledCrossSections(
+            dates=block.dates,
+            predicted=block.predicted,
+            realized=direction * block.realized,
+        )
+        calibration = calibrate_up_probability(block)
+        assert calibration is not None
+        metrics, reason = serving_metrics(predicted, settled=block)
+        assert reason == ""
+        assert metrics["p_up_calibration_slope"] == calibration.slope
+        assert metrics["p_up_calibration_intercept"] == calibration.intercept
+        assert metrics["p_up_calibration_base_rate"] == float((block.realized > 0).mean())
+        assert metrics["p_up_calibration_n"] == block.predicted.size
+        if direction == -1:
+            assert calibration.slope < 0
+            assert metrics["n_high_confidence"] == 0
+            veto = evaluate_behavioural_veto(metrics, metrics)
+            assert "calibrated to underperform" in " ".join(veto.reasons)
+
+    @pytest.mark.parametrize("short", [False, True])
+    def test_unfitted_metrics_are_absent(self, panel, short) -> None:
+        from crucible.slots.model import SettledCrossSections, serving_metrics
+
+        graded, predicted = TestTheVetoProducers()._graded(panel)
+        block = graded.settled
+        block = (
+            block.tail(1)
+            if short
+            else SettledCrossSections(
+                dates=block.dates,
+                predicted=block.predicted,
+                realized=np.ones_like(block.realized),
+            )
+        )
+        metrics, reason = serving_metrics(predicted, settled=block)
+        assert reason
+        assert not any(key.startswith("p_up_calibration_") for key in metrics)
+
+    @pytest.mark.parametrize("slope", [-1.234, 0.0, 1.234])
+    @pytest.mark.parametrize("count,expected", [(0, "veto"), (2, "pass"), (None, "insufficient")])
+    def test_reporting_preserves_decisions(self, slope, count, expected) -> None:
+        original = dict(
+            alpha_stdev=0.02, stdev_p_up=0.06, n_high_confidence=count, model_hit_rate_30d=0.70
+        )
+        enriched = dict(
+            original,
+            p_up_calibration_slope=slope,
+            p_up_calibration_intercept=0.1,
+            p_up_calibration_base_rate=0.456,
+            p_up_calibration_n=120,
+        )
+        before = evaluate_behavioural_veto(original, original)
+        after = evaluate_behavioural_veto(enriched, original)
+        assert before.status == after.status == expected
+        assert before.uncomputable == after.uncomputable
+        assert before.metrics == after.metrics
+        if count == 0:
+            clause = (
+                "its up-probability calibration slope is -1.23 (n=120): "
+                "its top names are calibrated to underperform"
+                if slope < 0
+                else f"calibration slope {slope:.2f}, base rate 0.46 (n=120)"
+            )
+            assert clause in " ".join(after.reasons)
+        else:
+            assert before.reasons == after.reasons
