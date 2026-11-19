@@ -44,12 +44,13 @@ import datetime as dt
 import json
 import os
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from importlib.resources import files
-from typing import Any
+from typing import Any, cast
 from zoneinfo import ZoneInfo
 
-from jsonschema import Draft202012Validator, ValidationError
+from jsonschema import Draft202012Validator
 
 from crucible.calendar import is_trading_day, resolve_trading_day
 
@@ -107,21 +108,24 @@ def session_executions(pages: Any, session: dt.date) -> list[dict[str, Any]]:
     return found
 
 
-def dispatch_execution(event: dict[str, Any], state_machine_arn: str) -> str:
+def dispatch_execution(event: Mapping[str, object], state_machine_arn: str) -> str:
     """Validate the versioned dispatch hint; never accept it as success evidence."""
-    payload = event.get("client_payload", {})
+    raw = event.get("client_payload", {})
     schema = json.loads(
         files("crucible").joinpath("schemas/postclose_dispatch.v1.json").read_text(encoding="utf-8")
     )
-    try:
-        Draft202012Validator(schema).validate(payload)
-    except ValidationError as exc:
-        raise ValueError("invalid postclose-reconciled dispatch contract") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("invalid postclose-reconciled dispatch contract")
+    payload = cast("dict[str, object]", raw)
+    valid = Draft202012Validator(schema).is_valid(  # pyright: ignore[reportUnknownMemberType] - jsonschema's validator methods are untyped
+        cast("dict[str, str]", raw)
+    )
+    if not valid:
+        raise ValueError("invalid postclose-reconciled dispatch contract")
     prefix = state_machine_arn.replace(":stateMachine:", ":execution:") + ":"
-    execution = payload.get("execution_arn") if isinstance(payload, dict) else None
+    execution = payload.get("execution_arn")
     if (
         event.get("action") != "postclose-reconciled"
-        or not isinstance(payload, dict)
         or payload.get("schema_version") != 1
         or payload.get("state_machine_arn") != state_machine_arn
         or payload.get("status") != "SUCCEEDED"

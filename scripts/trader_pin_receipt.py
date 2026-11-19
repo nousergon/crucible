@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from typing import Protocol
+from typing import Protocol, cast
 from urllib.parse import urlsplit
 
 from trader_pin_guard import STATE_MACHINE_ARN_VAR, dispatch_execution
@@ -26,9 +26,9 @@ def main(client: ReceiptClient | None = None) -> int:
     digest = hashlib.sha256(execution.encode()).hexdigest()
     key = uri.path.strip("/") + "/runs/release.pin_apply/dispatch/" + digest + ".json"
     if client is None:
-        import boto3
+        import boto3  # noqa: PLC0415 - only the live path needs the SDK  # pyright: ignore[reportMissingTypeStubs]
 
-        client = boto3.client("s3")
+        client = cast("ReceiptClient", boto3.client("s3"))  # pyright: ignore[reportUnknownMemberType]
     client.put_object(
         Bucket=uri.netloc,
         Key=key,
