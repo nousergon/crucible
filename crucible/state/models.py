@@ -19,10 +19,6 @@ Conventions, applied to every table:
   refuses UPDATE, DELETE and TRUNCATE. A correction is a new row, or for
   money a new journal entry.
 
-The ``llm_trace_index`` added by revision ``0002`` is deliberately an index,
-not a source document: it stores searchable call metadata, content hashes and
-optional S3 references, but never prompt or response bodies.
-
 Two gaps from the shape check (10-21 S7, settled here):
 
 1. **The trial key is ``as_of``, not ``cycle_date``.** The issue text says
@@ -364,7 +360,7 @@ posting = sa.Table(
 
 
 # --------------------------------------------------------------------------
-# LLM trace index: metadata and content references only (ruling C)
+# LLM trace index: searchable metadata only; content remains in object storage
 # --------------------------------------------------------------------------
 
 llm_trace_index = sa.Table(
@@ -379,32 +375,21 @@ llm_trace_index = sa.Table(
     sa.Column("output_tokens", sa.Integer, nullable=False),
     sa.Column("cost_usd", MONEY, nullable=False),
     sa.Column("citations", JSONB, nullable=False, server_default=sa.text("'[]'::jsonb")),
-    sa.Column("input_content_sha256", sa.Text, nullable=False),
-    sa.Column("output_content_sha256", sa.Text, nullable=False),
-    sa.Column("input_s3_key", sa.Text),
-    sa.Column("output_s3_key", sa.Text),
+    sa.Column("input_content_hash", sa.Text, nullable=False),
+    sa.Column("output_content_hash", sa.Text, nullable=False),
+    # NULL is the ruling-C hash-only representation; bodies never belong here.
+    sa.Column("content_s3_key", sa.Text),
+    sa.Column("metadata", JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")),
     _written_at(),
     sa.PrimaryKeyConstraint("trace_id", "span_id", name="llm_trace_index_pkey"),
     sa.CheckConstraint("input_tokens >= 0", name="llm_trace_index_input_tokens_nonneg"),
     sa.CheckConstraint("output_tokens >= 0", name="llm_trace_index_output_tokens_nonneg"),
     sa.CheckConstraint("cost_usd >= 0", name="llm_trace_index_cost_nonneg"),
-    sa.CheckConstraint(
-        "input_content_sha256 ~ '^[0-9a-f]{64}$'", name="llm_trace_index_input_hash_shape"
-    ),
-    sa.CheckConstraint(
-        "output_content_sha256 ~ '^[0-9a-f]{64}$'", name="llm_trace_index_output_hash_shape"
-    ),
-    sa.CheckConstraint("jsonb_typeof(citations) = 'array'", name="llm_trace_index_citations_array"),
     sa.Index("llm_trace_index_call_site", "call_site"),
-    sa.Index("llm_trace_index_span", "span_id"),
     sa.Index("llm_trace_index_model", "model"),
     sa.Index("llm_trace_index_route", "route"),
-    sa.Index("llm_trace_index_input_tokens", "input_tokens"),
-    sa.Index("llm_trace_index_output_tokens", "output_tokens"),
-    sa.Index("llm_trace_index_cost", "cost_usd"),
-    sa.Index("llm_trace_index_input_hash", "input_content_sha256"),
-    sa.Index("llm_trace_index_output_hash", "output_content_sha256"),
-    sa.Index("llm_trace_index_citations", "citations", postgresql_using="gin"),
+    sa.Index("llm_trace_index_input_hash", "input_content_hash"),
+    sa.Index("llm_trace_index_output_hash", "output_content_hash"),
 )
 
 

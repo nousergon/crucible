@@ -29,8 +29,11 @@ from crucible.alerts import (
     EXCEPTION_SCORE_METRIC,
     OVERDUE_LOOKBACK_TRADING_DAYS,
     TRADER_RECONCILE_JOB,
+    Page,
     StoreAccessError,
+    emit,
     evaluate_back_office_breaks,
+    group_pages,
     sweep,
 )
 from crucible.calendar import previous_trading_day
@@ -154,6 +157,29 @@ class TestEvaluateOverdueBreaks:
         _write(store, FRIDAY, [_row("performance_statement", "FAIL", "statement NOT filed")])
         (page,) = evaluate_back_office_breaks(store, now=SATURDAY_NIGHT)
         assert "performance_statement: statement NOT filed" in page.reason
+
+    @pytest.mark.parametrize(
+        "step",
+        [
+            "exception_records_filed",
+            "exception_proposals_filed",
+            "exception_rule_clears_filed",
+            "ledger_book_of_record",
+            "benchmark_closes_capture",
+            "performance_statement",
+            "month_end_close",
+            "month_rebuild",
+            "books_worm_retention",
+        ],
+    )
+    def test_each_back_office_manifest_step_failure_is_visible(
+        self, tmp_path: pathlib.Path, step: str
+    ) -> None:
+        store = LocalStore(tmp_path)
+        _write(store, FRIDAY, [_row(step, "FAIL", "record could not be filed")])
+        (page,) = evaluate_back_office_breaks(store, now=SATURDAY_NIGHT)
+        assert page.condition == "failure"
+        assert f"{step}: record could not be filed" in page.reason
 
     def test_a_broker_row_failing_is_not_a_back_office_break(self, tmp_path: pathlib.Path) -> None:
         """The broker's breaks fail the reconcile run and page under its own
@@ -372,6 +398,213 @@ class TestTheSweepPagesAnOverdueQueue:
         sent = [call for call in transport.calls if BACK_OFFICE_JOB in call.message]
         assert len(sent) == 2
         assert "ledger_book_of_record: roll-forward broke" in sent[-1].message
+
+    def test_failed_rule_clear_filing_updates_a_standing_incident_once(
+        self, tmp_path: pathlib.Path, transport: CapturingTransport
+    ) -> None:
+        store = LocalStore(tmp_path)
+        _write(store, THURSDAY, self._queue(THURSDAY, [("prop-1", "2026-08-21", 4)]))
+        first = sweep(store, now=SATURDAY_NIGHT, transport=transport, sweep_run_id="Z" * 26)
+        (original,) = self._rows(store, first)
+        friday = self._queue(FRIDAY, [("prop-1", "2026-08-21", 5)])
+        friday.append(_row("exception_rule_clears_filed", "FAIL", "rule evidence unreadable"))
+        _write(store, FRIDAY, friday)
+        later = SATURDAY_NIGHT + dt.timedelta(days=1)
+        sweep(store, now=later, transport=transport, sweep_run_id="Y" * 26)
+        last = sweep(store, now=later, transport=transport, sweep_run_id="X" * 26)
+
+        sent = [call for call in transport.calls if BACK_OFFICE_JOB in call.message]
+        assert len(sent) == 2
+        assert "exception_rule_clears_filed: rule evidence unreadable" in sent[-1].message
+        (row,) = self._rows(store, last)
+        assert row["trading_day"] == original["trading_day"] == THURSDAY.isoformat()
+        assert row["observations"] == 3
+        assert "exception_rule_clears_filed: rule evidence unreadable" in str(row["rendered"])
+        assert "Current observation (not a delivery receipt)" in str(row["rendered"])
+        assert row["rendered_initial"] == original["rendered"]
+        assert any(
+            "exception_rule_clears_filed: rule evidence unreadable" in str(member["reason"])
+            for member in cast("list[dict[str, object]]", row["members_now"])
+        )
+
+    @staticmethod
+    def _published_queue(store: LocalStore, day: dt.date, ids: list[str]) -> None:
+        items = [(pid, "2026-08-21", 5) for pid in ids]
+        metrics = TestTheSweepPagesAnOverdueQueue._queue(day, items[:5])
+        row = cast("dict[str, object]", metrics[-1])
+        row["status_reason"] = (
+            str(row["status_reason"]).replace("5 back-office", f"{len(ids)} back-office")
+            + f"; and {len(ids) - 5} more"
+        )
+        row["value"] = float(len(ids))
+        key = f"trader/exception_scores/{day.isoformat()}.json"
+        row["source_path"] = key
+        store.put_bytes(
+            key,
+            json.dumps(
+                {
+                    "schema_version": "exception_score.v1",
+                    "trading_day": day.isoformat(),
+                    "generated_at": row["last_updated_utc"],
+                    "totals": {"overdue": len(ids)},
+                    "queue": [
+                        {
+                            "proposal_id": pid,
+                            "trading_day": opened,
+                            "age_trading_days": age,
+                            "overdue": True,
+                        }
+                        for pid, opened, age in items
+                    ],
+                }
+            ).encode(),
+        )
+        _write(store, day, metrics)
+
+    def test_members_beyond_the_five_name_summary_are_named_and_deduplicated(
+        self, tmp_path: pathlib.Path, transport: CapturingTransport
+    ) -> None:
+        store = LocalStore(tmp_path)
+        first_five = [f"prop-{i}" for i in range(5)]
+        self._published_queue(store, THURSDAY, first_five)
+        sweep(store, now=SATURDAY_NIGHT, transport=transport, sweep_run_id="Z" * 26)
+        self._published_queue(store, FRIDAY, [*first_five, "sixth"])
+        sweep(store, now=SATURDAY_NIGHT, transport=transport, sweep_run_id="Y" * 26)
+        sent = [call for call in transport.calls if BACK_OFFICE_JOB in call.message]
+        assert len(sent) == 2
+        assert "sixth (2026-08-21, 5 trading days)" in sent[-1].message
+        self._published_queue(store, FRIDAY, [*first_five, "replacement"])
+        sweep(store, now=SATURDAY_NIGHT, transport=transport, sweep_run_id="X" * 26)
+        last = sweep(store, now=SATURDAY_NIGHT, transport=transport, sweep_run_id="W" * 26)
+        sent = [call for call in transport.calls if BACK_OFFICE_JOB in call.message]
+        assert len(sent) == 3
+        assert "replacement (2026-08-21, 5 trading days)" in sent[-1].message
+        (row,) = self._rows(store, last)
+        assert row["trading_day"] == THURSDAY.isoformat()
+        assert row["observations"] == 4
+
+    @pytest.mark.parametrize(
+        "fault", ["absent", "corrupt", "stale", "count", "identity", "invalid-day"]
+    )
+    def test_unusable_full_queue_evidence_never_hides_the_break(
+        self, tmp_path: pathlib.Path, fault: str
+    ) -> None:
+        store = LocalStore(tmp_path)
+        self._published_queue(store, FRIDAY, [f"prop-{i}" for i in range(6)])
+        key = "trader/exception_scores/2026-08-28.json"
+        if fault == "absent":
+            (tmp_path / key).unlink()
+        elif fault == "corrupt":
+            store.put_bytes(key, b"not json")
+        else:
+            document = json.loads(store.get_bytes(key))
+            if fault == "stale":
+                document["generated_at"] = "2026-08-27T21:00:00Z"
+            elif fault == "count":
+                document["queue"].pop()
+            elif fault == "invalid-day":
+                document["queue"][-1]["trading_day"] = "2026-99-99"
+            else:
+                document["queue"][0]["proposal_id"] = "different"
+            store.put_bytes(key, json.dumps(document).encode())
+        (page,) = evaluate_back_office_breaks(store, now=SATURDAY_NIGHT)
+        assert "6 back-office queue items" in page.reason
+        assert "Queue evidence unavailable:" in page.reason
+        assert "prop-5 (" not in page.reason
+
+    @pytest.mark.parametrize("corrupt", [False, True])
+    @pytest.mark.parametrize("initial_six", [False, True])
+    def test_recovering_identical_queue_evidence_does_not_notify_again(
+        self,
+        tmp_path: pathlib.Path,
+        transport: CapturingTransport,
+        *,
+        corrupt: bool,
+        initial_six: bool,
+    ) -> None:
+        store = LocalStore(tmp_path)
+        five = [f"prop-{i}" for i in range(5)]
+        self._published_queue(store, THURSDAY, [*five, "sixth"] if initial_six else five)
+        sweep(store, now=SATURDAY_NIGHT, transport=transport, sweep_run_id="Z" * 26)
+        self._published_queue(store, FRIDAY, [*five, "sixth"])
+        sweep(store, now=SATURDAY_NIGHT, transport=transport, sweep_run_id="Y" * 26)
+        key = "trader/exception_scores/2026-08-28.json"
+        saved = store.get_bytes(key)
+        if corrupt:
+            store.put_bytes(key, b"bad json")
+        else:
+            (tmp_path / key).unlink()
+        missing = sweep(store, now=SATURDAY_NIGHT, transport=transport, sweep_run_id="X" * 26)
+        (row,) = self._rows(store, missing)
+        assert "Queue evidence unavailable" in str(row["members_now"])
+        assert "Queue evidence unavailable" in str(row["rendered"])
+        store.put_bytes(key, saved)
+        last = sweep(store, now=SATURDAY_NIGHT, transport=transport, sweep_run_id="W" * 26)
+        sent = [call for call in transport.calls if BACK_OFFICE_JOB in call.message]
+        assert len(sent) == (1 if initial_six else 2)
+        (row,) = self._rows(store, last)
+        assert row["observations"] == 4
+
+    def test_a_long_queue_gain_remains_visible_in_the_console_message(
+        self, tmp_path: pathlib.Path, transport: CapturingTransport
+    ) -> None:
+        store = LocalStore(tmp_path)
+        old = [f"proposal-{i:032d}" for i in range(100)]
+        self._published_queue(store, THURSDAY, old)
+        first = sweep(store, now=SATURDAY_NIGHT, transport=transport, sweep_run_id="Z" * 26)
+        (original,) = self._rows(store, first)
+        self._published_queue(store, FRIDAY, [*old, "new-overdue"])
+        last = sweep(store, now=SATURDAY_NIGHT, transport=transport, sweep_run_id="Y" * 26)
+        (row,) = self._rows(store, last)
+        assert "new-overdue (2026-08-21, 5 trading days)" in str(row["rendered"])
+        assert row["rendered_initial"] == original["rendered"]
+        assert row["members"] == original["members"]
+        assert row["observations"] == 2
+
+    @pytest.mark.parametrize("reobserve_first", [False, True])
+    def test_console_observation_drops_a_resolved_back_office_member(
+        self, tmp_path: pathlib.Path, transport: CapturingTransport, *, reobserve_first: bool
+    ) -> None:
+        store = LocalStore(tmp_path)
+        office = Page("failure", BACK_OFFICE_JOB, FRIDAY, "s3_throttling", "R" * 26)
+        other = Page("failure", "data.daily", FRIDAY, "s3_throttling", "S" * 26)
+        shared = group_pages([office, other])
+        (key,) = emit(store, shared, now=SATURDAY_NIGHT, transport=transport, sweep_run_id=None)
+        original = json.loads(store.get_bytes(key))
+        if reobserve_first:
+            emit(store, shared, now=SATURDAY_NIGHT, transport=transport, sweep_run_id=None)
+        (last_key,) = emit(
+            store, group_pages([other]), now=SATURDAY_NIGHT, transport=transport, sweep_run_id=None
+        )
+        assert last_key == key
+        row = json.loads(store.get_bytes(key))
+        assert BACK_OFFICE_JOB not in row["rendered"]
+        assert "data.daily" in row["rendered"]
+        assert row["rendered_initial"] == original["rendered"]
+        assert row["members"] == original["members"]
+
+    def test_secondary_evidence_access_fault_does_not_rekey_the_incident(
+        self, tmp_path: pathlib.Path, transport: CapturingTransport
+    ) -> None:
+        class EvidenceFault(LocalStore):
+            deny_evidence = False
+
+            def get_bytes(self, key: str) -> bytes:
+                if self.deny_evidence and key.startswith("trader/exception_scores/"):
+                    raise PermissionError("s3_throttling while reading queue evidence")
+                return super().get_bytes(key)
+
+        store = EvidenceFault(tmp_path)
+        self._published_queue(store, FRIDAY, [f"prop-{i}" for i in range(6)])
+        first = sweep(store, now=SATURDAY_NIGHT, transport=transport, sweep_run_id="Z" * 26)
+        (original,) = self._rows(store, first)
+        store.deny_evidence = True
+        last = sweep(store, now=SATURDAY_NIGHT, transport=transport, sweep_run_id="Y" * 26)
+        (row,) = self._rows(store, last)
+        assert row["cause_key"] == original["cause_key"]
+        assert row["observations"] == 2
+        assert "s3_throttling while reading queue evidence" in str(row["rendered"])
+        assert len([c for c in transport.calls if BACK_OFFICE_JOB in c.message]) == 1
 
     def test_an_unreadable_streak_start_still_pages_the_latest_day(
         self, tmp_path: pathlib.Path
