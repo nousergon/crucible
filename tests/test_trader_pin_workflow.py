@@ -32,7 +32,12 @@ def _runs(job: dict) -> list[str]:
 
 def test_the_triggers_are_a_weekday_evening_cron_and_a_sha_only_dispatch() -> None:
     triggers = _triggers(_workflow())
-    assert set(triggers) == {"schedule", "workflow_dispatch"}
+    assert set(triggers) in (
+        {"schedule", "workflow_dispatch"},
+        {"schedule", "workflow_dispatch", "repository_dispatch"},
+    )
+    if "repository_dispatch" in triggers:
+        assert triggers["repository_dispatch"] == {"types": ["postclose-reconciled"]}
     # 02:45 UTC Tuesday-Saturday = Monday-Friday New York evenings, after v2's
     # post-close reconcile and its 02:15 UTC backstop (alpha-engine-config-I12024).
     assert triggers["schedule"] == [{"cron": "45 2 * * 2-6"}]
@@ -59,7 +64,14 @@ def test_the_guard_reads_v2s_post_close_reconcile() -> None:
 def test_each_event_reaches_exactly_one_job() -> None:
     jobs = _workflow()["jobs"]
     assert jobs["request"]["if"] == "${{ github.event_name == 'workflow_dispatch' }}"
-    assert jobs["apply"]["if"] == "${{ github.event_name == 'schedule' }}"
+    expected = "${{ github.event_name == 'schedule' }}"
+    if "repository_dispatch" in _triggers(_workflow()):
+        expected = (
+            "${{ github.event_name == 'schedule' || "
+            "(github.event_name == 'repository_dispatch' && "
+            "github.event.action == 'postclose-reconciled') }}"
+        )
+    assert jobs["apply"]["if"] == expected
 
 
 def test_both_jobs_refuse_a_non_main_ref_first() -> None:
@@ -118,12 +130,21 @@ def test_the_apply_guards_then_rehearses_then_applies() -> None:
     )
     assert rehearse["run"] == base + " --dry-run"
     assert apply["run"] == base
-    assert len(steps) == guard + 3, "nothing runs after the apply"
+    if "repository_dispatch" in _triggers(_workflow()):
+        receipt = steps[guard + 3]
+        assert receipt["if"] == "${{ github.event_name == 'repository_dispatch' }}"
+        assert receipt["run"] == "uv run python scripts/trader_pin_receipt.py"
+        assert len(steps) == guard + 4
+    else:
+        assert len(steps) == guard + 3
 
 
 def test_it_installs_frozen_and_never_cancels_a_run_in_flight() -> None:
     workflow = _workflow()
-    assert workflow["concurrency"] == {"group": "trader-pin", "cancel-in-progress": False}
+    group = "trader-pin"
+    if "repository_dispatch" in _triggers(workflow):
+        group = "trader-pin-${{ github.event_name == 'workflow_dispatch' && 'request' || 'apply' }}"
+    assert workflow["concurrency"] == {"group": group, "cancel-in-progress": False}
     for name in ("request", "apply"):
         assert "uv sync --frozen" in _runs(workflow["jobs"][name])
 
