@@ -836,6 +836,20 @@ def _execution_row(
         "decision_price_basis": DECISION_PRICE_BASIS,
         "notional_usd": reading.notional_usd,
         "shortfall_usd": reading.shortfall_usd,
+        "gross_shortfall_usd": reading.gross_shortfall_usd,
+        "net_shortfall_usd": reading.shortfall_usd,
+        "gross_shortfall_bps": (
+            reading.gross_shortfall_usd / reading.decision_notional_usd * 1e4
+            if reading.decision_notional_usd > 0
+            else None
+        ),
+        "net_shortfall_bps": reading.weighted_bps,
+        "delay_usd": reading.delay_usd,
+        "execution_usd": reading.execution_usd,
+        "fees_usd": reading.fees_usd,
+        "unfilled_opportunity_usd": reading.unfilled_opportunity_usd,
+        "complete_cost": reading.complete,
+        "legacy_v1_sessions": list(reading.legacy_v1),
         "n_orders_filled": reading.n_filled,
         "band": reading.band,
         "sessions_missing": list(reading.missing),
@@ -857,7 +871,8 @@ def _execution_row(
             n_floor=EXECUTION_N_FLOOR,
             extra=extra,
             reason=(
-                f"the trader filed no {EXECUTION_SHORTFALL_SCHEMA_VERSION} artifact under "
+                "the trader filed no execution_shortfall.v1 or "
+                f"{EXECUTION_SHORTFALL_SCHEMA_VERSION} artifact under "
                 f"{TRADER_EXECUTION_SHORTFALL_PREFIX} for any of the {len(days)} sessions "
                 f"{first}..{last}; the trader is a separate system and is not running into "
                 "this store, and the row is declared rather than omitted so the table's "
@@ -933,6 +948,11 @@ def _execution_row(
         n_floor=EXECUTION_N_FLOOR,
         target=baseline,
         red_line=upper,
+        forced_status=(
+            "WATCH"
+            if reading.legacy_v1 and weighted < upper and (high is None or high < upper)
+            else None
+        ),
         extra=extra,
         reason=(
             f"notional-weighted implementation shortfall {weighted:+.3f} bps against the "
@@ -940,6 +960,12 @@ def _execution_row(
             f"${reading.notional_usd:,.0f} notional (${reading.shortfall_usd:+,.2f}), in "
             f"{first}..{last}, {_ci_phrase(low, high)}; lower is better; "
             f"{band_phrase}{missing_phrase}"
+            + (
+                f"; legacy execution_shortfall.v1 session(s) {list(reading.legacy_v1)} "
+                "cover filled quantity only, so complete costs are unavailable"
+                if reading.legacy_v1
+                else ""
+            )
         ),
     )
 
