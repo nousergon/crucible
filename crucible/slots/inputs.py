@@ -1146,7 +1146,10 @@ def stack_prediction_columns(
             # one encoding every downstream selector already treats as "this
             # row cannot be used". `scores.get(n, 0.0)` would be the
             # substitution the ruling forbids, and it would read identically
-            # on every surface.
+            # on every surface. The same encoding also makes the exclusion
+            # consume the stacked arm's `max_incomplete_row_ratio` allowance;
+            # deliberately, base exclusions and genuinely null features share
+            # one budget because both remove rows from the training block.
             present = [n for n in panel.names if n in scores]
             scored_by_session[day] = len(present)
             missing_names.update(n for n in panel.names if n not in scores)

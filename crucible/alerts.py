@@ -2088,6 +2088,32 @@ def evaluate_min_active_arms(
         if not finding or finding.get("status") != "BELOW_FLOOR":
             continue
 
+        grade_manifest_key = manifest_key(
+            "experiment.grade", latest_day.isoformat(), discriminator=slot
+        )
+        grade_manifest = read_store_document(store, grade_manifest_key)
+        if grade_manifest.document is None:
+            if grade_manifest.problem is not None and not grade_manifest.access_problem:
+                run_id = _UNPARSEABLE_RUN_ID
+            else:
+                problem = grade_manifest.problem or f"{grade_manifest_key} is absent"
+                if access_faults is None:
+                    raise StoreAccessError(problem)
+                access_faults.append(problem)
+                continue
+        else:
+            manifest_run_id = grade_manifest.document.get("run_id")
+            if (
+                not isinstance(manifest_run_id, str)
+                or re.fullmatch(r"[0-9A-HJKMNP-TV-Z]{26}", manifest_run_id) is None
+            ):
+                problem = f"{grade_manifest_key} has no valid ULID run_id"
+                if access_faults is None:
+                    raise StoreAccessError(problem)
+                access_faults.append(problem)
+                continue
+            run_id = manifest_run_id
+
         # The incident's anchor: walk backward from the latest below-floor
         # cycle to the EARLIEST one in an unbroken below-floor streak, bounded
         # by the same lookback. The arena grades weekly (§4.4), so most
@@ -2123,7 +2149,7 @@ def evaluate_min_active_arms(
                     f"slot {slot!r}: {finding.get('reason') or 'below its min_active_arms floor'} "
                     f"(latest reading {latest_day.isoformat()})"
                 ),
-                run_id=latest.get("run_id") or _UNPARSEABLE_RUN_ID,
+                run_id=run_id,
             )
         )
     return pages
