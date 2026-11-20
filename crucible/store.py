@@ -1480,7 +1480,18 @@ READ_THROUGH_BEFORE_ENV = "CRUCIBLE_READ_THROUGH_BEFORE"
 #: `runs/`, `champions/`, `trader/`, `releases/` or any other record a job
 #: checks to decide whether IT already ran: a staging job that found a prod
 #: record there would skip its own work and file the prod result as staging's.
-READ_THROUGH_PREFIXES: tuple[str, ...] = ("data/", "features/", "universe/", "arm_predictions/")
+#: `experiments/` is history too: `experiment.grade` scores every shadow whose
+#: horizon has SETTLED, and a store weeks old holds none, so the staging weekly
+#: failed `experiment.grade[u]` with MissingArtifactError on 2026-11-19. Grading
+#: re-scores each shadow and writes its verdict to ``primary``; no grader reads a
+#: verdict to decide whether it already ran. `champions/` stays staging's alone.
+READ_THROUGH_PREFIXES: tuple[str, ...] = (
+    "data/",
+    "features/",
+    "universe/",
+    "arm_predictions/",
+    "experiments/",
+)
 _KEY_DAY = re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)")
 
 
