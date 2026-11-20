@@ -1,5 +1,5 @@
 """`alpha-engine-config-I13055`: a weekly arc that fails part-way still files
-`report/{day}/weekly_summary.json`, marked failed, naming the failed stage and
+`weekly/{day}/summary.json`, marked failed, naming the failed stage and
 every declared stage it never reached. Before this, the summary was built only
 after `run_arc` returned, so a failed week showed on the console as the
 previous week going stale and the failed stage was named nowhere on the page.
