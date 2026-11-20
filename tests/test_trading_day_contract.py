@@ -192,6 +192,24 @@ class TestStoreWalk:
         store.put_bytes("signals/2026-08-28/signals.json", b"{}")
         store.assert_keys_bind_to_trading_days()
 
+    def test_manifest_calendar_date_discriminators_are_provenance(self, tmp_path) -> None:
+        """Weekend and holiday firing dates distinguish otherwise identical
+        runs; only the manifest's trading-day segment makes a session claim."""
+        store = LocalStore(tmp_path)
+        store.put_bytes("runs/alerts.sweep/2026-08-28/2026-08-29/run.json", b"{}")
+        store.put_bytes("runs/data.daily/2026-07-02/2026-07-03/run.json", b"{}")
+        store.assert_keys_bind_to_trading_days()
+
+    @pytest.mark.parametrize("bad", ["2026-08-29", "2026-8-29"])
+    def test_manifest_bad_trading_day_is_not_hidden_by_discriminator(
+        self, tmp_path, bad: str
+    ) -> None:
+        store = LocalStore(tmp_path)
+        store.put_bytes(f"runs/alerts.sweep/{bad}/2026-08-29/run.json", b"{}")
+        with pytest.raises(NonTradingDayKeyError) as exc:
+            store.assert_keys_bind_to_trading_days()
+        assert bad in str(exc.value)
+
     def test_the_walk_rejects_a_saturday_key(self, tmp_path) -> None:
         """The defect this exists to catch: a job that keyed by wall-clock
         date instead of resolving. It writes a Saturday, every downstream
