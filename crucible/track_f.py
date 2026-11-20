@@ -579,7 +579,7 @@ def _record_weekly_summary(
     failed_stage: tuple[str, dict[str, object] | None] | None = None,
     not_run: list[str] | None = None,
 ) -> None:
-    """File `report/{day}/weekly_summary.json` and the estimated compute cost metric."""
+    """File `weekly/{day}/summary.json` and the estimated compute cost metric."""
     day = ctx.trading_day.isoformat()
     now = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     started = ctx.started.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
