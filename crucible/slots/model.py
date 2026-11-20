@@ -1233,6 +1233,9 @@ class ModelRecipe:
     #: to an incomplete feature vector before the fit refuses. `None` means
     #: the arm declares none and is held to
     #: :data:`DEFAULT_MAX_INCOMPLETE_ROW_RATIO`.
+    #: A stacked base's unscored names are incomplete rows too and consume this
+    #: SAME allowance alongside genuinely null features: both remove rows from
+    #: the training block, and the declared limit bounds their combined loss.
     #:
     #: A TUNED number and therefore a private-tree one: how much of a
     #: cross-section an arm may lose and still be the arm that was
