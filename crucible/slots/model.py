@@ -3324,6 +3324,7 @@ class CPCVFold:
     train_dates: tuple[str, ...]
     test_dates: tuple[str, ...]
     purged_dates: tuple[str, ...]
+    failure_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -3345,6 +3346,12 @@ class CPCVResult:
                 "(champion-challenger-policy.md §7.2)."
             )
         return float(np.mean(self.ics))
+
+
+#: A CPCV battery is a distribution, not an all-or-nothing chain of fits.
+#: Four fifths keeps that distribution meaningful while allowing one refusal
+#: in the production 15-combination battery to remain a measurable result.
+CPCV_MIN_FITTABLE_SHARE = 0.8
 
 
 def _contiguous_groups(n: int, n_groups: int) -> list[tuple[int, int]]:
@@ -3381,14 +3388,20 @@ def cpcv_oos_ic(
     after side carried the embargo alone (2 sessions against a 21-session
     label), and 14 of 15 folds trained on labels overlapping their test labels.
 
-    An empty or unfittable fold makes the whole result ``unmeasurable`` with a
-    reason. It is never a zero IC: `n_dates == 0` is a defect, not a result.
+    Every empty, unfittable, or unrankable fold is recorded and the remaining
+    combinations are still attempted.  The battery is measurable when at
+    least :data:`CPCV_MIN_FITTABLE_SHARE` of its combinations fit.  An
+    unmeasurable battery never substitutes a zero IC.
     """
     n = len(panel.dates)
     if n < cpcv.n_groups:
+        total = math.comb(cpcv.n_groups, cpcv.k_test)
         return CPCVResult(
             "unmeasurable",
-            f"{n} trading day(s) cannot be split into {cpcv.n_groups} groups",
+            (
+                f"0 of {total} combination(s) fitted: {n} trading day(s) cannot be split "
+                f"into {cpcv.n_groups} groups"
+            ),
             (),
             (),
             0,
@@ -3423,45 +3436,36 @@ def cpcv_oos_ic(
 
         train_idx = np.flatnonzero(keep)
         test_idx = np.flatnonzero(is_test)
+        failure_reason: str | None = None
         if train_idx.size == 0 or test_idx.size == 0:
-            return CPCVResult(
-                "unmeasurable",
-                (
-                    f"combination {combo} leaves {train_idx.size} training and "
-                    f"{test_idx.size} test day(s) after a "
-                    f"{label_horizon_trading_days}d purge and a "
-                    f"{cpcv.embargo_trading_days}d embargo"
-                ),
-                (),
-                tuple(folds),
-                n_paths,
+            failure_reason = (
+                f"combination {combo} leaves {train_idx.size} training and "
+                f"{test_idx.size} test day(s) after a "
+                f"{label_horizon_trading_days}d purge and a "
+                f"{cpcv.embargo_trading_days}d embargo"
             )
+        else:
+            try:
+                ic = _fold_ic(panel, recipe, train_idx, test_idx)
+            except (TrainingIntegrityError, np.linalg.LinAlgError) as exc:
+                failure_reason = f"combination {combo} could not be fitted: {exc}"
+            else:
+                if ic is None:
+                    failure_reason = (
+                        f"combination {combo} produced no dispersion on one side of the rank "
+                        "correlation — a collapsed prediction or a flat label block cannot be "
+                        "ranked, and an unrankable fold is not a zero IC"
+                    )
+                else:
+                    ics.append(ic)
+        if failure_reason is not None:
+            folds[-1] = replace(fold, failure_reason=failure_reason)
 
-        try:
-            ic = _fold_ic(panel, recipe, train_idx, test_idx)
-        except (TrainingIntegrityError, np.linalg.LinAlgError) as exc:
-            return CPCVResult(
-                "unmeasurable",
-                f"combination {combo} could not be fitted: {exc}",
-                (),
-                tuple(folds),
-                n_paths,
-            )
-        if ic is None:
-            return CPCVResult(
-                "unmeasurable",
-                (
-                    f"combination {combo} produced no dispersion on one side of the rank "
-                    "correlation — a collapsed prediction or a flat label block cannot be "
-                    "ranked, and an unrankable fold is not a zero IC"
-                ),
-                (),
-                tuple(folds),
-                n_paths,
-            )
-        ics.append(ic)
-
-    return CPCVResult("ok", "", tuple(ics), tuple(folds), n_paths)
+    total = len(folds)
+    fitted = len(ics)
+    reason = f"{fitted} of {total} combination(s) fitted"
+    status = "ok" if fitted / total >= CPCV_MIN_FITTABLE_SHARE else "unmeasurable"
+    return CPCVResult(status, reason, tuple(ics) if status == "ok" else (), tuple(folds), n_paths)
 
 
 def _flatten(day_idx: np.ndarray, n_names: int) -> np.ndarray:
