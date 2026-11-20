@@ -49,7 +49,14 @@ from pathlib import Path
 from typing import Any
 
 from crucible.llm import DEFAULT_LLM_CAP_USD, DEFAULT_LLM_CAP_USD_MEASURED
-from crucible.store import LocalStore, S3Store, Store, capturing, parse_store_scheme
+from crucible.store import (
+    LocalStore,
+    S3Store,
+    Store,
+    capturing,
+    parse_store_scheme,
+    with_read_through,
+)
 
 __all__ = [
     "CLOUDTRAIL_ARCHIVE_VAR",
@@ -276,7 +283,7 @@ class Settings:
                 "hardcoded production bucket fallback — a job that wrote to "
                 "production because a flag was missing is noticed once."
             )
-        resolved = store_from_uri(self.store_uri)
+        resolved = with_read_through(store_from_uri(self.store_uri))
         return capturing(resolved) if self.dry_run else resolved
 
     def cloudtrail_bucket_prefix(self) -> tuple[str, str]:

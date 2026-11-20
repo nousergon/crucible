@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Reconcile dispatch workflow receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "execution_arn",
+    "workflow_run_id",
+    "outcome"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "execution_arn": {
+      "type": "string",
+      "pattern": "^arn:aws:states:[^:]+:[0-9]{12}:execution:[^:]+:.+$"
+    },
+    "workflow_run_id": {
+      "type": "string",
+      "pattern": "^[0-9]+$"
+    },
+    "outcome": {
+      "const": "workflow_completed"
+    }
+  }
+}

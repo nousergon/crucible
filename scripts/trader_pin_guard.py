@@ -41,11 +41,16 @@ workflow fails naming it — "could not ask" never reads as "not clean".
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from importlib.resources import files
+from typing import Any, cast
 from zoneinfo import ZoneInfo
+
+from jsonschema import Draft202012Validator
 
 from crucible.calendar import is_trading_day, resolve_trading_day
 
@@ -103,7 +108,36 @@ def session_executions(pages: Any, session: dt.date) -> list[dict[str, Any]]:
     return found
 
 
-def read(now: dt.datetime, list_pages: Any) -> Reading:
+def dispatch_execution(event: Mapping[str, object], state_machine_arn: str) -> str:
+    """Validate the versioned dispatch hint; never accept it as success evidence."""
+    raw = event.get("client_payload", {})
+    schema = json.loads(
+        files("crucible").joinpath("schemas/postclose_dispatch.v1.json").read_text(encoding="utf-8")
+    )
+    if not isinstance(raw, dict):
+        raise ValueError("invalid postclose-reconciled dispatch contract")
+    payload = cast("dict[str, object]", raw)
+    valid = Draft202012Validator(schema).is_valid(  # pyright: ignore[reportUnknownMemberType] - jsonschema's validator methods are untyped
+        cast("dict[str, str]", raw)
+    )
+    if not valid:
+        raise ValueError("invalid postclose-reconciled dispatch contract")
+    prefix = state_machine_arn.replace(":stateMachine:", ":execution:") + ":"
+    execution = payload.get("execution_arn")
+    if (
+        event.get("action") != "postclose-reconciled"
+        or payload.get("schema_version") != 1
+        or payload.get("state_machine_arn") != state_machine_arn
+        or payload.get("status") != "SUCCEEDED"
+        or not isinstance(execution, str)
+        or not execution.startswith(prefix)
+        or not execution[len(prefix) :]
+    ):
+        raise ValueError("invalid postclose-reconciled dispatch contract")
+    return execution
+
+
+def read(now: dt.datetime, list_pages: Any, *, execution_arn: str | None = None) -> Reading:
     """The guard's reading at ``now``. ``list_pages`` yields `ListExecutions` pages."""
     if now.tzinfo is None:
         raise ValueError(f"{now!r} is naive; the guard reads New York wall time")
@@ -118,7 +152,12 @@ def read(now: dt.datetime, list_pages: Any) -> Reading:
         )
     executions = session_executions(list_pages(), session)
     statuses = sorted({str(e.get("status")) for e in executions})
-    succeeded = [e for e in executions if e.get("status") == "SUCCEEDED"]
+    succeeded = [
+        e
+        for e in executions
+        if e.get("status") == "SUCCEEDED"
+        and (execution_arn is None or e.get("executionArn") == execution_arn)
+    ]
     running = [e for e in executions if e.get("status") == "RUNNING"]
     if succeeded and not running:
         return Reading(
@@ -146,6 +185,10 @@ def main(
     if not arn:
         print(f"::error::{STATE_MACHINE_ARN_VAR} is unset; the guard cannot name the post-close")
         return 1
+    execution_arn = None
+    if os.environ.get("GITHUB_EVENT_NAME") == "repository_dispatch":
+        with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as handle:
+            execution_arn = dispatch_execution(json.load(handle), arn)
     if client is None:
         import boto3  # noqa: PLC0415 - only the live path needs the SDK
 
@@ -154,6 +197,7 @@ def main(
     reading = read(
         now or dt.datetime.now(dt.UTC),
         lambda: paginator.paginate(stateMachineArn=arn, PaginationConfig={"PageSize": 100}),
+        execution_arn=execution_arn,
     )
     print(f"trader-pin guard: {reading.postclose}: {reading.detail}")
     output = os.environ.get("GITHUB_OUTPUT")
