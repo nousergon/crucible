@@ -86,6 +86,20 @@ def test_settled_shadows_read_through_for_grading(pair: Pair) -> None:
     assert not fallback.exists("experiments/m-arm/2026-10-01/verdict.json")
 
 
+def test_graded_outputs_are_staging_own(pair: Pair) -> None:
+    """A prod verdict no staging run claims never surfaces in staging (explain, 2026-11-20)."""
+    _, fallback, store = pair
+    for key in (
+        "experiments/s-arm/2026-10-01/verdict.json",
+        "experiments/s-arm/2026-10-01/cross_section_settled.json",
+    ):
+        fallback.put_bytes(key, b"prod")
+        assert not store.exists(key)
+        assert key not in set(store.list_keys("experiments/"))
+    fallback.put_bytes("experiments/s-arm/2026-10-01/shadow.json", b"prod")
+    assert store.exists("experiments/s-arm/2026-10-01/shadow.json")
+
+
 def test_a_bad_cutoff_refuses(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="YYYY-MM-DD"):
         ReadThroughStore(LocalStore(tmp_path / "a"), LocalStore(tmp_path / "b"), before="11/07")
