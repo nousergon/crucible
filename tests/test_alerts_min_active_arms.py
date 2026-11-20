@@ -12,17 +12,19 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+from pathlib import Path
 
 import pytest
 
 from crucible.alerts import PAGE_CONDITIONS, StoreAccessError, evaluate_min_active_arms
-from crucible.keys import arena_cycle_key
+from crucible.keys import arena_cycle_key, manifest_key
 from crucible.slots.cycle import MIN_ACTIVE_ARMS_FINDING_METRIC
 from crucible.store import LocalStore
 
 FRIDAY = dt.date(2026, 8, 28)
 PRIOR_FRIDAY = dt.date(2026, 8, 21)
 NOW = dt.datetime(2026, 8, 29, 23, 0, tzinfo=dt.UTC)
+GRADE_RUN_ID = "01KAFZ6Y8J7Q3S5T9V2W4X6Z8A"
 
 
 def _write_cycle(store: LocalStore, slot: str, day: dt.date, *, status: str, count: int) -> None:
@@ -67,10 +69,14 @@ def _write_cycle(store: LocalStore, slot: str, day: dt.date, *, status: str, cou
             }
         ).encode("utf-8"),
     )
+    store.put_bytes(
+        manifest_key("experiment.grade", day.isoformat(), discriminator=slot),
+        json.dumps({"run_id": GRADE_RUN_ID}).encode("utf-8"),
+    )
 
 
 class TestEvaluateMinActiveArms:
-    def test_fires_for_a_below_floor_slot(self, tmp_path) -> None:
+    def test_fires_for_a_below_floor_slot(self, tmp_path: Path) -> None:
         store = LocalStore(tmp_path)
         _write_cycle(store, "s", FRIDAY, status="BELOW_FLOOR", count=1)
         pages = evaluate_min_active_arms(store, now=NOW)
@@ -79,19 +85,32 @@ class TestEvaluateMinActiveArms:
         assert s_pages[0].condition == "failure"
         assert s_pages[0].condition in PAGE_CONDITIONS
         assert "floor of 3" in s_pages[0].reason
+        assert s_pages[0].run_id == GRADE_RUN_ID
 
-    def test_does_not_fire_for_a_slot_at_the_floor(self, tmp_path) -> None:
+    def test_does_not_fire_for_a_slot_at_the_floor(self, tmp_path: Path) -> None:
         store = LocalStore(tmp_path)
         _write_cycle(store, "s", FRIDAY, status="OK", count=3)
         pages = evaluate_min_active_arms(store, now=NOW)
         assert [p for p in pages if p.job == "slots.s"] == []
 
-    def test_a_slot_with_no_graded_cycle_pages_nothing(self, tmp_path) -> None:
+    def test_an_unparseable_grade_manifest_uses_the_sentinel(self, tmp_path: Path) -> None:
+        store = LocalStore(tmp_path)
+        _write_cycle(store, "s", FRIDAY, status="BELOW_FLOOR", count=1)
+        store.put_bytes(
+            manifest_key("experiment.grade", FRIDAY.isoformat(), discriminator="s"),
+            b"{not json",
+        )
+
+        pages = evaluate_min_active_arms(store, now=NOW)
+
+        assert [page.run_id for page in pages if page.job == "slots.s"] == ["0" * 26]
+
+    def test_a_slot_with_no_graded_cycle_pages_nothing(self, tmp_path: Path) -> None:
         store = LocalStore(tmp_path)
         assert evaluate_min_active_arms(store, now=NOW) == []
 
     def test_the_incident_anchors_at_the_earliest_below_floor_cycle_not_today(
-        self, tmp_path
+        self, tmp_path: Path
     ) -> None:
         """A standing state observed two cycles running must dedup to ONE
         incident — the anchor is the earlier day, so the second sweep's
@@ -106,7 +125,7 @@ class TestEvaluateMinActiveArms:
         assert s_pages[0].trading_day == PRIOR_FRIDAY
 
     def test_a_slot_that_cleared_the_floor_does_not_anchor_past_the_recovery(
-        self, tmp_path
+        self, tmp_path: Path
     ) -> None:
         """The below-floor run before a recovery must not extend the anchor
         through a cycle that read OK."""
@@ -118,7 +137,9 @@ class TestEvaluateMinActiveArms:
         assert len(s_pages) == 1
         assert s_pages[0].trading_day == FRIDAY
 
-    def test_a_cycle_that_does_not_conform_to_arena_cycle_raises_named(self, tmp_path) -> None:
+    def test_a_cycle_that_does_not_conform_to_arena_cycle_raises_named(
+        self, tmp_path: Path
+    ) -> None:
         """`alpha-engine-config-I9847` (wave 2): a cycle document that parses
         as JSON but is missing a field a real writer always carries (here,
         the whole required shape — `decision`, `as_of`, `slot`...) used to
