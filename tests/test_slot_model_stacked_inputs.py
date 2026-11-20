@@ -38,13 +38,26 @@ from crucible.slots.inputs import (
     stack_prediction_columns,
     write_arm_predictions,
 )
-from crucible.slots.model import FeaturePanel, load_model_recipes
+from crucible.slots.model import (
+    FeaturePanel,
+    TrainingIntegrityError,
+    load_model_recipes,
+    train_arm,
+)
 from crucible.store import LocalStore
 
 _LAYER = ("mom_21d_ratio", "vol_21d_ratio")
 
 
-def _write(directory: Path, name: str, *, features: str, inputs: tuple[str, ...] = ()) -> None:
+def _write(
+    directory: Path,
+    name: str,
+    *,
+    features: str,
+    inputs: tuple[str, ...] = (),
+    label_horizon: int = 21,
+    min_trading_days: int = 504,
+) -> None:
     """A recipe file, written the way the private strategy tree writes one.
 
     `inputs` entries go in BLOCK form. `predictions[base]` is a legal plain
@@ -62,9 +75,9 @@ def _write(directory: Path, name: str, *, features: str, inputs: tuple[str, ...]
         lines += [f"    - {entry}" for entry in inputs]
     lines += [
         "  estimator: {kind: ridge, alpha: 1.0}",
-        "  label_horizon_trading_days: 21",
+        f"  label_horizon_trading_days: {label_horizon}",
         "  refit_cadence_trading_days: 5",
-        "  training_window: {kind: expanding, min_trading_days: 504}",
+        f"  training_window: {{kind: expanding, min_trading_days: {min_trading_days}}}",
         "  cpcv: {n_groups: 6, k_test: 2, embargo_trading_days: 2}",
         "registered_at: '2026-06-01'",
     ]
@@ -537,6 +550,40 @@ class TestTheStackScoresTheIntersection:
             "condition through a different door"
         )
         assert np.isfinite(column[:, 1:]).all(), "every scored name keeps its value"
+
+    def test_base_exclusions_and_feature_nulls_share_the_incomplete_row_budget(
+        self, tmp_path: Path
+    ) -> None:
+        """Two sub-limit losses combine because both remove training rows."""
+        panel = _wide_panel(100)
+        features = panel.features["mom_21d_ratio"].copy()
+        features[:, 9:18] = np.nan
+        panel = replace(panel, features={"mom_21d_ratio": features})
+        store = LocalStore(tmp_path / "store")
+        _write_base(store, panel, scored=panel.names[9:])
+
+        stacked = _stack(store, panel)
+        (coverage,) = stacked.input_coverage
+        floor = get_slot("m").stacked_base_coverage_floor
+        assert coverage.worst_coverage == pytest.approx(0.91)
+        assert coverage.worst_coverage > floor
+
+        recipes = tmp_path / "recipes"
+        recipes.mkdir()
+        _write(recipes, "base", features="[mom_21d_ratio]")
+        _write(
+            recipes,
+            "stacked",
+            features="[mom_21d_ratio]",
+            inputs=("predictions[base]",),
+            label_horizon=1,
+            min_trading_days=2,
+        )
+        loaded = load_model_recipes(recipes, feature_columns=_LAYER)
+        recipe = next(recipe for recipe in loaded.registered if recipe.name == "stacked")
+
+        with pytest.raises(TrainingIntegrityError, match=r"0\.1800.*above the declared ceiling"):
+            train_arm(recipe, stacked, as_of=stacked.dates[-1])
 
     def test_the_panel_carries_a_coverage_record_naming_scored_panel_and_missing(
         self, tmp_path
