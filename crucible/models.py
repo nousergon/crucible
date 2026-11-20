@@ -101,6 +101,7 @@ still holds because that derivation happens here, not in a second copy.
 from __future__ import annotations
 
 import datetime as dt
+import re
 from typing import Annotated, Any, ClassVar, Final, Literal, get_args
 
 from krepis.metrics import StatusLiteral
@@ -2849,9 +2850,16 @@ class FeatureRow(_Strict):
         "degraded or the feature changed' from.",
     )
     window_trading_days: Annotated[int, Field(ge=1)] | None = Field(
-        description="A count of SESSIONS (§4.12), never calendar days. Null for a "
-        "point-in-time column reading only the current row. Zero and negative are "
-        "refused -- a window is at least one session."
+        description="The column's total history requirement, as a count of SESSIONS "
+        "(§4.12), never calendar days. Null for a point-in-time column reading only "
+        "the current row. Zero and negative are refused -- a window is at least one "
+        "session."
+    )
+    economic_window_trading_days: Annotated[int, Field(ge=1)] | None = Field(
+        default=None,
+        description="The economic window named by a _<N>d_ name segment when it "
+        "differs from window_trading_days, the column's total history requirement. "
+        "Additive optional for documents whose named and history windows agree.",
     )
     cross_sectional: bool = Field(
         description="True when the column is computed across one day's cross-section "
@@ -2910,6 +2918,26 @@ class FeatureRow(_Strict):
                 "unnormalized — a raw column claiming a normalized unit is the same "
                 "defect in the other direction: the name promises the consumer an "
                 "unnormalized value and the declared unit says otherwise."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _name_and_windows_agree(self) -> FeatureRow:
+        """Refuse a name whose economic session count contradicts its windows."""
+        name_window = re.search(r"_(\d+)d_", self.name)
+        if name_window is None:
+            return self
+        declared_window = (
+            self.economic_window_trading_days
+            if self.economic_window_trading_days is not None
+            else self.window_trading_days
+        )
+        if declared_window != int(name_window.group(1)):
+            raise ValueError(
+                f"feature {self.name!r} names an economic window of "
+                f"{name_window.group(1)} sessions but declares {declared_window!r}; "
+                "economic_window_trading_days is required when the economic window "
+                "differs from the total history requirement"
             )
         return self
 

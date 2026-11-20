@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -138,8 +139,12 @@ class FeatureSpec:
     #: (`alpha-engine-config-I10071`) regardless of what the market did.
     market_wide: bool
     #: SESSIONS, not calendar days. `None` for a point-in-time column that
-    #: reads only the current row.
+    #: reads only the current row. This is the column's total history
+    #: requirement, which may be longer than its economic window.
     window_trading_days: int | None = None
+    #: The economic window named by a `_<N>d_` segment when it differs from
+    #: the total history requirement.
+    economic_window_trading_days: int | None = None
     #: Whether the column is COMPUTED across the cross-section of one day
     #: (a z-score or a cross-sectional mean) rather than along one ticker's
     #: history. Orthogonal to `market_wide`: `tech_score_ratio` is computed
@@ -192,6 +197,26 @@ class FeatureSpec:
                 f"{self.window_trading_days}; a window is a count of SESSIONS and is "
                 "at least one (plan §4.12)"
             )
+        if self.economic_window_trading_days is not None and self.economic_window_trading_days < 1:
+            raise ValueError(
+                f"feature {self.name!r} declares economic_window_trading_days="
+                f"{self.economic_window_trading_days}; an economic window is a count "
+                "of SESSIONS and is at least one"
+            )
+        name_window = re.search(r"_(\d+)d_", self.name)
+        if name_window is not None:
+            declared_window = (
+                self.economic_window_trading_days
+                if self.economic_window_trading_days is not None
+                else self.window_trading_days
+            )
+            if declared_window != int(name_window.group(1)):
+                raise ValueError(
+                    f"feature {self.name!r} names an economic window of "
+                    f"{name_window.group(1)} sessions but declares {declared_window!r}; "
+                    "economic_window_trading_days is required when the economic window "
+                    "differs from the total history requirement"
+                )
 
     def to_dict(self) -> dict[str, JsonValue]:
         # `market_wide` IS written here (`alpha-engine-config-I10114`): the
@@ -223,6 +248,7 @@ class FeatureSpec:
             "description": self.description,
             "inputs": list(self.inputs),
             "window_trading_days": self.window_trading_days,
+            "economic_window_trading_days": self.economic_window_trading_days,
             "cross_sectional": self.cross_sectional,
             "market_wide": self.market_wide,
         }
@@ -372,6 +398,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
         expression="zscore(momentum_20d_log_return)",
         description="Cross-sectional z-score of 20-session momentum, over the liquid set.",
         inputs=("momentum_20d_log_return", "liquidity_pass_raw"),
+        economic_window_trading_days=20,
         cross_sectional=True,
     ),
     FeatureSpec(
@@ -381,6 +408,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
         expression="zscore(return_60d_log_return)",
         description="Cross-sectional z-score of 60-session return, over the liquid set.",
         inputs=("return_60d_log_return", "liquidity_pass_raw"),
+        economic_window_trading_days=60,
         cross_sectional=True,
     ),
     FeatureSpec(
@@ -497,6 +525,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
             "liquid set. This is the column both M arms rank first."
         ),
         inputs=("residual_momentum_252d_skip21d_ratio", "liquidity_pass_raw"),
+        economic_window_trading_days=252,
         cross_sectional=True,
     ),
     FeatureSpec(
@@ -510,6 +539,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
         ),
         inputs=("return_1d_log_return",),
         window_trading_days=42,
+        economic_window_trading_days=21,
     ),
     FeatureSpec(
         name="momentum_change_21d_zscore",
@@ -518,6 +548,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
         expression="zscore(momentum_change_21d_log_return)",
         description=("Cross-sectional z-score of momentum acceleration, over the liquid set."),
         inputs=("momentum_change_21d_log_return", "liquidity_pass_raw"),
+        economic_window_trading_days=21,
         cross_sectional=True,
     ),
     # -- the v3.0-meta L1 inputs (alpha-engine-config-I10695) -----------------
