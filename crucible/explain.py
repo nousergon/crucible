@@ -44,7 +44,12 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from crucible.documents import load_store_document, read_manifests_under
-from crucible.keys import EXPERIMENTS_ROOT, RUNS_ROOT, manifest_key
+from crucible.keys import (
+    EXPERIMENTS_ROOT,
+    RUNS_ROOT,
+    is_invocation_manifest_key,
+    manifest_key,
+)
 from crucible.manifest import (
     ManifestValidationError,
     MoneyPathChainError,
@@ -426,9 +431,9 @@ def load_manifests(store: Store) -> ManifestLoad:
     failure mode is about OUR ACCESS to the prefix, not about any one
     manifest, so it stays a raise; a per-manifest fault does not.
     """
-    listing = read_manifests_under(store, RUNS_ROOT)
+    listing = read_manifests_under(store, RUNS_ROOT, include_history=True)
     listing.raise_if_unlistable()
-    manifests: list[dict[str, Any]] = []
+    manifests_by_run: dict[str, tuple[str, dict[str, Any]]] = {}  # pyright: ignore[reportExplicitAny]
     unreadable: dict[str, str] = dict(listing.faults)
     for key, document in listing.documents:
         try:
@@ -436,7 +441,10 @@ def load_manifests(store: Store) -> ManifestLoad:
         except ManifestValidationError as exc:
             unreadable[key] = str(exc)
             continue
-        manifests.append(document)
+        previous = manifests_by_run.get(document["run_id"])
+        if previous is None or is_invocation_manifest_key(key):
+            manifests_by_run[document["run_id"]] = (key, document)
+    manifests = [pair[1] for pair in manifests_by_run.values()]
     return ManifestLoad(tuple(manifests), unreadable)
 
 
