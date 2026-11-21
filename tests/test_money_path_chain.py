@@ -43,6 +43,7 @@ from crucible.keys import (
     champion_key,
     execution_shortfall_key,
     holdout_unseal_key,
+    invocation_manifest_key,
     manifest_key,
     money_path_claim_key,
     predictions_key,
@@ -227,6 +228,13 @@ class TestTheWriterEmitsTheLink:
         )
         assert "money_path_link" not in written
 
+    def test_a_duplicate_immutable_invocation_is_refused(self, store) -> None:
+        manifest = _manifest("01JG0000000000000000000001", outputs=[])
+        write_manifest(store, manifest_key("promote", TRADING_DAY), manifest)
+
+        with pytest.raises(PointerConflictError, match="already exists"):
+            write_manifest(store, manifest_key("promote", TRADING_DAY), manifest)
+
     def test_the_first_money_path_run_is_the_genesis(self, store) -> None:
         written = write_manifest(
             store,
@@ -407,7 +415,8 @@ class TestTheChainDetectsTamperingAndAcceptsHonestAppends:
         assert len(verdict.records) == 4
 
     def test_a_mutated_historical_record_is_detected(self, store) -> None:
-        keys = self._three_record_chain(store)
+        aliases = self._three_record_chain(store)
+        keys = [_history_key_of(json.loads(store.get_bytes(key))) for key in aliases]
         # The restatement: record 1's cost is edited in place, exactly the
         # shape of the v1 NAV series being manually restated. The record is
         # still a perfectly valid v2 manifest — that is the point.
@@ -469,7 +478,8 @@ class TestTheChainDetectsTamperingAndAcceptsHonestAppends:
     def test_a_removed_link_is_detected(self, store) -> None:
         """A record leaves a hash chain by having its link removed. If that
         read as "not on the chain" the deletion would grade green."""
-        keys = self._three_record_chain(store)
+        aliases = self._three_record_chain(store)
+        keys = [_history_key_of(json.loads(store.get_bytes(key))) for key in aliases]
         stripped = json.loads(store.get_bytes(keys[2]))
         del stripped["money_path_link"]
         validate(stripped)
@@ -481,7 +491,8 @@ class TestTheChainDetectsTamperingAndAcceptsHonestAppends:
         assert "carries no `money_path_link`" in verdict.reason
 
     def test_a_deleted_middle_record_is_detected_as_an_index_gap(self, store) -> None:
-        keys = self._three_record_chain(store)
+        aliases = self._three_record_chain(store)
+        keys = [_history_key_of(json.loads(store.get_bytes(key))) for key in aliases]
         (store.root / keys[1]).unlink()
         verdict = verify_money_path_chain(store)
         assert verdict.status == "failed"
@@ -490,7 +501,8 @@ class TestTheChainDetectsTamperingAndAcceptsHonestAppends:
     def test_a_record_whose_run_id_pointer_disagrees_with_its_digest_is_detected(
         self, store
     ) -> None:
-        keys = self._three_record_chain(store)
+        aliases = self._three_record_chain(store)
+        keys = [_history_key_of(json.loads(store.get_bytes(key))) for key in aliases]
         doc = json.loads(store.get_bytes(keys[2]))
         doc["money_path_link"]["prev_run_id"] = "01JG000000000000000000000Z"
         validate(doc)
@@ -634,7 +646,8 @@ class TestExplainVerifiesTheChain:
     def test_a_break_is_the_first_thing_render_prints(self, store) -> None:
         """Not appended under forty lines of hops. A break printed last is a
         warning wearing a finding's clothes."""
-        keys = self._chain(store)
+        aliases = self._chain(store)
+        keys = [_history_key_of(json.loads(store.get_bytes(key))) for key in aliases]
         tampered = json.loads(store.get_bytes(keys[0]))
         tampered["seed"] = 999
         store.put_bytes(keys[0], json.dumps(tampered, indent=2, sort_keys=True).encode("utf-8"))
@@ -645,7 +658,8 @@ class TestExplainVerifiesTheChain:
         assert text.splitlines()[0].startswith("MONEY-PATH CHAIN: FAILED")
 
     def test_a_break_is_a_named_failure_a_caller_can_exit_non_zero_on(self, store) -> None:
-        keys = self._chain(store)
+        aliases = self._chain(store)
+        keys = [_history_key_of(json.loads(store.get_bytes(key))) for key in aliases]
         tampered = json.loads(store.get_bytes(keys[0]))
         tampered["seed"] = 999
         store.put_bytes(keys[0], json.dumps(tampered, indent=2, sort_keys=True).encode("utf-8"))
@@ -663,7 +677,8 @@ class TestExplainVerifiesTheChain:
         reaches it; a command that refused to print the lineage at the moment
         the lineage became interesting would be the wrong trade. The refusal
         belongs to the caller, via `raise_if_broken`."""
-        keys = self._chain(store)
+        aliases = self._chain(store)
+        keys = [_history_key_of(json.loads(store.get_bytes(key))) for key in aliases]
         tampered = json.loads(store.get_bytes(keys[0]))
         tampered["seed"] = 999
         store.put_bytes(keys[0], json.dumps(tampered, indent=2, sort_keys=True).encode("utf-8"))
@@ -700,6 +715,15 @@ def _promote(run_id: str, slot: str, *, finished: str) -> dict[str, Any]:
 def _key_of(manifest: dict[str, Any]) -> str:
     return manifest_key(
         manifest["job"], manifest["trading_day"], discriminator=manifest.get("discriminator")
+    )
+
+
+def _history_key_of(manifest: dict[str, Any]) -> str:
+    return invocation_manifest_key(
+        manifest["job"],
+        manifest["trading_day"],
+        manifest["run_id"],
+        discriminator=manifest.get("discriminator"),
     )
 
 
@@ -774,12 +798,12 @@ class TestConcurrentWritersCannotShareAnIndex:
         # The loser re-read the head and chained to the WINNER, by digest.
         assert written["money_path_link"]["prev_run_id"] == winner["run_id"]
         assert written["money_path_link"]["prev_sha256"] == sha256_hex(
-            store.get_bytes(_key_of(winner))
+            store.get_bytes(_history_key_of(winner))
         )
         # One claim per index, each naming the run that owns it.
         assert _claim(store, 1)["run_id"] == winner["run_id"]
         assert _claim(store, 2)["run_id"] == loser["run_id"]
-        assert _claim(store, 2)["manifest_key"] == _key_of(loser)
+        assert _claim(store, 2)["manifest_key"] == _history_key_of(loser)
         # One lost claim, one backoff.
         assert clock.sleeps == [MONEY_PATH_CLAIM_BACKOFF_S]
 
@@ -839,7 +863,7 @@ class TestConcurrentWritersCannotShareAnIndex:
             money_path_claim_key(1),
             ETAG_ABSENT,
             json.dumps(
-                {"index": 1, "run_id": orphan["run_id"], "manifest_key": _key_of(orphan)}
+                {"index": 1, "run_id": orphan["run_id"], "manifest_key": _history_key_of(orphan)}
             ).encode("utf-8"),
         )
         blocked = _promote("01JG000000000000000000000A", "m", finished="2026-08-31T13:45:00Z")
@@ -869,12 +893,10 @@ class TestConcurrentWritersCannotShareAnIndex:
         ]
 
 
-class TestARerunReplacesItsOwnRecordAtItsOwnIndex:
-    """Same job, same trading day, same key: the rerun replaces its record
-    rather than following it, so it must be allowed to reuse the index its
-    first run claimed."""
+class TestARerunAppendsAnImmutableRecord:
+    """Same job and day still means a new invocation and chain record."""
 
-    def test_a_rerun_of_the_head_reuses_its_claim_and_the_chain_verifies(self, store) -> None:
+    def test_a_rerun_of_the_head_appends_and_the_chain_verifies(self, store) -> None:
         clock = _FakeClock("2026-08-31T15:00:00Z")
         first_m = _promote("01JG0000000000000000000001", "m", finished="2026-08-31T13:00:00Z")
         write_manifest(store, _key_of(first_m), first_m, sleep=clock.sleep, clock=clock)
@@ -884,15 +906,19 @@ class TestARerunReplacesItsOwnRecordAtItsOwnIndex:
         rerun_s = _promote("01JG0000000000000000000003", "s", finished="2026-08-31T14:00:00Z")
         written = write_manifest(store, _key_of(rerun_s), rerun_s, sleep=clock.sleep, clock=clock)
 
-        assert written["money_path_link"]["index"] == 1
-        assert written["money_path_link"]["prev_run_id"] == first_m["run_id"]
+        assert written["money_path_link"]["index"] == 2
+        assert written["money_path_link"]["prev_run_id"] == first_s["run_id"]
         assert json.loads(store.get_bytes(_key_of(rerun_s)))["run_id"] == rerun_s["run_id"]
-        # The claim still names the key; it is the KEY's index, not a run's.
-        assert _claim(store, 1)["manifest_key"] == _key_of(first_s)
+        assert _claim(store, 1)["manifest_key"] == _history_key_of(first_s)
+        assert _claim(store, 2)["manifest_key"] == _history_key_of(rerun_s)
         assert clock.sleeps == []
         verdict = verify_money_path_chain(store)
         assert verdict.status == "ok", verdict.reason
-        assert [r.run_id for r in verdict.records] == [first_m["run_id"], rerun_s["run_id"]]
+        assert [r.run_id for r in verdict.records] == [
+            first_m["run_id"],
+            first_s["run_id"],
+            rerun_s["run_id"],
+        ]
 
     def test_a_rerun_of_a_head_somebody_has_claimed_past_is_refused(self, store) -> None:
         """A successor that claimed index 1 computed its `prev_sha256` over

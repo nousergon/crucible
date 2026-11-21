@@ -1008,14 +1008,20 @@ def _money_path_manifest(
 
 
 def _write_money_path_manifest(store, manifest: dict[str, Any]) -> str:
-    """Write ``manifest`` through the single writer; return its manifest key."""
+    """Write ``manifest`` and return its immutable chain-record key."""
+    from crucible.keys import invocation_manifest_key
     from crucible.manifest import write_manifest
 
     key = manifest_key(
         manifest["job"], manifest["trading_day"], discriminator=manifest.get("discriminator")
     )
     write_manifest(store, key, manifest)
-    return key
+    return invocation_manifest_key(
+        manifest["job"],
+        manifest["trading_day"],
+        manifest["run_id"],
+        discriminator=manifest.get("discriminator"),
+    )
 
 
 class TestVerifyChainFlag:
