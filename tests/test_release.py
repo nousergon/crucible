@@ -15,6 +15,7 @@ from crucible.release import (
     RELEASE_PROVENANCE_SCHEMA_VERSION,
     RELEASE_SCHEMA_VERSION,
     TRADER_PIN_KEY,
+    ReleaseHasNoWheelhouseError,
     ReleaseImmutabilityError,
     ReleaseProvenance,
     ReleaseRecord,
@@ -101,6 +102,23 @@ def _published(store, sha=SHA_A):
         workflow_run_url="https://github.com/nousergon/crucible/actions/runs/1",
         now=dt.datetime(2026, 8, 28, 21, 0, tzinfo=dt.UTC),
     )
+
+
+def _pinnable(store, sha=SHA_A):
+    """Lay down the v4 record that a pointer is allowed to target."""
+    from tests.support.releases import synthetic_manifest
+
+    legacy = _published(store, sha)
+    record = ReleaseRecord(
+        schema_version=RELEASE_SCHEMA_VERSION,
+        sha=sha,
+        lockfile_sha256=legacy.lockfile_sha256,
+        wheel_sha256=legacy.wheel_sha256,
+        wheel_filename=legacy.wheel_filename,
+        wheelhouse=synthetic_manifest(),
+    )
+    store.put_bytes(release_json_key(sha), record.to_json())
+    return record
 
 
 def _trader_evidence(sha=SHA_A, status="ok"):
@@ -349,7 +367,7 @@ class TestObjectLock:
         conditional PUT — the exact opposite of what Object Lock defends."""
         client = _FakeS3Client()
         store = S3Store("bucket", "crucible", client=client)
-        _published(store)
+        _pinnable(store)
         pin(store, SHA_A, expect=ETAG_ABSENT)
         assert f"crucible/{POINTER_KEY}" not in client.retentions
         # And no PUT to the pointer's key was ever asked to lock the wheel's key
@@ -378,7 +396,7 @@ class TestPointer:
 
     def test_pin_then_read_round_trips(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
-        _published(store)
+        _pinnable(store)
         pin(store, SHA_A)
         assert current_release(store) == SHA_A
 
@@ -419,8 +437,8 @@ class TestPointer:
     def test_the_trader_pin_is_a_separate_pointer(self, tmp_path) -> None:
         """A trader that followed `current` would be promoted by every merge."""
         store = LocalStore(tmp_path)
-        _published(store)
-        _published(store, SHA_B)
+        _pinnable(store)
+        _pinnable(store, SHA_B)
         pin(store, SHA_A, target="trader", trader_smoke=_trader_evidence(SHA_A))
         pin(store, SHA_B, target="current")
         assert json.loads(store.get_bytes(TRADER_PIN_KEY))["sha"] == SHA_A
@@ -434,8 +452,8 @@ class TestPointer:
 
     def test_a_swap_against_a_stale_version_loses(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
-        _published(store)
-        _published(store, SHA_B)
+        _pinnable(store)
+        _pinnable(store, SHA_B)
         pin(store, SHA_A, expect=ETAG_ABSENT)
         with pytest.raises(PointerConflictError):
             pin(store, SHA_B, expect=ETAG_ABSENT)
@@ -451,7 +469,7 @@ class TestStalePointer:
         run whatever was already on the box — the silent version of every
         deploy bug."""
         store = LocalStore(tmp_path)
-        _published(store)
+        _pinnable(store)
         pin(store, SHA_A)
         (tmp_path / wheel_key(SHA_A)).unlink()
         with pytest.raises(StaleReleasePointerError, match="whose wheel is not at"):
@@ -501,19 +519,28 @@ class TestAPriorReleaseIsStillAddressable:
         )
         return legacy_key
 
-    def test_pinning_to_a_pre_fix_release_is_accepted(self, tmp_path) -> None:
+    def test_pinning_to_a_pre_wheelhouse_release_is_refused_before_the_write(
+        self, tmp_path
+    ) -> None:
         store = LocalStore(tmp_path)
         legacy_key = self._publish_a_v2_release(store, tmp_path)
-        # The bug: this key does not exist and never did for a v2 release.
         assert not store.exists(wheel_key(SHA_B))
         assert store.exists(legacy_key)
-        pin(store, SHA_B)
-        assert current_release(store) == SHA_B
+        with pytest.raises(ReleaseHasNoWheelhouseError) as excinfo:
+            pin(store, SHA_B)
+        assert "alpha-engine-config-I10812" in str(excinfo.value)
+        assert "Redeploy that SHA through `deploy.yml`" in str(excinfo.value)
+        assert current_release(store) is None
 
     def test_resolving_a_pre_fix_release_is_accepted(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
         self._publish_a_v2_release(store, tmp_path)
-        pin(store, SHA_B)
+        store.put_bytes(
+            POINTER_KEY,
+            json.dumps(
+                {"sha": SHA_B, "target": "current", "pinned_at": "2026-06-01T00:00:00Z"}
+            ).encode(),
+        )
         assert resolve_release(store) == SHA_B
 
     def test_a_sha_that_was_never_published_is_refused_by_that_name(self, tmp_path) -> None:
@@ -523,17 +550,14 @@ class TestAPriorReleaseIsStillAddressable:
         with pytest.raises(StaleReleasePointerError, match="was never published"):
             published_wheel_key(store, SHA_A)
 
-    def test_a_published_release_whose_wheel_was_deleted_names_the_real_key(self, tmp_path) -> None:
-        """`release.json` survives, the wheel does not: the refusal quotes the
-        LEGACY key the object actually occupied, so the operator looks in the
-        right place."""
+    def test_wheelhouse_refusal_precedes_checking_a_legacy_wheel(self, tmp_path) -> None:
+        """A legacy release is unsafe regardless of whether its wheel remains."""
         store = LocalStore(tmp_path)
         legacy_key = self._publish_a_v2_release(store, tmp_path)
         (tmp_path / legacy_key).unlink()
-        with pytest.raises(StaleReleasePointerError) as excinfo:
+        with pytest.raises(ReleaseHasNoWheelhouseError) as excinfo:
             pin(store, SHA_B)
-        assert legacy_key in str(excinfo.value)
-        assert wheel_key(SHA_B) not in str(excinfo.value)
+        assert SHA_B in str(excinfo.value)
 
     def test_a_current_release_still_resolves_through_its_own_record(self, tmp_path) -> None:
         """The v3 path is not special-cased — it goes through the same lookup,
@@ -586,7 +610,12 @@ class TestARecordUnderTheWrongPrefixIsRefusedByName:
         publish_release(
             store, sha=SHA_A, wheel=b"w-a", lockfile=b"l", test_summary="", workflow_run_url=""
         )
-        pin(store, SHA_A)
+        store.put_bytes(
+            POINTER_KEY,
+            json.dumps(
+                {"sha": SHA_A, "target": "current", "pinned_at": "2026-06-01T00:00:00Z"}
+            ).encode(),
+        )
         publish_release(
             store, sha=SHA_B, wheel=b"w-b", lockfile=b"l", test_summary="", workflow_run_url=""
         )
@@ -613,15 +642,15 @@ class TestARecordUnderTheWrongPrefixIsRefusedByName:
 class TestSmokeGate:
     def test_an_ok_smoke_flips_the_pointer(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
-        _published(store)
+        _pinnable(store)
         _, version = read_pointer(store)
         assert flip_on_smoke(store, sha=SHA_A, smoke_manifest=_smoke_manifest(), expect=version)
         assert current_release(store) == SHA_A
 
     def test_a_failed_smoke_leaves_the_pointer_exactly_where_it_was(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
-        _published(store)
-        _published(store, SHA_B)
+        _pinnable(store)
+        _pinnable(store, SHA_B)
         pin(store, SHA_A)
         _, version = read_pointer(store)
         flipped = flip_on_smoke(
@@ -634,8 +663,8 @@ class TestSmokeGate:
         """The gate failing open: promoting on a smoke that verified a
         different artifact."""
         store = LocalStore(tmp_path)
-        _published(store)
-        _published(store, SHA_B)
+        _pinnable(store)
+        _pinnable(store, SHA_B)
         with pytest.raises(ValueError, match="not"):
             flip_on_smoke(
                 store, sha=SHA_B, smoke_manifest=_smoke_manifest(SHA_A), expect=ETAG_ABSENT
@@ -653,8 +682,8 @@ class TestSmokeGate:
         self, tmp_path
     ) -> None:
         store = LocalStore(tmp_path)
-        _published(store)
-        _published(store, SHA_B)
+        _pinnable(store)
+        _pinnable(store, SHA_B)
         _, version = read_pointer(store)  # both deploys read ETAG_ABSENT
         pin(store, SHA_B, expect=version)  # the other deploy wins
         with pytest.raises(PointerConflictError):
