@@ -627,9 +627,8 @@ def require_wheelhouse(record: ReleaseRecord) -> dict[str, Any]:
         raise ReleaseHasNoWheelhouseError(
             f"release {record.sha} ({record.schema_version}) publishes no wheelhouse. Boxes "
             "install offline from a hash-locked wheelhouse only and never fall back to "
-            "PyPI. Fix: `crucible release.pin` a release that carries one (any release "
-            "deployed since the wheelhouse landed), or merge to main so deploy.yml publishes a "
-            "new one. Re-deploying THIS sha cannot add one: its release.json is immutable."
+            "PyPI (alpha-engine-config-I10812). Fix: redeploy this SHA through `deploy.yml` "
+            "so it publishes a wheelhouse."
         )
     return record.wheelhouse
 
@@ -1066,7 +1065,7 @@ def pin(
     deploy, which passes the token it read before running the smoke. The
     deploy path always passes it.
 
-    The wheel key comes from :func:`published_wheel_key`, so a rollback to a
+    The wheel key comes from :func:`resolve_published_wheel`, so a rollback to a
     pre-alpha-engine-config-I9908 release is accepted rather than refused
     against a v3-shaped path that release never occupied. This is the call
     site the bug actually bit: `release.pin <prior-sha>` IS the rollback
@@ -1094,7 +1093,12 @@ def pin(
             "trader smoke evidence was passed for target 'current'. The harness pointer is "
             "gated by the harness smoke (`flip_on_smoke`), never by the trader's."
         )
-    wheel = published_wheel_key(store, sha)
+    published = resolve_published_wheel(store, sha)
+    # Validate the release before reading the pointer version or attempting
+    # its compare-and-swap. A successful pin must always be bootable by boxes,
+    # which install exclusively from this manifest (alpha-engine-config-I10812).
+    require_wheelhouse(published.record)
+    wheel = published.wheel_key
     if not store.exists(wheel):
         raise StaleReleasePointerError(
             f"refusing to pin {target} to {sha}: no wheel at {wheel}. A "
