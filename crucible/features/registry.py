@@ -137,9 +137,12 @@ class FeatureSpec:
     #: measured against pooled point masses reads BREACH by construction
     #: (`alpha-engine-config-I10071`) regardless of what the market did.
     market_wide: bool
-    #: SESSIONS, not calendar days. `None` for a point-in-time column that
-    #: reads only the current row.
+    #: Total history requirement in SESSIONS, not calendar days. `None` for a
+    #: point-in-time column that reads only the current row.
     window_trading_days: int | None = None
+    #: The economic window named by a `_<N>d_` segment when it differs from
+    #: the total history requirement.
+    economic_window_trading_days: int | None = None
     #: Whether the column is COMPUTED across the cross-section of one day
     #: (a z-score or a cross-sectional mean) rather than along one ticker's
     #: history. Orthogonal to `market_wide`: `tech_score_ratio` is computed
@@ -223,6 +226,7 @@ class FeatureSpec:
             "description": self.description,
             "inputs": list(self.inputs),
             "window_trading_days": self.window_trading_days,
+            "economic_window_trading_days": self.economic_window_trading_days,
             "cross_sectional": self.cross_sectional,
             "market_wide": self.market_wide,
         }
@@ -372,6 +376,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
         expression="zscore(momentum_20d_log_return)",
         description="Cross-sectional z-score of 20-session momentum, over the liquid set.",
         inputs=("momentum_20d_log_return", "liquidity_pass_raw"),
+        economic_window_trading_days=20,
         cross_sectional=True,
     ),
     FeatureSpec(
@@ -381,6 +386,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
         expression="zscore(return_60d_log_return)",
         description="Cross-sectional z-score of 60-session return, over the liquid set.",
         inputs=("return_60d_log_return", "liquidity_pass_raw"),
+        economic_window_trading_days=60,
         cross_sectional=True,
     ),
     FeatureSpec(
@@ -497,6 +503,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
             "liquid set. This is the column both M arms rank first."
         ),
         inputs=("residual_momentum_252d_skip21d_ratio", "liquidity_pass_raw"),
+        economic_window_trading_days=252,
         cross_sectional=True,
     ),
     FeatureSpec(
@@ -510,6 +517,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
         ),
         inputs=("return_1d_log_return",),
         window_trading_days=42,
+        economic_window_trading_days=21,
     ),
     FeatureSpec(
         name="momentum_change_21d_zscore",
@@ -518,6 +526,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
         expression="zscore(momentum_change_21d_log_return)",
         description=("Cross-sectional z-score of momentum acceleration, over the liquid set."),
         inputs=("momentum_change_21d_log_return", "liquidity_pass_raw"),
+        economic_window_trading_days=21,
         cross_sectional=True,
     ),
     # -- the v3.0-meta L1 inputs (alpha-engine-config-I10695) -----------------
@@ -1035,7 +1044,7 @@ def registry_payload(catalog: tuple[FeatureSpec, ...] = CATALOG) -> RegistryPayl
 
 
 def _hashed_dict(spec: FeatureSpec) -> dict[str, JsonValue]:
-    """The fields `feature_version()` hashes: `to_dict()` minus `market_wide`.
+    """The fields `feature_version()` hashes, excluding descriptive fields.
 
     `market_wide` joined `to_dict()` after `feature_version()` had already
     been hashing catalogue dicts for every existing `features/{version}/`
@@ -1053,6 +1062,7 @@ def _hashed_dict(spec: FeatureSpec) -> dict[str, JsonValue]:
     """
     d = spec.to_dict()
     del d["market_wide"]
+    del d["economic_window_trading_days"]
     return d
 
 
