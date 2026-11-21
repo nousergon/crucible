@@ -2858,8 +2858,8 @@ class FeatureRow(_Strict):
     economic_window_trading_days: Annotated[int, Field(ge=1)] | None = Field(
         default=None,
         description="The economic window named by a _<N>d_ name segment when it "
-        "differs from window_trading_days, the column's total history requirement. "
-        "Additive optional for documents whose named and history windows agree.",
+        "differs from the total history requirement. When absent, the name's window "
+        "is checked against window_trading_days.",
     )
     cross_sectional: bool = Field(
         description="True when the column is computed across one day's cross-section "
@@ -2922,22 +2922,21 @@ class FeatureRow(_Strict):
         return self
 
     @model_validator(mode="after")
-    def _name_and_windows_agree(self) -> FeatureRow:
-        """Refuse a name whose economic session count contradicts its windows."""
-        name_window = re.search(r"_(\d+)d_", self.name)
-        if name_window is None:
+    def _named_window_agrees_with_declared_window(self) -> FeatureRow:
+        """Make a name-embedded economic window part of the contract."""
+        match = re.search(r"_(\d+)d_", self.name)
+        if match is None:
             return self
+        named_window = int(match.group(1))
         declared_window = (
             self.economic_window_trading_days
             if self.economic_window_trading_days is not None
             else self.window_trading_days
         )
-        if declared_window != int(name_window.group(1)):
+        if declared_window != named_window:
             raise ValueError(
-                f"feature {self.name!r} names an economic window of "
-                f"{name_window.group(1)} sessions but declares {declared_window!r}; "
-                "economic_window_trading_days is required when the economic window "
-                "differs from the total history requirement"
+                f"feature {self.name!r} names an economic window of {named_window} "
+                f"sessions but declares {declared_window!r}"
             )
         return self
 

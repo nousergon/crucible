@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -138,9 +137,8 @@ class FeatureSpec:
     #: measured against pooled point masses reads BREACH by construction
     #: (`alpha-engine-config-I10071`) regardless of what the market did.
     market_wide: bool
-    #: SESSIONS, not calendar days. `None` for a point-in-time column that
-    #: reads only the current row. This is the column's total history
-    #: requirement, which may be longer than its economic window.
+    #: Total history requirement in SESSIONS, not calendar days. `None` for a
+    #: point-in-time column that reads only the current row.
     window_trading_days: int | None = None
     #: The economic window named by a `_<N>d_` segment when it differs from
     #: the total history requirement.
@@ -197,26 +195,6 @@ class FeatureSpec:
                 f"{self.window_trading_days}; a window is a count of SESSIONS and is "
                 "at least one (plan §4.12)"
             )
-        if self.economic_window_trading_days is not None and self.economic_window_trading_days < 1:
-            raise ValueError(
-                f"feature {self.name!r} declares economic_window_trading_days="
-                f"{self.economic_window_trading_days}; an economic window is a count "
-                "of SESSIONS and is at least one"
-            )
-        name_window = re.search(r"_(\d+)d_", self.name)
-        if name_window is not None:
-            declared_window = (
-                self.economic_window_trading_days
-                if self.economic_window_trading_days is not None
-                else self.window_trading_days
-            )
-            if declared_window != int(name_window.group(1)):
-                raise ValueError(
-                    f"feature {self.name!r} names an economic window of "
-                    f"{name_window.group(1)} sessions but declares {declared_window!r}; "
-                    "economic_window_trading_days is required when the economic window "
-                    "differs from the total history requirement"
-                )
 
     def to_dict(self) -> dict[str, JsonValue]:
         # `market_wide` IS written here (`alpha-engine-config-I10114`): the
@@ -1066,7 +1044,7 @@ def registry_payload(catalog: tuple[FeatureSpec, ...] = CATALOG) -> RegistryPayl
 
 
 def _hashed_dict(spec: FeatureSpec) -> dict[str, JsonValue]:
-    """The fields `feature_version()` hashes: `to_dict()` minus `market_wide`.
+    """The fields `feature_version()` hashes, excluding descriptive fields.
 
     `market_wide` joined `to_dict()` after `feature_version()` had already
     been hashing catalogue dicts for every existing `features/{version}/`
@@ -1084,6 +1062,7 @@ def _hashed_dict(spec: FeatureSpec) -> dict[str, JsonValue]:
     """
     d = spec.to_dict()
     del d["market_wide"]
+    del d["economic_window_trading_days"]
     return d
 
 

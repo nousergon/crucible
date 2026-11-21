@@ -101,15 +101,23 @@ class TestTheProducerConforms:
         for feature in payload["features"]:
             assert isinstance(feature["market_wide"], bool), feature["name"]
 
-    def test_name_windows_match_the_catalogue_declarations(self) -> None:
+    def test_name_embedded_windows_match_the_declared_economic_window(self) -> None:
         for feature in _valid()["features"]:
             match = re.search(r"_(\d+)d_", feature["name"])
             if match is None:
                 continue
-            declared = feature["economic_window_trading_days"]
+            declared = feature.get("economic_window_trading_days")
             if declared is None:
                 declared = feature["window_trading_days"]
             assert declared == int(match.group(1)), feature["name"]
+
+        momentum_change = next(
+            feature
+            for feature in _valid()["features"]
+            if feature["name"] == "momentum_change_21d_log_return"
+        )
+        assert momentum_change["window_trading_days"] == 42
+        assert momentum_change["economic_window_trading_days"] == 21
 
     def test_market_wide_is_excluded_from_the_feature_version_hash(self) -> None:
         """`market_wide` joined `to_dict()` after `feature_version()` was
@@ -224,15 +232,11 @@ class TestTheSchemaRefuses:
         payload["features"][0]["window_trading_days"] = 0
         assert _errors(payload)
 
-    def test_a_name_that_disagrees_with_its_declared_windows_is_refused(self) -> None:
+    def test_a_name_embedded_window_that_disagrees_with_declarations(self) -> None:
         payload = _valid()
-        entry = next(
-            feature
-            for feature in payload["features"]
-            if feature["name"] == "momentum_change_21d_log_return"
-        )
-        entry["economic_window_trading_days"] = 20
-        with pytest.raises(FeatureRegistryValidationError, match="economic window of 21"):
+        entry = next(f for f in payload["features"] if f["name"] == "momentum_20d_log_return")
+        entry["window_trading_days"] = 21
+        with pytest.raises(FeatureRegistryValidationError, match="economic window of 20"):
             validate_registry_payload(payload)
 
     def test_an_undeclared_field_on_a_feature(self) -> None:
