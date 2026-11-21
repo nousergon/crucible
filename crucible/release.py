@@ -628,8 +628,8 @@ def require_wheelhouse(record: ReleaseRecord) -> dict[str, Any]:
             f"release {record.sha} ({record.schema_version}) publishes no wheelhouse. Boxes "
             "install offline from a hash-locked wheelhouse only and never fall back to "
             "PyPI. Fix: `crucible release.pin` a release that carries one (any release "
-            "deployed since the wheelhouse landed), or merge to main so deploy.yml publishes a "
-            "new one. Re-deploying THIS sha cannot add one: its release.json is immutable."
+            "deployed since the wheelhouse landed), or publish a new SHA. Re-deploying THIS "
+            "sha cannot add one: its release.json is immutable."
         )
     return record.wheelhouse
 
@@ -1047,7 +1047,7 @@ def pin(
     store: Store,
     sha: str,
     *,
-    target: str = "current",
+    target: str | None = "current",
     expect: str | None = None,
     now: dt.datetime | None = None,
     trader_smoke: TraderSmokeEvidence | None = None,
@@ -1066,6 +1066,10 @@ def pin(
     deploy, which passes the token it read before running the smoke. The
     deploy path always passes it.
 
+    ``target=None`` is reserved for fault probes that must construct a stale
+    current pointer deliberately. Normal current pins, including calls that
+    omit ``target``, require a release with a wheelhouse.
+
     The wheel key comes from :func:`published_wheel_key`, so a rollback to a
     pre-alpha-engine-config-I9908 release is accepted rather than refused
     against a v3-shaped path that release never occupied. This is the call
@@ -1073,6 +1077,8 @@ def pin(
     command, and prior shas are precisely the ones with legacy wheel names.
     """
     _assert_sha(sha)
+    validate_wheelhouse = target == "current"
+    target = target or "current"
     if target not in PIN_TARGETS:
         raise ValueError(f"pin target {target!r} not in {PIN_TARGETS}")
     if target == "trader":
@@ -1094,7 +1100,10 @@ def pin(
             "trader smoke evidence was passed for target 'current'. The harness pointer is "
             "gated by the harness smoke (`flip_on_smoke`), never by the trader's."
         )
-    wheel = published_wheel_key(store, sha)
+    published = resolve_published_wheel(store, sha)
+    if validate_wheelhouse:
+        require_wheelhouse(published.record)
+    wheel = published.wheel_key
     if not store.exists(wheel):
         raise StaleReleasePointerError(
             f"refusing to pin {target} to {sha}: no wheel at {wheel}. A "

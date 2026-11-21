@@ -27,6 +27,7 @@ from crucible.release import (
     ReleaseHasNoWheelhouseError,
     ReleaseRecord,
     current_release,
+    pin,
     publish_release,
     read_pointer,
     release_json_key,
@@ -60,6 +61,7 @@ from tests.support.releases import (
 )
 
 SHA = "a" * 40
+SHA_B = "b" * 40
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_YML = ROOT / ".github" / "workflows" / "deploy.yml"
 SCHEMAS = ROOT / "crucible" / "schemas"
@@ -201,6 +203,53 @@ class TestTheReleaseV4Contract:
         assert all(k.startswith(f"releases/{SHA}/{WHEELHOUSE_DIRNAME}/") for k in keys)
         with pytest.raises(ValueError):
             wheelhouse_object_key(SHA, "nested/x.whl")
+
+
+class TestPinRequiresTheWheelhouse:
+    @pytest.mark.parametrize("target", [pytest.param(None, id="omitted"), "current"])
+    def test_current_pin_refuses_a_release_without_a_wheelhouse_before_writing(
+        self, tmp_path, target
+    ) -> None:
+        store = LocalStore(tmp_path)
+        publish_release(
+            store,
+            sha=SHA,
+            wheel=b"wheel",
+            lockfile=b"lock",
+            test_summary="ok",
+            workflow_run_url="",
+        )
+
+        with pytest.raises(ReleaseHasNoWheelhouseError, match="publish a new SHA"):
+            if target is None:
+                pin(store, SHA)
+            else:
+                pin(store, SHA, target=target)
+
+        assert current_release(store) is None
+
+    def test_current_pin_accepts_a_release_with_a_wheelhouse(self, tmp_path) -> None:
+        publish_v4(tmp_path, SHA)
+        store = LocalStore(tmp_path)
+
+        pin(store, SHA)
+
+        assert current_release(store) == SHA
+
+    def test_fault_only_target_can_exercise_the_stale_pointer_guard(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        publish_release(
+            store,
+            sha=SHA_B,
+            wheel=b"wheel",
+            lockfile=b"lock",
+            test_summary="ok",
+            workflow_run_url="",
+        )
+
+        pin(store, SHA_B, target=None)
+
+        assert current_release(store) == SHA_B
 
 
 class TestThePublisherShipsTheWheelhouse:
