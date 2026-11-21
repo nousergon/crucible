@@ -45,6 +45,17 @@ BUS_KEY = "alerts/2026-08-28/failure.data.weekly.json"
 NO_SUCH_RUN_ID = "0" * 26
 
 
+def _seed_bus_row(
+    store: LocalStore,
+    *,
+    alert_id: str,
+    member_run_id: str | None = None,
+    member_job: str = "data.weekly",
+) -> None:
+    members = [] if member_run_id is None else [{"job": member_job, "run_id": member_run_id}]
+    store.put_bytes(BUS_KEY, json.dumps({"alert_id": alert_id, "members": members}).encode())
+
+
 def _seed_manifest(store: LocalStore, *, job: str, trading_day: dt.date, ok: bool) -> str:
     """A real manifest through the real runner, so its `run_id` is a real
     ULID and its shape is exactly what a producer's own writes look like —
@@ -111,7 +122,7 @@ class TestRefusalsCommonToEveryOutcome:
     def test_refuses_an_unrecognized_fault_id(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
         run_id = _seed_manifest(store, job="data.weekly", trading_day=FRIDAY, ok=False)
-        store.put_bytes(BUS_KEY, b'{"condition": "failure"}')
+        _seed_bus_row(store, alert_id=run_id)
         with pytest.raises(FaultRecordRefusedError, match="not one of"):
             _record(
                 store,
@@ -169,7 +180,7 @@ class TestInduced:
         run that does not exist on the store."""
         store = LocalStore(tmp_path)
         _seed_manifest(store, job="data.weekly", trading_day=FRIDAY, ok=False)
-        store.put_bytes(BUS_KEY, b'{"condition": "failure"}')
+        _seed_bus_row(store, alert_id=NO_SUCH_RUN_ID)
         with pytest.raises(FaultRecordRefusedError, match="no manifest under"):
             _record(
                 store,
@@ -188,7 +199,7 @@ class TestInduced:
         is pointed at the harder record rather than at a way around this one."""
         store = LocalStore(tmp_path)
         run_id = _seed_manifest(store, job="data.weekly", trading_day=FRIDAY, ok=True)
-        store.put_bytes(BUS_KEY, b'{"condition": "failure"}')
+        _seed_bus_row(store, alert_id=run_id)
         with pytest.raises(FaultRecordRefusedError, match="not 'failed'"):
             _record(
                 store,
@@ -242,6 +253,90 @@ class TestInduced:
                 bus_key="not/a/bus/key/at/all.json",
             )
 
+    def test_accepts_a_bus_row_whose_alert_id_is_the_run_id(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        run_id = _seed_manifest(store, job="data.weekly", trading_day=FRIDAY, ok=False)
+        _seed_bus_row(store, alert_id=run_id)
+        _record(
+            store,
+            fault_id="data_source_withheld",
+            outcome="induced",
+            target_job="data.weekly",
+            run_id=run_id,
+            bus_key=BUS_KEY,
+        )
+
+    def test_accepts_a_bus_row_with_a_member_for_the_run(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        run_id = _seed_manifest(store, job="data.weekly", trading_day=FRIDAY, ok=False)
+        _seed_bus_row(store, alert_id="incident-id", member_run_id=run_id)
+        _record(
+            store,
+            fault_id="data_source_withheld",
+            outcome="induced",
+            target_job="data.weekly",
+            run_id=run_id,
+            bus_key=BUS_KEY,
+        )
+
+    @pytest.mark.parametrize("member_job", ["data.weekly", "unrelated.job"])
+    def test_refuses_a_bus_row_for_a_different_run(self, tmp_path, member_job: str) -> None:
+        store = LocalStore(tmp_path)
+        run_id = _seed_manifest(store, job="data.weekly", trading_day=FRIDAY, ok=False)
+        other_run_id = "1" * 26
+        _seed_bus_row(
+            store,
+            alert_id="incident-id",
+            member_run_id=other_run_id,
+            member_job=member_job,
+        )
+        with pytest.raises(FaultRecordRefusedError, match=f"{run_id!r}.*{other_run_id!r}"):
+            _record(
+                store,
+                fault_id="data_source_withheld",
+                outcome="induced",
+                target_job="data.weekly",
+                run_id=run_id,
+                bus_key=BUS_KEY,
+            )
+
+    @pytest.mark.parametrize("body", [b"not json", b"[]", b'{"alert_id": 3, "members": {}}'])
+    def test_refuses_an_unparseable_or_malformed_bus_row(self, tmp_path, body: bytes) -> None:
+        store = LocalStore(tmp_path)
+        run_id = _seed_manifest(store, job="data.weekly", trading_day=FRIDAY, ok=False)
+        store.put_bytes(BUS_KEY, body)
+        with pytest.raises(FaultRecordRefusedError, match="readable|incorrectly shaped"):
+            _record(
+                store,
+                fault_id="data_source_withheld",
+                outcome="induced",
+                target_job="data.weekly",
+                run_id=run_id,
+                bus_key=BUS_KEY,
+            )
+
+    def test_refuses_an_unreadable_bus_row(self, tmp_path, monkeypatch) -> None:
+        store = LocalStore(tmp_path)
+        run_id = _seed_manifest(store, job="data.weekly", trading_day=FRIDAY, ok=False)
+        _seed_bus_row(store, alert_id=run_id)
+        original_get_bytes = store.get_bytes
+
+        def refuse_bus_read(key: str) -> bytes:
+            if key == BUS_KEY:
+                raise PermissionError("seeded unreadable bus row")
+            return original_get_bytes(key)
+
+        monkeypatch.setattr(store, "get_bytes", refuse_bus_read)
+        with pytest.raises(FaultRecordRefusedError, match="PermissionError"):
+            _record(
+                store,
+                fault_id="data_source_withheld",
+                outcome="induced",
+                target_job="data.weekly",
+                run_id=run_id,
+                bus_key=BUS_KEY,
+            )
+
     def test_refuses_without_a_target_job(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
         run_id = _seed_manifest(store, job="data.weekly", trading_day=FRIDAY, ok=False)
@@ -257,7 +352,7 @@ class TestInduced:
     def test_writes_the_record_naming_the_excused_run_and_the_page(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
         run_id = _seed_manifest(store, job="data.weekly", trading_day=FRIDAY, ok=False)
-        store.put_bytes(BUS_KEY, b'{"condition": "failure"}')
+        _seed_bus_row(store, alert_id=run_id)
         ctx = _record(
             store,
             fault_id="data_source_withheld",
@@ -291,8 +386,8 @@ class TestInduced:
         describes the day's state, and re-inducing the same fault on the
         same day and re-filing overwrites correctly."""
         store = LocalStore(tmp_path)
-        store.put_bytes(BUS_KEY, b'{"condition": "failure"}')
         first_run_id = _seed_manifest(store, job="data.weekly", trading_day=FRIDAY, ok=False)
+        _seed_bus_row(store, alert_id=first_run_id)
         _record(
             store,
             fault_id="data_source_withheld",
@@ -304,6 +399,7 @@ class TestInduced:
         # Stand down, then re-induce: a fresh failed manifest, a fresh run_id.
         second_run_id = _seed_manifest(store, job="data.weekly", trading_day=FRIDAY, ok=False)
         assert second_run_id != first_run_id
+        _seed_bus_row(store, alert_id=second_run_id)
         _record(
             store,
             fault_id="data_source_withheld",
