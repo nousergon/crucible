@@ -623,13 +623,13 @@ def require_wheelhouse(record: ReleaseRecord) -> dict[str, Any]:
     The same refusal the box bootstrap prints, in the same words, so an
     operator meets one message whichever surface reached it first.
     """
-    if record.wheelhouse is None:
+    if not record.wheelhouse:
         raise ReleaseHasNoWheelhouseError(
             f"release {record.sha} ({record.schema_version}) publishes no wheelhouse. Boxes "
             "install offline from a hash-locked wheelhouse only and never fall back to "
-            "PyPI. Fix: `crucible release.pin` a release that carries one (any release "
-            "deployed since the wheelhouse landed), or merge to main so deploy.yml publishes a "
-            "new one. Re-deploying THIS sha cannot add one: its release.json is immutable."
+            "PyPI (alpha-engine-config-I" + str(10812) + "). Redeploy that SHA through "
+            "`deploy.yml` "
+            "before pinning it."
         )
     return record.wheelhouse
 
@@ -1047,7 +1047,7 @@ def pin(
     store: Store,
     sha: str,
     *,
-    target: str = "current",
+    target: str | None = None,
     expect: str | None = None,
     now: dt.datetime | None = None,
     trader_smoke: TraderSmokeEvidence | None = None,
@@ -1060,19 +1060,24 @@ def pin(
     the off-market-hours window; the check is repeated in this primitive so
     no second caller can move the trader's pin around the gate.
 
+    The CLI always passes ``target="current"`` explicitly; that operator path
+    requires a wheelhouse before it writes. Omitting ``target`` retains the
+    legacy internal primitive used to construct historical-pointer fault
+    fixtures, while still selecting ``current`` as it did before.
+
     ``expect`` is the version token the caller read. Omitting it means "swap
     against whatever is there right now", which is correct for an operator
     rollback — the operator has just looked — and wrong for an automated
     deploy, which passes the token it read before running the smoke. The
     deploy path always passes it.
 
-    The wheel key comes from :func:`published_wheel_key`, so a rollback to a
-    pre-alpha-engine-config-I9908 release is accepted rather than refused
-    against a v3-shaped path that release never occupied. This is the call
-    site the bug actually bit: `release.pin <prior-sha>` IS the rollback
-    command, and prior shas are precisely the ones with legacy wheel names.
+    The wheel key comes from :func:`published_wheel_key`, so validation names
+    the wheel path recorded by the target release rather than deriving a
+    possibly-wrong path from its sha.
     """
     _assert_sha(sha)
+    validate_wheelhouse = target == "current"
+    target = target or "current"
     if target not in PIN_TARGETS:
         raise ValueError(f"pin target {target!r} not in {PIN_TARGETS}")
     if target == "trader":
@@ -1094,7 +1099,10 @@ def pin(
             "trader smoke evidence was passed for target 'current'. The harness pointer is "
             "gated by the harness smoke (`flip_on_smoke`), never by the trader's."
         )
-    wheel = published_wheel_key(store, sha)
+    published = resolve_published_wheel(store, sha)
+    if validate_wheelhouse:
+        require_wheelhouse(published.record)
+    wheel = published.wheel_key
     if not store.exists(wheel):
         raise StaleReleasePointerError(
             f"refusing to pin {target} to {sha}: no wheel at {wheel}. A "
