@@ -24,6 +24,7 @@ import json
 import numpy as np
 import pytest
 
+import crucible.slots.model as model_slot
 from crucible.calendar import is_trading_day
 from crucible.cli import main as cli_main
 from crucible.features import DEFAULT_FEATURE_VERSION
@@ -49,6 +50,7 @@ from crucible.slots.model import (
     UNSERVABLE_AS_OF_METRIC,
     UNSIGNED_TARGET_METRIC,
     FeatureLayerSource,
+    FeaturePanel,
     ModelRecipe,
     RegisteredModelArm,
     SlotRecipes,
@@ -443,7 +445,33 @@ class TestGradeRunsTheSharedEngine:
         )
         return ctx, result
 
-    def test_a_cycle_is_written_and_the_cpcv_ic_reaches_the_manifest(self, store, strategy) -> None:
+    def test_a_cycle_is_written_and_the_cpcv_ic_reaches_the_manifest(
+        self, store, strategy, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        original_fold_ic = model_slot._fold_ic
+        calls = 0
+
+        def refuse_one_combination(
+            panel: FeaturePanel,
+            recipe: ModelRecipe,
+            train_idx: np.ndarray,
+            test_idx: np.ndarray,
+        ) -> float | None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return None
+            return original_fold_ic(panel, recipe, train_idx, test_idx)
+
+        monkeypatch.setattr(model_slot, "_fold_ic", refuse_one_combination)
+        for recipe_path in (strategy.strategy_dir / "arms" / SLOT).glob("*.yaml"):
+            recipe_path.write_text(
+                recipe_path.read_text(encoding="utf-8").replace(
+                    "cpcv: {n_groups: 4, k_test: 1, embargo_trading_days: 1}",
+                    "cpcv: {n_groups: 6, k_test: 2, embargo_trading_days: 1}",
+                ),
+                encoding="utf-8",
+            )
         self._produce_a_series(store, strategy)
         _, result = self._grade(store, strategy, GRADE_DAY)
         assert result["arena_cycle_key"]
@@ -453,6 +481,17 @@ class TestGradeRunsTheSharedEngine:
         cpcv = [m for m in document["metrics"] if m["name"] == CPCV_OOS_IC_METRIC]
         assert len(cpcv) == 2, "one out-of-sample IC row per registered arm"
         assert {m["horizon_trading_days"] for m in cpcv} == {2}
+        recovered = [m for m in cpcv if "14 of 15 combination(s) fitted" in m["status_reason"]]
+        assert len(recovered) == 1
+        assert recovered[0]["status"] == "OK"
+        assert isinstance(recovered[0]["value"], float)
+        recovered_arm = recovered[0]["status_reason"].split("'")[1]
+        recovered_grade = next(
+            grade for arm, grade in result["model_grades"].items() if f":{recovered_arm}:" in arm
+        )
+        assert isinstance(recovered_grade["cpcv_mean_ic"], float)
+        cycle = json.loads(store.get_bytes(result["arena_cycle_key"]).decode("utf-8"))
+        assert recovered_arm in json.dumps(cycle), "the recovered arm still carries a cycle figure"
 
     def test_the_refusal_row_reaches_the_grade_manifest_too(self, store, strategy) -> None:
         """A slot that became unservable between produce and grade must page

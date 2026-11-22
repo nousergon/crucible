@@ -459,6 +459,13 @@ def _is_iso_date(value: str) -> bool:
         return False
 
 
+def daily_notice_marker_key(trading_day: dt.date) -> str:
+    """`alerts/daily-notice/{YYYY-MM-DD}.json` — the per-trading-day delivery
+    marker the daily notice reserves (compare-and-swap, create-only) before it
+    sends, so a rerun or a re-launched process cannot send the day twice."""
+    return f"alerts/daily-notice/{trading_day.isoformat()}.json"
+
+
 def weekly_backstop_prefix() -> str:
     """`runs/_dispatch/weekly-backstop/` — every week's backstop markers."""
     return WEEKLY_BACKSTOP_ROOT
