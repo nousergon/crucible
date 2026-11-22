@@ -1385,7 +1385,7 @@ class TestTheSmokeGate:
         publish_release(
             store, sha=OTHER, wheel=b"w2", lockfile=b"l", test_summary="", workflow_run_url=""
         )
-        pin(store, OTHER)
+        pin(store, OTHER, target=None)
         (tmp_path / wheel_key(OTHER)).unlink()
 
         assert self._run(tmp_path) == 0  # the flip is the REMEDY; it must still deploy

@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -30,7 +31,7 @@ from crucible.daily_notice import (
     send_notice,
 )
 from crucible.execution import EXECUTION_METRIC_NAME
-from crucible.keys import manifest_key
+from crucible.keys import daily_notice_marker_key, manifest_key
 from crucible.runner import RunContext
 from crucible.store import LocalStore
 
@@ -232,6 +233,52 @@ class TestSweepWiring:
         track_c._send_daily_notice(LocalStore(tmp_path), ctx)
         assert sent == [("2026-11-06", "runs/alerts.sweep/2026-11-09/2026-11-10/run.json")]
 
+    def test_the_marker_key_shape(self) -> None:
+        assert (
+            daily_notice_marker_key(dt.date(2026, 11, 20)) == "alerts/daily-notice/2026-11-20.json"
+        )
+
+    def test_repeated_attempts_send_only_once(self, tmp_path, sent) -> None:
+        store = LocalStore(tmp_path)
+        ctx = _ctx(dt.datetime(2026, 11, 10, 2, 0, tzinfo=dt.UTC), dt.date(2026, 11, 9))
+        track_c._send_daily_notice(store, ctx)
+        track_c._send_daily_notice(LocalStore(tmp_path), ctx)
+        assert len(sent) == 1
+
+    def test_concurrent_attempts_send_only_once(self, tmp_path, sent) -> None:
+        store = LocalStore(tmp_path)
+        ctx = _ctx(dt.datetime(2026, 11, 10, 2, 0, tzinfo=dt.UTC), dt.date(2026, 11, 9))
+        threads = [
+            threading.Thread(target=track_c._send_daily_notice, args=(store, ctx)) for _ in range(4)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert len(sent) == 1
+
+    def test_distinct_trading_days_send_independently(self, tmp_path, sent) -> None:
+        store = LocalStore(tmp_path)
+        monday = _ctx(dt.datetime(2026, 11, 10, 2, 0, tzinfo=dt.UTC), dt.date(2026, 11, 9))
+        tuesday = _ctx(dt.datetime(2026, 11, 11, 2, 0, tzinfo=dt.UTC), dt.date(2026, 11, 10))
+        track_c._send_daily_notice(store, monday)
+        track_c._send_daily_notice(store, tuesday)
+        assert [day for day, _artifact in sent] == ["2026-11-06", "2026-11-09"]
+
+    def test_a_marker_failure_never_fails_the_sweep(self, tmp_path, sent, monkeypatch, capsys):
+        store = LocalStore(tmp_path)
+
+        def boom(*_a: object, **_k: object) -> str:
+            raise RuntimeError("store down")
+
+        monkeypatch.setattr(store, "compare_and_swap", boom)
+        ctx = _ctx(dt.datetime(2026, 11, 10, 2, 0, tzinfo=dt.UTC), dt.date(2026, 11, 9))
+        track_c._send_daily_notice(store, ctx)
+        assert sent == []
+        assert (
+            "daily notice marker NOT created: RuntimeError: store down" in capsys.readouterr().err
+        )
+
     def test_a_weekend_firing_sends_nothing(self, tmp_path, sent) -> None:
         # Saturday 2026-11-07 21:00 ET resolves to Friday's trading day.
         ctx = _ctx(dt.datetime(2026, 11, 8, 2, 0, tzinfo=dt.UTC), dt.date(2026, 11, 6))
@@ -246,6 +293,11 @@ class TestSweepWiring:
         ctx = _ctx(dt.datetime(2026, 11, 10, 2, 0, tzinfo=dt.UTC), dt.date(2026, 11, 9))
         track_c._send_daily_notice(LocalStore(tmp_path), ctx)
         assert "daily notice NOT delivered: RuntimeError: telegram down" in capsys.readouterr().err
+        # The marker stays after a failed delivery: a later sweep does not resend.
+        retried: list[str] = []
+        monkeypatch.setattr(daily_notice, "send_notice", lambda *_a, **_k: retried.append("x"))
+        track_c._send_daily_notice(LocalStore(tmp_path), ctx)
+        assert retried == []
 
     def test_the_handler_sends_after_the_run(self, tmp_path, monkeypatch) -> None:
         sent: list[RunContext] = []

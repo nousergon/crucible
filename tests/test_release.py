@@ -37,6 +37,7 @@ from crucible.release import (
     wheel_key_for,
 )
 from crucible.store import ETAG_ABSENT, LocalStore, PointerConflictError, S3Store
+from tests.support.releases import publish_v4
 
 SHA_A = "a" * 40
 SHA_B = "b" * 40
@@ -350,7 +351,7 @@ class TestObjectLock:
         client = _FakeS3Client()
         store = S3Store("bucket", "crucible", client=client)
         _published(store)
-        pin(store, SHA_A, expect=ETAG_ABSENT)
+        pin(store, SHA_A, target=None, expect=ETAG_ABSENT)
         assert f"crucible/{POINTER_KEY}" not in client.retentions
         # And no PUT to the pointer's key was ever asked to lock the wheel's key
         # or vice versa — the two writes go through entirely separate calls.
@@ -379,7 +380,7 @@ class TestPointer:
     def test_pin_then_read_round_trips(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
         _published(store)
-        pin(store, SHA_A)
+        pin(store, SHA_A, target=None)
         assert current_release(store) == SHA_A
 
     def test_a_pointer_missing_sha_raises_named_at_the_boundary(self, tmp_path) -> None:
@@ -422,7 +423,7 @@ class TestPointer:
         _published(store)
         _published(store, SHA_B)
         pin(store, SHA_A, target="trader", trader_smoke=_trader_evidence(SHA_A))
-        pin(store, SHA_B, target="current")
+        pin(store, SHA_B, target=None)
         assert json.loads(store.get_bytes(TRADER_PIN_KEY))["sha"] == SHA_A
         assert json.loads(store.get_bytes(POINTER_KEY))["sha"] == SHA_B
 
@@ -436,9 +437,9 @@ class TestPointer:
         store = LocalStore(tmp_path)
         _published(store)
         _published(store, SHA_B)
-        pin(store, SHA_A, expect=ETAG_ABSENT)
+        pin(store, SHA_A, target=None, expect=ETAG_ABSENT)
         with pytest.raises(PointerConflictError):
-            pin(store, SHA_B, expect=ETAG_ABSENT)
+            pin(store, SHA_B, target=None, expect=ETAG_ABSENT)
 
 
 class TestStalePointer:
@@ -452,7 +453,7 @@ class TestStalePointer:
         deploy bug."""
         store = LocalStore(tmp_path)
         _published(store)
-        pin(store, SHA_A)
+        pin(store, SHA_A, target=None)
         (tmp_path / wheel_key(SHA_A)).unlink()
         with pytest.raises(StaleReleasePointerError, match="whose wheel is not at"):
             resolve_release(store)
@@ -507,13 +508,13 @@ class TestAPriorReleaseIsStillAddressable:
         # The bug: this key does not exist and never did for a v2 release.
         assert not store.exists(wheel_key(SHA_B))
         assert store.exists(legacy_key)
-        pin(store, SHA_B)
+        pin(store, SHA_B, target=None)
         assert current_release(store) == SHA_B
 
     def test_resolving_a_pre_fix_release_is_accepted(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
         self._publish_a_v2_release(store, tmp_path)
-        pin(store, SHA_B)
+        pin(store, SHA_B, target=None)
         assert resolve_release(store) == SHA_B
 
     def test_a_sha_that_was_never_published_is_refused_by_that_name(self, tmp_path) -> None:
@@ -531,7 +532,7 @@ class TestAPriorReleaseIsStillAddressable:
         legacy_key = self._publish_a_v2_release(store, tmp_path)
         (tmp_path / legacy_key).unlink()
         with pytest.raises(StaleReleasePointerError) as excinfo:
-            pin(store, SHA_B)
+            pin(store, SHA_B, target=None)
         assert legacy_key in str(excinfo.value)
         assert wheel_key(SHA_B) not in str(excinfo.value)
 
@@ -586,7 +587,7 @@ class TestARecordUnderTheWrongPrefixIsRefusedByName:
         publish_release(
             store, sha=SHA_A, wheel=b"w-a", lockfile=b"l", test_summary="", workflow_run_url=""
         )
-        pin(store, SHA_A)
+        pin(store, SHA_A, target=None)
         publish_release(
             store, sha=SHA_B, wheel=b"w-b", lockfile=b"l", test_summary="", workflow_run_url=""
         )
@@ -613,15 +614,15 @@ class TestARecordUnderTheWrongPrefixIsRefusedByName:
 class TestSmokeGate:
     def test_an_ok_smoke_flips_the_pointer(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
-        _published(store)
+        publish_v4(store, SHA_A)
         _, version = read_pointer(store)
         assert flip_on_smoke(store, sha=SHA_A, smoke_manifest=_smoke_manifest(), expect=version)
         assert current_release(store) == SHA_A
 
     def test_a_failed_smoke_leaves_the_pointer_exactly_where_it_was(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
-        _published(store)
-        _published(store, SHA_B)
+        publish_v4(store, SHA_A)
+        publish_v4(store, SHA_B)
         pin(store, SHA_A)
         _, version = read_pointer(store)
         flipped = flip_on_smoke(
@@ -634,8 +635,8 @@ class TestSmokeGate:
         """The gate failing open: promoting on a smoke that verified a
         different artifact."""
         store = LocalStore(tmp_path)
-        _published(store)
-        _published(store, SHA_B)
+        publish_v4(store, SHA_A)
+        publish_v4(store, SHA_B)
         with pytest.raises(ValueError, match="not"):
             flip_on_smoke(
                 store, sha=SHA_B, smoke_manifest=_smoke_manifest(SHA_A), expect=ETAG_ABSENT
@@ -643,7 +644,7 @@ class TestSmokeGate:
 
     def test_a_non_smoke_manifest_cannot_be_the_gate(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
-        _published(store)
+        publish_v4(store, SHA_A)
         manifest = _smoke_manifest()
         manifest["job"] = "data.daily"
         with pytest.raises(ValueError, match="gate is the smoke run"):
@@ -653,8 +654,8 @@ class TestSmokeGate:
         self, tmp_path
     ) -> None:
         store = LocalStore(tmp_path)
-        _published(store)
-        _published(store, SHA_B)
+        publish_v4(store, SHA_A)
+        publish_v4(store, SHA_B)
         _, version = read_pointer(store)  # both deploys read ETAG_ABSENT
         pin(store, SHA_B, expect=version)  # the other deploy wins
         with pytest.raises(PointerConflictError):
