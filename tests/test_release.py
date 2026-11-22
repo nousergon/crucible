@@ -37,6 +37,7 @@ from crucible.release import (
     wheel_key_for,
 )
 from crucible.store import ETAG_ABSENT, LocalStore, PointerConflictError, S3Store
+from tests.support.releases import publish_v4
 
 SHA_A = "a" * 40
 SHA_B = "b" * 40
@@ -101,22 +102,6 @@ def _published(store, sha=SHA_A):
         workflow_run_url="https://github.com/nousergon/crucible/actions/runs/1",
         now=dt.datetime(2026, 8, 28, 21, 0, tzinfo=dt.UTC),
     )
-
-
-def _published_v4(store, sha=SHA_A):
-    from tests.support.releases import synthetic_manifest
-
-    record = _published(store, sha)
-    record = ReleaseRecord(
-        schema_version="release.v4",
-        sha=record.sha,
-        lockfile_sha256=record.lockfile_sha256,
-        wheel_sha256=record.wheel_sha256,
-        wheel_filename=record.wheel_filename,
-        wheelhouse=synthetic_manifest(),
-    )
-    store.put_bytes(release_json_key(sha), record.to_json())
-    return record
 
 
 def _trader_evidence(sha=SHA_A, status="ok"):
@@ -594,7 +579,7 @@ class TestARecordUnderTheWrongPrefixIsRefusedByName:
         store = LocalStore(tmp_path)
         self._cross_wire(store)
         with pytest.raises(ReleaseRecordMismatchError, match="describes"):
-            pin(store, SHA_A, target=None)
+            pin(store, SHA_A)
         assert current_release(store) is None
 
     def test_resolve_release_refuses_a_pointer_at_a_cross_wired_prefix(self, tmp_path) -> None:
@@ -629,16 +614,16 @@ class TestARecordUnderTheWrongPrefixIsRefusedByName:
 class TestSmokeGate:
     def test_an_ok_smoke_flips_the_pointer(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
-        _published_v4(store)
+        publish_v4(store, SHA_A)
         _, version = read_pointer(store)
         assert flip_on_smoke(store, sha=SHA_A, smoke_manifest=_smoke_manifest(), expect=version)
         assert current_release(store) == SHA_A
 
     def test_a_failed_smoke_leaves_the_pointer_exactly_where_it_was(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
-        _published_v4(store)
-        _published_v4(store, SHA_B)
-        pin(store, SHA_A, target=None)
+        publish_v4(store, SHA_A)
+        publish_v4(store, SHA_B)
+        pin(store, SHA_A)
         _, version = read_pointer(store)
         flipped = flip_on_smoke(
             store, sha=SHA_B, smoke_manifest=_smoke_manifest(SHA_B, "failed"), expect=version
@@ -650,8 +635,8 @@ class TestSmokeGate:
         """The gate failing open: promoting on a smoke that verified a
         different artifact."""
         store = LocalStore(tmp_path)
-        _published_v4(store)
-        _published_v4(store, SHA_B)
+        publish_v4(store, SHA_A)
+        publish_v4(store, SHA_B)
         with pytest.raises(ValueError, match="not"):
             flip_on_smoke(
                 store, sha=SHA_B, smoke_manifest=_smoke_manifest(SHA_A), expect=ETAG_ABSENT
@@ -659,7 +644,7 @@ class TestSmokeGate:
 
     def test_a_non_smoke_manifest_cannot_be_the_gate(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
-        _published_v4(store)
+        publish_v4(store, SHA_A)
         manifest = _smoke_manifest()
         manifest["job"] = "data.daily"
         with pytest.raises(ValueError, match="gate is the smoke run"):
@@ -669,10 +654,10 @@ class TestSmokeGate:
         self, tmp_path
     ) -> None:
         store = LocalStore(tmp_path)
-        _published_v4(store)
-        _published_v4(store, SHA_B)
+        publish_v4(store, SHA_A)
+        publish_v4(store, SHA_B)
         _, version = read_pointer(store)  # both deploys read ETAG_ABSENT
-        pin(store, SHA_B, target=None, expect=version)  # the other deploy wins
+        pin(store, SHA_B, expect=version)  # the other deploy wins
         with pytest.raises(PointerConflictError):
             flip_on_smoke(store, sha=SHA_A, smoke_manifest=_smoke_manifest(), expect=version)
 

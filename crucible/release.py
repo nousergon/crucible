@@ -628,8 +628,8 @@ def require_wheelhouse(record: ReleaseRecord) -> dict[str, Any]:
             f"release {record.sha} ({record.schema_version}) publishes no wheelhouse. Boxes "
             "install offline from a hash-locked wheelhouse only and never fall back to "
             "PyPI. Fix: `crucible release.pin` a release that carries one (any release "
-            "deployed since the wheelhouse landed), or publish a new SHA. Re-deploying THIS "
-            "sha cannot add one: its release.json is immutable."
+            "deployed since the wheelhouse landed), or merge to main so deploy.yml publishes a "
+            "new one. Re-deploying THIS sha cannot add one: its release.json is immutable."
         )
     return record.wheelhouse
 
@@ -1060,15 +1060,15 @@ def pin(
     the off-market-hours window; the check is repeated in this primitive so
     no second caller can move the trader's pin around the gate.
 
+    Current pins require a wheelhouse. ``target=None`` still writes the
+    current pointer but deliberately bypasses that check for fault fixtures
+    which need to construct a stale pre-wheelhouse pointer.
+
     ``expect`` is the version token the caller read. Omitting it means "swap
     against whatever is there right now", which is correct for an operator
     rollback — the operator has just looked — and wrong for an automated
     deploy, which passes the token it read before running the smoke. The
     deploy path always passes it.
-
-    ``target=None`` is reserved for fault probes that must construct a stale
-    current pointer deliberately. Normal current pins, including calls that
-    omit ``target``, require a release with a wheelhouse.
 
     The wheel key comes from :func:`published_wheel_key`, so a rollback to a
     pre-alpha-engine-config-I9908 release is accepted rather than refused
@@ -1078,7 +1078,8 @@ def pin(
     """
     _assert_sha(sha)
     validate_wheelhouse = target == "current"
-    target = target or "current"
+    if target is None:
+        target = "current"
     if target not in PIN_TARGETS:
         raise ValueError(f"pin target {target!r} not in {PIN_TARGETS}")
     if target == "trader":

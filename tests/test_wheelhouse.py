@@ -23,6 +23,7 @@ from jsonschema import Draft202012Validator
 
 from crucible.deploy import main as deploy_main
 from crucible.release import (
+    POINTER_KEY,
     RELEASE_SCHEMA_VERSION,
     ReleaseHasNoWheelhouseError,
     ReleaseRecord,
@@ -61,7 +62,6 @@ from tests.support.releases import (
 )
 
 SHA = "a" * 40
-SHA_B = "b" * 40
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_YML = ROOT / ".github" / "workflows" / "deploy.yml"
 SCHEMAS = ROOT / "crucible" / "schemas"
@@ -204,52 +204,35 @@ class TestTheReleaseV4Contract:
         with pytest.raises(ValueError):
             wheelhouse_object_key(SHA, "nested/x.whl")
 
-
-class TestPinRequiresTheWheelhouse:
-    @pytest.mark.parametrize("target", [pytest.param(None, id="omitted"), "current"])
+    @pytest.mark.parametrize("target", [pytest.param("omitted", id="omitted"), "current"])
     def test_current_pin_refuses_a_release_without_a_wheelhouse_before_writing(
-        self, tmp_path, target
+        self, tmp_path: Path, target: str
     ) -> None:
         store = LocalStore(tmp_path)
         publish_release(
-            store,
-            sha=SHA,
-            wheel=b"wheel",
-            lockfile=b"lock",
-            test_summary="ok",
-            workflow_run_url="",
+            store, sha=SHA, wheel=b"w", lockfile=b"l", test_summary="", workflow_run_url=""
         )
-
-        with pytest.raises(ReleaseHasNoWheelhouseError, match="publish a new SHA"):
-            if target is None:
+        with pytest.raises(ReleaseHasNoWheelhouseError, match="Re-deploying THIS sha cannot"):
+            if target == "omitted":
                 pin(store, SHA)
             else:
                 pin(store, SHA, target=target)
+        assert not store.exists(POINTER_KEY)
 
-        assert current_release(store) is None
-
-    def test_current_pin_accepts_a_release_with_a_wheelhouse(self, tmp_path) -> None:
-        publish_v4(tmp_path, SHA)
+    def test_current_pin_accepts_a_release_with_a_wheelhouse(self, tmp_path: Path) -> None:
         store = LocalStore(tmp_path)
-
+        publish_v4(store, SHA)
         pin(store, SHA)
-
         assert current_release(store) == SHA
 
-    def test_fault_only_target_can_exercise_the_stale_pointer_guard(self, tmp_path) -> None:
+    def test_empty_target_is_not_the_unvalidated_fixture_path(self, tmp_path: Path) -> None:
         store = LocalStore(tmp_path)
         publish_release(
-            store,
-            sha=SHA_B,
-            wheel=b"wheel",
-            lockfile=b"lock",
-            test_summary="ok",
-            workflow_run_url="",
+            store, sha=SHA, wheel=b"w", lockfile=b"l", test_summary="", workflow_run_url=""
         )
-
-        pin(store, SHA_B, target=None)
-
-        assert current_release(store) == SHA_B
+        with pytest.raises(ValueError, match="pin target"):
+            pin(store, SHA, target="")
+        assert not store.exists(POINTER_KEY)
 
 
 class TestThePublisherShipsTheWheelhouse:
