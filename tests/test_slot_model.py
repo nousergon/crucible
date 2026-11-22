@@ -293,6 +293,61 @@ class TestNoDesignColumnsGuard:
 
 
 class TestCPCV:
+    def test_one_unfittable_combination_does_not_end_the_battery(
+        self, panel, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls = 0
+
+        def one_refusal(*args: object, **kwargs: object) -> float:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise TrainingIntegrityError("deliberate fold refusal")
+            return 0.25
+
+        monkeypatch.setattr("crucible.slots.model._fold_ic", one_refusal)
+        result = cpcv_oos_ic(
+            panel,
+            recipe=_recipe(),
+            cpcv=CPCVSpec(n_groups=6, k_test=2, embargo_trading_days=2),
+            label_horizon_trading_days=2,
+        )
+
+        assert calls == 15
+        assert result.status == "ok"
+        assert result.mean_ic == 0.25
+        assert result.reason == "14 of 15 combination(s) fitted"
+        failures = [fold for fold in result.folds if fold.failure_reason]
+        assert len(failures) == 1
+        assert failures[0].test_groups == (0, 1)
+        failure_reason = failures[0].failure_reason
+        assert failure_reason is not None
+        assert "deliberate fold refusal" in failure_reason
+
+    def test_a_battery_below_the_fittable_floor_is_unmeasurable(
+        self, panel, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls = 0
+
+        def four_fits(*args: object, **kwargs: object) -> float | None:
+            nonlocal calls
+            calls += 1
+            return 0.25 if calls <= 4 else None
+
+        monkeypatch.setattr("crucible.slots.model._fold_ic", four_fits)
+        result = cpcv_oos_ic(
+            panel,
+            recipe=_recipe(),
+            cpcv=CPCVSpec(n_groups=6, k_test=2, embargo_trading_days=2),
+            label_horizon_trading_days=2,
+        )
+
+        assert calls == 15
+        assert result.status == "unmeasurable"
+        assert result.ics == ()
+        assert result.reason == "4 of 15 combination(s) fitted"
+        assert len([fold for fold in result.folds if fold.failure_reason]) == 11
+
     def test_labels_overlapping_the_test_block_are_purged_from_training(self, panel) -> None:
         result = cpcv_oos_ic(
             panel,
@@ -367,7 +422,9 @@ class TestCPCV:
             label_horizon_trading_days=21,
         )
         assert result.status == "unmeasurable"
-        assert result.reason
+        assert result.reason.startswith("0 of 15 combination(s) fitted")
+        assert len(result.folds) == 15
+        assert all(fold.failure_reason for fold in result.folds)
 
 
 # --------------------------------------------------------------------------

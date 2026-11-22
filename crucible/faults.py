@@ -528,7 +528,7 @@ def _absorbed_evidence(
     return key, dict(last_retry)
 
 
-def _validate_bus_key(store: Store, bus_key: str) -> None:
+def _validate_bus_key(store: Store, bus_key: str, run_id: str, target_job: str) -> None:
     if parse_bus_key(bus_key) is None:
         raise FaultRecordRefusedError(
             f"--bus-key {bus_key!r} is not shaped like an alert bus key "
@@ -546,6 +546,38 @@ def _validate_bus_key(store: Store, bus_key: str) -> None:
             f"--bus-key {bus_key!r} names a key the store does not hold — a fault "
             "record may only name a page that actually fired."
         )
+    read = read_store_document(store, bus_key)
+    if read.problem is not None or read.absent or read.document is None:
+        problem = read.problem or "the row disappeared while it was being read"
+        raise FaultRecordRefusedError(
+            f"--bus-key {bus_key!r} is not a readable alert bus row: {problem}. A "
+            "fault record cannot be filed against bus evidence it cannot parse."
+        )
+    alert_id = read.document.get("alert_id")
+    if alert_id == run_id:
+        return
+    members = read.document.get("members")
+    if not isinstance(alert_id, str) or not isinstance(members, list):
+        raise FaultRecordRefusedError(
+            f"--bus-key {bus_key!r} is incorrectly shaped: `alert_id` must be a string "
+            "and `members` must be a list."
+        )
+    member_run_ids: list[str] = []
+    for member in cast("list[object]", members):
+        if not isinstance(member, dict):
+            continue
+        member_row = cast("dict[str, object]", member)
+        member_run_id = member_row.get("run_id")
+        if isinstance(member_run_id, str):
+            member_run_ids.append(member_run_id)
+    if run_id in member_run_ids:
+        return
+    row_run_ids = [alert_id, *member_run_ids]
+    raise FaultRecordRefusedError(
+        f"--bus-key {bus_key!r} does not belong to run_id {run_id!r} of "
+        f"target job {target_job!r}; the row names different run ID(s) "
+        f"{row_run_ids!r}. A page from another run cannot be borrowed."
+    )
 
 
 def _unreachable_evidence(store: Store, fault_id: str, now: dt.datetime) -> list[dict[str, str]]:
@@ -651,7 +683,7 @@ def record_fault(
                     "produced the row yet, the record waits for it — the clause reads "
                     "UNMEASURABLE until then, which is the honest reading."
                 )
-            _validate_bus_key(store, bus_key)
+            _validate_bus_key(store, bus_key, run_id, target_job)
             manifest_key, attempt = _induced_evidence(store, target_job, trading_day, run_id)
         else:
             if bus_key:

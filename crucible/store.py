@@ -24,6 +24,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import threading
 import urllib.parse
 from abc import ABC, abstractmethod
@@ -1463,4 +1464,150 @@ def open_store(uri: str | None, *, dry_run: bool = False) -> Store:
         store: Store = S3Store(bucket, prefix)
     else:
         store = LocalStore(target, create=not dry_run)
+    store = with_read_through(store)
     return capturing(store) if dry_run else store
+
+
+#: The environment variable that turns on :class:`ReadThroughStore`
+#: (alpha-engine-config-I13900). Set on staging boxes only, to the PROD store
+#: whose history staging reads.
+READ_THROUGH_URI_ENV = "CRUCIBLE_READ_THROUGH_URI"
+#: The first trading day staging computes for itself. A history key dated on
+#: or after it never falls back, so staging's own pipeline is what the soak
+#: grades from that day on.
+READ_THROUGH_BEFORE_ENV = "CRUCIBLE_READ_THROUGH_BEFORE"
+#: The prefixes whose keys may be read through: research HISTORY only. Never
+#: `runs/`, `champions/`, `trader/`, `releases/` or any other record a job
+#: checks to decide whether IT already ran: a staging job that found a prod
+#: record there would skip its own work and file the prod result as staging's.
+#: `experiments/` is history too: `experiment.grade` scores every shadow whose
+#: horizon has SETTLED, and a store weeks old holds none, so the staging weekly
+#: failed `experiment.grade[u]` with MissingArtifactError on 2026-11-19. Grading
+#: re-scores each shadow and writes its verdict to ``primary``; no grader reads a
+#: verdict to decide whether it already ran. `champions/` stays staging's alone.
+READ_THROUGH_PREFIXES: tuple[str, ...] = (
+    "data/",
+    "features/",
+    "universe/",
+    "arm_predictions/",
+    "experiments/",
+)
+#: What `experiment.grade` WRITES under `experiments/`: staging grades every
+#: settled shadow itself, so these are staging's own outputs and never read
+#: through. A prod verdict surfacing in staging's listing is one no staging
+#: run claims, and `explain` (which walks the newest settled verdict back
+#: through the manifests that claim it) failed on exactly that on 2026-11-20.
+GRADED_OUTPUTS: tuple[str, ...] = ("/verdict.json", "/cross_section_settled.json")
+_KEY_DAY = re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)")
+
+
+class ReadThroughStore(Store):
+    """Staging's store, reading research history it never computed from prod.
+
+    alpha-engine-config-I13900. Serving and the weekly arc RE-TRAIN an arm
+    from the feature layer over `min_trading_days` of settled history, which
+    a store that came into being weeks ago does not hold. Every WRITE goes to
+    ``primary``. A READ of a key under :data:`READ_THROUGH_PREFIXES`, dated
+    before ``before`` (or carrying no date, e.g. a feature registry), falls
+    back to ``fallback`` when ``primary`` lacks it; listing such a prefix
+    returns the union. Every other key is ``primary``'s alone.
+    """
+
+    def __init__(self, primary: Store, fallback: Store, *, before: str) -> None:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", before):
+            raise ValueError(f"{READ_THROUGH_BEFORE_ENV} must be YYYY-MM-DD, not {before!r}")
+        self.primary = primary
+        self.fallback = fallback
+        self.before = before
+
+    def _may_fall_back(self, key: str) -> bool:
+        if not key.startswith(READ_THROUGH_PREFIXES):
+            return False
+        if key.endswith(GRADED_OUTPUTS):
+            return False
+        day = _KEY_DAY.search(key)
+        return day is None or day.group(1) < self.before
+
+    def put_bytes(
+        self,
+        key: str,
+        payload: bytes,
+        *,
+        object_lock_mode: str | None = None,
+        object_lock_retain_until: dt.datetime | None = None,
+    ) -> str:
+        return self.primary.put_bytes(
+            key,
+            payload,
+            object_lock_mode=object_lock_mode,
+            object_lock_retain_until=object_lock_retain_until,
+        )
+
+    def compare_and_swap(self, key: str, expected: str, payload: bytes) -> str:
+        return self.primary.compare_and_swap(key, expected, payload)
+
+    def _assert_writable_key(self, key: str) -> None:
+        self.primary._assert_writable_key(key)  # noqa: SLF001 - same interface, delegated
+
+    def get_bytes(self, key: str) -> bytes:
+        try:
+            return self.primary.get_bytes(key)
+        except KeyError:
+            if not self._may_fall_back(key):
+                raise
+        return self.fallback.get_bytes(key)
+
+    def exists(self, key: str) -> bool:
+        if self.primary.exists(key):
+            return True
+        return self._may_fall_back(key) and self.fallback.exists(key)
+
+    def etag(self, key: str) -> str:
+        tag = self.primary.etag(key)
+        if tag != ETAG_ABSENT or not self._may_fall_back(key):
+            return tag
+        return self.fallback.etag(key)
+
+    def presigned_url(self, key: str, expires_s: int) -> str:
+        return self.primary.presigned_url(key, expires_s)
+
+    def list_keys(self, prefix: str = "") -> Iterator[str]:
+        seen: set[str] = set()
+        for key in self.primary.list_keys(prefix):
+            seen.add(key)
+            yield key
+        for scope in READ_THROUGH_PREFIXES:
+            if scope.startswith(prefix):
+                query = scope
+            elif prefix.startswith(scope):
+                query = prefix
+            else:
+                continue
+            for key in self.fallback.list_keys(query):
+                if key not in seen and self._may_fall_back(key):
+                    seen.add(key)
+                    yield key
+
+
+def with_read_through(store: Store) -> Store:
+    """``store`` wrapped by :class:`ReadThroughStore` when the environment asks.
+
+    Both env vars or neither: a fallback URI with no cutoff would read prod
+    history for every day, including the days staging is being graded on.
+    """
+    uri = os.environ.get(READ_THROUGH_URI_ENV, "")
+    before = os.environ.get(READ_THROUGH_BEFORE_ENV, "")
+    if not uri and not before:
+        return store
+    if not uri or not before:
+        raise ValueError(
+            f"set both {READ_THROUGH_URI_ENV} and {READ_THROUGH_BEFORE_ENV}, or neither "
+            f"(got {READ_THROUGH_URI_ENV}={uri!r}, {READ_THROUGH_BEFORE_ENV}={before!r})"
+        )
+    kind, rest = parse_store_scheme(uri)
+    if kind != "s3":
+        fallback: Store = LocalStore(uri, create=False)
+    else:
+        bucket, _, prefix = rest.partition("/")
+        fallback = S3Store(bucket, prefix)
+    return ReadThroughStore(store, fallback, before=before)
