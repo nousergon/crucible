@@ -15,6 +15,7 @@ already fails on the defect rather than one written after the fact.
 from __future__ import annotations
 
 import datetime as dt
+from pathlib import Path
 
 import pytest
 
@@ -117,7 +118,7 @@ class TestManifestFieldEnforcement:
     figure derived from them counted from a day the market never traded.
     """
 
-    def test_a_recipe_registered_on_a_saturday_is_refused_at_load(self, tmp_path) -> None:
+    def test_a_recipe_registered_on_a_saturday_is_refused_at_load(self, tmp_path: Path) -> None:
         """The reproduction, verbatim: `registered_at: '2026-08-29'`."""
         from crucible.slots.arms import load_arm_specs
 
@@ -136,7 +137,7 @@ class TestManifestFieldEnforcement:
         )
 
     @pytest.mark.parametrize("bad", [SATURDAY, SUNDAY, OBSERVED_HOLIDAY])
-    def test_an_arm_built_in_code_carries_the_same_contract(self, bad) -> None:
+    def test_an_arm_built_in_code_carries_the_same_contract(self, bad: dt.date) -> None:
         """The assertion is on the spec, not on the YAML parser, so the
         migration importer — which takes `registered_at` from a v1 pointer's
         `promoted_at` — cannot enter a non-session by a different door."""
@@ -185,24 +186,31 @@ class TestStoreWalk:
     `Store` interface, so it inherits it rather than being rewritten for it.
     """
 
-    def test_a_clean_store_passes_the_walk(self, tmp_path) -> None:
+    def test_a_clean_store_passes_the_walk(self, tmp_path: Path) -> None:
         store = LocalStore(tmp_path)
         store.put_bytes("runs/data.daily/2026-08-27/run.json", b"{}")
         store.put_bytes("runs/data.daily/2026-08-28/run.json", b"{}")
         store.put_bytes("signals/2026-08-28/signals.json", b"{}")
         store.assert_keys_bind_to_trading_days()
 
-    def test_manifest_calendar_date_discriminators_are_provenance(self, tmp_path) -> None:
-        """Weekend and holiday firing dates distinguish otherwise identical
-        runs; only the manifest's trading-day segment makes a session claim."""
+    def test_run_calendar_date_discriminators_are_provenance(self, tmp_path: Path) -> None:
+        """Weekend firing dates distinguish runs; only the trading-day
+        segment makes a session claim, including for manifest siblings."""
         store = LocalStore(tmp_path)
-        store.put_bytes("runs/alerts.sweep/2026-08-28/2026-08-29/run.json", b"{}")
-        store.put_bytes("runs/data.daily/2026-07-02/2026-07-03/run.json", b"{}")
+        prefix = "runs/report.morning/2026-08-28/2026-08-29"
+        for filename in (
+            "run.json",
+            "message.txt",
+            "update.md",
+            "history_row.json",
+            "trigger.preopen.json",
+        ):
+            store.put_bytes(f"{prefix}/{filename}", b"{}")
         store.assert_keys_bind_to_trading_days()
 
     @pytest.mark.parametrize("bad", ["2026-08-29", "2026-8-29"])
     def test_manifest_bad_trading_day_is_not_hidden_by_discriminator(
-        self, tmp_path, bad: str
+        self, tmp_path: Path, bad: str
     ) -> None:
         store = LocalStore(tmp_path)
         store.put_bytes(f"runs/alerts.sweep/{bad}/2026-08-29/run.json", b"{}")
@@ -210,7 +218,7 @@ class TestStoreWalk:
             store.assert_keys_bind_to_trading_days()
         assert bad in str(exc.value)
 
-    def test_the_walk_rejects_a_saturday_key(self, tmp_path) -> None:
+    def test_the_walk_rejects_a_saturday_key(self, tmp_path: Path) -> None:
         """The defect this exists to catch: a job that keyed by wall-clock
         date instead of resolving. It writes a Saturday, every downstream
         pairing silently loses that date, and nothing else complains."""
@@ -221,13 +229,13 @@ class TestStoreWalk:
             store.assert_keys_bind_to_trading_days()
         assert "2026-08-29" in str(exc.value)
 
-    def test_the_walk_rejects_a_weekday_holiday_key(self, tmp_path) -> None:
+    def test_the_walk_rejects_a_weekday_holiday_key(self, tmp_path: Path) -> None:
         store = LocalStore(tmp_path)
         store.put_bytes("runs/data.daily/2026-07-03/run.json", b"{}")
         with pytest.raises(NonTradingDayKeyError):
             store.assert_keys_bind_to_trading_days()
 
-    def test_the_walk_reports_every_offender_not_only_the_first(self, tmp_path) -> None:
+    def test_the_walk_reports_every_offender_not_only_the_first(self, tmp_path: Path) -> None:
         """An operator fixing one bad key per run of the test is how a
         multi-day backfill defect takes a week to clear."""
         store = LocalStore(tmp_path)
@@ -238,7 +246,7 @@ class TestStoreWalk:
         for bad in ("2026-08-29", "2026-08-30", "2026-07-03"):
             assert bad in str(exc.value)
 
-    def test_a_key_with_no_date_component_is_not_silently_passed_over(self, tmp_path) -> None:
+    def test_a_key_with_no_date_component_is_not_silently_passed_over(self, tmp_path: Path) -> None:
         """A key carrying no ISO date is legal (`releases/current`,
         `champions/r/current.json`). It must be *recognised* as dateless, not
         merely fail to match a regex — otherwise a malformed date like
