@@ -39,6 +39,7 @@ from crucible.calendar import (
     NonTradingDayKeyError,
     is_trading_day,
 )
+from crucible.keys import parse_manifest_key
 
 __all__ = [
     "CAPTURED_URL_SCHEME",
@@ -366,6 +367,13 @@ class Store(ABC):
         The §4.12 contract test, as a method rather than a script, so it runs
         against whichever backend the caller has.
 
+        A manifest discriminator is provenance, not the trading-day component
+        that §4.12 constrains. For keys recognised by
+        :func:`crucible.keys.parse_manifest_key`, only the parsed trading-day
+        segment is therefore checked; a date-shaped discriminator may record
+        the calendar day on which the run fired. Non-manifest keys retain the
+        component-by-component walk.
+
         Three cases, and the third is the one that matters:
 
         * a key with a well-formed ISO date → the date must be a session;
@@ -381,7 +389,11 @@ class Store(ABC):
         """
         offenders: list[str] = []
         for key in self.list_keys(prefix):
-            for candidate in NEAR_MISS_DATE_RE.findall(key):
+            parsed_manifest = parse_manifest_key(key)
+            candidates = NEAR_MISS_DATE_RE.findall(
+                parsed_manifest[1] if parsed_manifest is not None else key
+            )
+            for candidate in candidates:
                 if not ISO_DATE_RE.fullmatch(candidate):
                     offenders.append(f"{key}: {candidate!r} is not a well-formed ISO-8601 date")
                     continue
