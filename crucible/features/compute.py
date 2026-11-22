@@ -21,9 +21,15 @@ bytes, which is the property a look-ahead breaks.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from crucible.features.registry import CATALOG, FeatureSpec, feature_version
+from crucible.regime import (
+    LEVEL_WINDOW_SESSIONS,
+    VOL_WINDOW_SESSIONS,
+    ZSCORE_MIN_OBSERVATIONS,
+    stress_score,
+)
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -261,6 +267,38 @@ _RESIDUAL_MOMENTUM_DEPTH_TRADING_DAYS = (
 )
 
 
+#: Sessions of history before `crucible.regime.stress_score` first exists, DERIVED
+#: from that module's windows. Each windowed input is NaN until its own source
+#: has data, then its trailing-median ratio needs a full level window, then its
+#: z-score needs `ZSCORE_MIN_OBSERVATIONS` of those. The slowest input is the
+#: vol ratio and the dispersion (both first readable on session 21 of a ticker's
+#: history); the drawdown and the 200-session breadth are faster.
+#: `tests/test_features_regime.py` measures the first non-null score on a
+#: synthetic panel and asserts it equals this, so an edit to a regime window
+#: that moves it is a red test rather than a panel too shallow for the column.
+_MARKET_STRESS_DEPTH_TRADING_DAYS = (
+    max(
+        _RETURN_DEPTH_TRADING_DAYS - 1 + VOL_WINDOW_SESSIONS,
+        21,
+    )
+    + LEVEL_WINDOW_SESSIONS
+    - 1
+    + ZSCORE_MIN_OBSERVATIONS
+    - 1
+)
+
+#: `(interaction column, the per-name column it multiplies by the stress score)`.
+_STRESS_INTERACTIONS: tuple[tuple[str, str], ...] = (
+    ("momentum_20d_zscore_x_stress_zscore", "momentum_20d_zscore"),
+    ("mom_12_1_zscore_x_stress_zscore", "mom_12_1_zscore"),
+    (
+        "residual_momentum_252d_skip21d_zscore_x_stress_zscore",
+        "residual_momentum_252d_skip21d_zscore",
+    ),
+    ("volatility_20d_x_stress_zscore", "volatility_20d_ratio"),
+)
+
+
 def catalog_column_depths() -> dict[str, int]:
     """`{column: sessions of a ticker's own history before it has a value}`.
 
@@ -312,11 +350,14 @@ def catalog_column_depths() -> dict[str, int]:
         # property of the point-in-time source, not of the price panel, and is
         # declared in `crucible.data.point_in_time`'s module docstring.
         depths[column] = 1
+    depths["market_stress_zscore"] = _MARKET_STRESS_DEPTH_TRADING_DAYS
     depths["momentum_20d_zscore"] = depths["momentum_20d_log_return"]
     depths["return_60d_zscore"] = depths["return_60d_log_return"]
     depths["mom_12_1_zscore"] = depths["mom_12_1_log_return"]
     depths["residual_momentum_252d_skip21d_zscore"] = depths["residual_momentum_252d_skip21d_ratio"]
     depths["momentum_change_21d_zscore"] = depths["momentum_change_21d_log_return"]
+    for interaction, component in _STRESS_INTERACTIONS:
+        depths[interaction] = max(depths[component], depths["market_stress_zscore"])
     depths["tech_score_ratio"] = max(
         depths["rsi_14_ratio"],
         depths["close_to_sma50_ratio"],
@@ -354,6 +395,20 @@ def min_panel_trading_days(catalog: tuple[FeatureSpec, ...] = CATALOG) -> int:
             "that was never compiled."
         )
     return max(depths[spec.name] for spec in catalog)
+
+
+def _stress_on(stress_by_day: pd.Series, day: object) -> float:
+    """The stress score for ``day``, NaN when the score does not exist for it.
+
+    Read through numpy so the lookup does not depend on whether ``day`` is a
+    `date`, a `Timestamp` or a `datetime64`.
+    """
+    import numpy as np
+
+    days = np.asarray(cast("object", stress_by_day.index), dtype="datetime64[ns]")
+    values = np.asarray(stress_by_day, dtype=np.float64)
+    hits = np.nonzero(days == np.asarray([day], dtype="datetime64[ns]")[0])[0]
+    return float(values[hits[0]]) if len(hits) else float("nan")
 
 
 def _rank01(series: pd.Series) -> pd.Series:
@@ -634,6 +689,11 @@ def build_features(
         frame["ticker"], sort=False
     ).shift(MOMENTUM_CHANGE_WINDOW_TRADING_DAYS)
 
+    # The day's stress score, from the whole panel's cross-section history. Every
+    # statistic for a day reads rows dated <= that day (`crucible.regime`), so
+    # rows appended after `day` cannot move it.
+    stress_by_day = stress_score(frame)  # pyright: ignore[reportArgumentType]  # a DataFrame is a `_Panel`; pandas' typed `columns` is not an Iterable[object] to the protocol
+
     cross = frame[frame["trading_day"] == day].copy()
     if cross.empty:
         raise ValueError(
@@ -654,12 +714,21 @@ def build_features(
         ("mom_12_1_log_return", "mom_12_1_zscore"),
         ("residual_momentum_252d_skip21d_ratio", "residual_momentum_252d_skip21d_zscore"),
         ("momentum_change_21d_log_return", "momentum_change_21d_zscore"),
+        # Interaction input only (alpha-engine-config-I14084): not a catalogue column.
+        ("volatility_20d_ratio", "_volatility_20d_zscore"),
     ):
         cross[target] = float("nan")
         # Z-scored over the LIQUID set only: an illiquid tail with wild
         # returns would set the scale for every liquid name, and the arms
         # that rank on these z-scores only ever consider liquid names.
         cross.loc[liquid, target] = _zscore(cross.loc[liquid, source_col])
+
+    # -- regime-conditioned columns (alpha-engine-config-I14084) ------------
+    # Null, never a guess, when the score does not exist yet for `day`.
+    cross["market_stress_zscore"] = _stress_on(stress_by_day, cast("object", day))
+    for interaction, component in _STRESS_INTERACTIONS:
+        source = "_volatility_20d_zscore" if component == "volatility_20d_ratio" else component
+        cross[interaction] = cross[source] * cross["market_stress_zscore"]
 
     cross["tech_score_ratio"] = (
         _rank01(cross["rsi_14_ratio"])

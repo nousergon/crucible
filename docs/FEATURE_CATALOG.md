@@ -99,6 +99,11 @@ below changes, and is recorded here as an illustration rather than a pin.
 | `stewardship_pillar_pct` | pct | — | yes | `wmean(100 - sector_pct(payout_ratio) .35, sector_pct(capex_growth_5y_ratio) .35, sector_pct(institutional_accumulation_raw) .30)` | `sector_raw`, `payout_ratio`, `capex_growth_5y_ratio`, `institutional_accumulation_raw` |
 | `defensiveness_pillar_pct` | pct | — | yes | `wmean(100 - sector_pct(volatility_20d_ratio) .50, 100 - sector_pct(vol_ratio_10_60_ratio) .30, 100 - sector_pct(atr_14_ratio) .20)` | `sector_raw`, `volatility_20d_ratio`, `vol_ratio_10_60_ratio`, `atr_14_ratio` |
 | `momentum_12_1_pillar_pct` | pct | — | yes | `wmean(sector_pct(mom_12_1_log_return) .40, sector_pct(return_120d_log_return) .25, sector_pct(dist_from_52w_high_ratio) .20, sector_pct(return_60d_log_return) .15)` | `sector_raw`, `mom_12_1_log_return`, `return_120d_log_return`, `dist_from_52w_high_ratio`, `return_60d_log_return` |
+| `market_stress_zscore` | zscore | 252 | no | `stress_score(panel) on the day (crucible.regime)` | `market_return_1d_log_return`, `momentum_20d_log_return`, `close_to_sma50_ratio`, `close_to_sma200_ratio` |
+| `momentum_20d_zscore_x_stress_zscore` | zscore | — | yes | `momentum_20d_zscore * market_stress_zscore` | `momentum_20d_zscore`, `market_stress_zscore` |
+| `mom_12_1_zscore_x_stress_zscore` | zscore | — | yes | `mom_12_1_zscore * market_stress_zscore` | `mom_12_1_zscore`, `market_stress_zscore` |
+| `residual_momentum_252d_skip21d_zscore_x_stress_zscore` | zscore | — | yes | `residual_momentum_252d_skip21d_zscore * market_stress_zscore` | `residual_momentum_252d_skip21d_zscore`, `market_stress_zscore` |
+| `volatility_20d_x_stress_zscore` | zscore | — | yes | `zscore(volatility_20d_ratio) * market_stress_zscore` | `volatility_20d_ratio`, `liquidity_pass_raw`, `market_stress_zscore` |
 <!-- END GENERATED CATALOG TABLE -->
 
 ## Adding a column

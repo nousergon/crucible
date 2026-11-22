@@ -90,7 +90,7 @@ def integration_seed_trading_days() -> int:
     **Was a literal `300`** (`alpha-engine-config-I10701`, measured against
     run 34797033396): `crucible-PR266` sized the producer's own guard —
     `crucible.data.daily.PanelDepthError` — from
-    `crucible.features.min_panel_trading_days()` (313 sessions today), and a
+    `crucible.features.min_panel_trading_days()` (331 sessions today), and a
     fixture that still hand-counted 300 failed `test_data_daily`,
     `test_data_weekly` and `test_data_heal` with "the trailing panel ...
     carries 300 session(s), below the 313 the feature catalogue's deepest

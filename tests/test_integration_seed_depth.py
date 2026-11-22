@@ -4,7 +4,7 @@ Normative source: `alpha-engine-config-I10701`, measured against run
 34797033396: `tests/integration/conftest.py::integration_arctic_symbols`
 seeded a hand-counted 300 trading sessions, and `crucible-PR266` sized
 `crucible.data.daily`'s `PanelDepthError` guard from
-`crucible.features.min_panel_trading_days()` (313 sessions today) — so the
+`crucible.features.min_panel_trading_days()` (331 sessions today) — so the
 literal fell behind the producer's own guard the moment that PR landed, and
 `test_data_daily`/`test_data_weekly`/`test_data_heal` failed with "the
 trailing panel ... carries 300 session(s), below the 313 the feature
