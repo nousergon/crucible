@@ -1304,8 +1304,7 @@ def _krepis_publish(*args: Any, **kwargs: Any) -> Any:
     every unit test and every laptop run import this module, and none of them
     should pull an SNS/HTTP client onto the import path.
     """
-    # krepis's signature carries a bare `dict` parameter.
-    from krepis.alerts import publish  # pyright: ignore[reportUnknownVariableType]  # noqa: PLC0415 - lazy on purpose
+    from krepis.alerts import publish  # noqa: PLC0415 - lazy on purpose
 
     return publish(*args, **kwargs)
 
