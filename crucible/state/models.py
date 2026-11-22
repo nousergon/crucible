@@ -360,6 +360,40 @@ posting = sa.Table(
 
 
 # --------------------------------------------------------------------------
+# LLM trace index: searchable metadata only; content remains in object storage
+# --------------------------------------------------------------------------
+
+llm_trace_index = sa.Table(
+    "llm_trace_index",
+    metadata,
+    sa.Column("trace_id", sa.Text, nullable=False),
+    sa.Column("span_id", sa.Text, nullable=False),
+    sa.Column("call_site", sa.Text, nullable=False),
+    sa.Column("model", sa.Text, nullable=False),
+    sa.Column("route", sa.Text, nullable=False),
+    sa.Column("input_tokens", sa.Integer, nullable=False),
+    sa.Column("output_tokens", sa.Integer, nullable=False),
+    sa.Column("cost_usd", MONEY, nullable=False),
+    sa.Column("citations", JSONB, nullable=False, server_default=sa.text("'[]'::jsonb")),
+    sa.Column("input_content_hash", sa.Text, nullable=False),
+    sa.Column("output_content_hash", sa.Text, nullable=False),
+    # NULL is the ruling-C hash-only representation; bodies never belong here.
+    sa.Column("content_s3_key", sa.Text),
+    sa.Column("metadata", JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")),
+    _written_at(),
+    sa.PrimaryKeyConstraint("trace_id", "span_id", name="llm_trace_index_pkey"),
+    sa.CheckConstraint("input_tokens >= 0", name="llm_trace_index_input_tokens_nonneg"),
+    sa.CheckConstraint("output_tokens >= 0", name="llm_trace_index_output_tokens_nonneg"),
+    sa.CheckConstraint("cost_usd >= 0", name="llm_trace_index_cost_nonneg"),
+    sa.Index("llm_trace_index_call_site", "call_site"),
+    sa.Index("llm_trace_index_model", "model"),
+    sa.Index("llm_trace_index_route", "route"),
+    sa.Index("llm_trace_index_input_hash", "input_content_hash"),
+    sa.Index("llm_trace_index_output_hash", "output_content_hash"),
+)
+
+
+# --------------------------------------------------------------------------
 # History
 # --------------------------------------------------------------------------
 
