@@ -1075,6 +1075,9 @@ def pin(
     against a v3-shaped path that release never occupied. This is the call
     site the bug actually bit: `release.pin <prior-sha>` IS the rollback
     command, and prior shas are precisely the ones with legacy wheel names.
+    Such a release also predates the wheelhouse, so a ``current`` pin to it
+    is still refused, by :func:`require_wheelhouse` rather than by a wheel
+    lookup against a path it never occupied.
     """
     _assert_sha(sha)
     validate_wheelhouse = target == "current"
