@@ -1504,6 +1504,12 @@ READ_THROUGH_PREFIXES: tuple[str, ...] = (
     "arm_predictions/",
     "experiments/",
 )
+#: What `experiment.grade` WRITES under `experiments/`: staging grades every
+#: settled shadow itself, so these are staging's own outputs and never read
+#: through. A prod verdict surfacing in staging's listing is one no staging
+#: run claims, and `explain` (which walks the newest settled verdict back
+#: through the manifests that claim it) failed on exactly that on 2026-11-20.
+GRADED_OUTPUTS: tuple[str, ...] = ("/verdict.json", "/cross_section_settled.json")
 _KEY_DAY = re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)")
 
 
@@ -1528,6 +1534,8 @@ class ReadThroughStore(Store):
 
     def _may_fall_back(self, key: str) -> bool:
         if not key.startswith(READ_THROUGH_PREFIXES):
+            return False
+        if key.endswith(GRADED_OUTPUTS):
             return False
         day = _KEY_DAY.search(key)
         return day is None or day.group(1) < self.before

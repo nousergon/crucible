@@ -253,6 +253,11 @@ class SlotSpec:
     #: floor. Nothing is ever substituted -- a name the base has no opinion on
     #: is an EXCLUDED name, never a zero.
     #:
+    #: Those exclusions deliberately also consume the arm's
+    #: ``max_incomplete_row_ratio`` allowance: both conditions remove rows
+    #: from the training block, so separate budgets could admit a block whose
+    #: combined loss is larger than the arm declared it would tolerate.
+    #:
     #: Declared here, on the slot, because it is a property of what the slot
     #: grades rather than of one arm's recipe: two arms held to two different
     #: coverage floors are graded over two different universes while every
