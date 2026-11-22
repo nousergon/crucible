@@ -38,10 +38,7 @@ class TestDiscriminator:
     def test_discriminator_precedes_the_immutable_history_namespace(self) -> None:
         assert invocation_manifest_key(
             "experiment.run", TRADING_DAY, "01JG0000000000000000000001", discriminator="u"
-        ) == (
-            "runs/experiment.run/2026-08-28/u/history/"
-            "01JG0000000000000000000001/run.json"
-        )
+        ) == ("runs/experiment.run/2026-08-28/u/history/01JG0000000000000000000001/run.json")
 
     def test_two_slots_produce_two_distinct_keys(self) -> None:
         u = manifest_key("experiment.run", TRADING_DAY, discriminator="u")

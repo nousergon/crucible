@@ -60,9 +60,7 @@ class TestSuccessPath:
 
         histories = [
             json.loads(
-                store.get_bytes(
-                    invocation_manifest_key("smoke", TRADING_DAY.isoformat(), run_id)
-                )
+                store.get_bytes(invocation_manifest_key("smoke", TRADING_DAY.isoformat(), run_id))
             )
             for run_id in run_ids
         ]

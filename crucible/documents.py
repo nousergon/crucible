@@ -315,9 +315,7 @@ class PrefixRead:
             raise UnreadableDocumentError(self.listing_problem)
 
 
-def read_manifests_under(
-    store: Store, prefix: str, *, include_history: bool = False
-) -> PrefixRead:
+def read_manifests_under(store: Store, prefix: str, *, include_history: bool = False) -> PrefixRead:
     """List ``prefix``, keep manifest keys only, read each through the guard.
 
     The one implementation of "read the manifests under this prefix" that
@@ -346,9 +344,7 @@ def read_manifests_under(
             )
         )
     for key in listed:
-        if not is_manifest_key(key) and not (
-            include_history and is_invocation_manifest_key(key)
-        ):
+        if not is_manifest_key(key) and not (include_history and is_invocation_manifest_key(key)):
             continue
         read = read_listed_document(store, key)
         if read.problem is not None:

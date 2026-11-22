@@ -758,9 +758,7 @@ def invocation_manifest_key(
     histories cannot collide.
     """
     if not run_id or not _DISCRIMINATOR_RE.fullmatch(run_id):
-        raise ValueError(
-            f"run_id {run_id!r} must be 1-64 characters of [A-Za-z0-9_.-]"
-        )
+        raise ValueError(f"run_id {run_id!r} must be 1-64 characters of [A-Za-z0-9_.-]")
     latest = manifest_key(job, trading_day, discriminator=discriminator)
     return f"{latest.removesuffix(MANIFEST_BASENAME)}history/{run_id}/{MANIFEST_BASENAME}"
 

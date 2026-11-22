@@ -437,9 +437,7 @@ def money_path_manifests(store: Store) -> list[tuple[str, dict[str, Any]]]:
         previous = found_by_run.get(document["run_id"])
         if previous is None or is_invocation_manifest_key(candidate):
             found_by_run[document["run_id"]] = (candidate, document)
-    return sorted(
-        found_by_run.values(), key=lambda pair: (pair[1]["finished"], pair[1]["run_id"])
-    )
+    return sorted(found_by_run.values(), key=lambda pair: (pair[1]["finished"], pair[1]["run_id"]))
 
 
 def digest_of_stored(store: Store, key: str) -> str:
