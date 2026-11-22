@@ -44,6 +44,7 @@ __all__ = [
     "Cadence",
     "Component",
     "DISPATCHES",
+    "DISPATCH_VERIFIERS",
     "Deadline",
     "LIFECYCLES",
     "NYSE_TZ",
@@ -116,7 +117,28 @@ LIFECYCLES: tuple[str, ...] = ("ACTIVE", "DISABLED", "RETIRED")
 #: `dispatch: null`, so no deadline was allowed and a unit that died before
 #: writing its manifest paged nobody. A `box-timer` row names its timer in
 #: `dispatch_unit`, so the cross-repo pairing has a declared name to check.
-DISPATCHES: tuple[str, ...] = ("arc", "scheduler", "github-actions", "box-timer")
+#:
+#: Each value is declared together with the tests that verify its wiring. The
+#: cross-repository identifiers are resolved by nous-ergon-ops; Crucible's
+#: guard resolves the tests that live here and checks every identifier's shape.
+DISPATCH_VERIFIERS: dict[str, tuple[str, ...]] = {
+    "arc": ("tests/test_weekly.py::TestDerivation::test_the_arc_is_every_row_that_declares_it",),
+    "scheduler": (
+        "nous-ergon-ops/tests/crossrepo/test_crucible_dispatch_lockstep.py::"
+        "test_every_declared_schedulable_job_is_actually_scheduled",
+    ),
+    "github-actions": (
+        "nous-ergon-ops/tests/crossrepo/test_crucible_dispatch_lockstep.py::"
+        "test_every_scheduled_workflow_is_named_by_a_registry_row",
+    ),
+    "box-timer": (
+        "tests/test_trader_session_deadline.py::TestTheRowIsScheduled::"
+        "test_it_names_the_box_timer_that_starts_it",
+        "tests/test_trader_reconcile_deadline.py::TestTheRowIsScheduled::"
+        "test_it_names_the_box_timer_that_starts_it",
+    ),
+}
+DISPATCHES: tuple[str, ...] = tuple(DISPATCH_VERIFIERS)
 
 #: WHICH trading days a deadline is due on. Exhaustive, and a machine field
 #: rather than a reading of the prose `schedule` string. `daily` is every
