@@ -1234,6 +1234,22 @@ def solve_target_weights(
         diagnostics["aim_weights"] = None
         diagnostics["aim_adjustment"] = _aim_off_meta(aim_rate, "infeasible_fallback")
         diagnostics["hard_risk"] = hard_risk_meta
+        diagnostics["per_name"] = _per_name_diagnostics(
+            tickers,
+            weights,
+            w_prev,
+            sigma,
+            omega_diag,
+            alpha_unc_used,
+            effective_caps,
+            eligibility,
+            floors,
+            adv_usd,
+            portfolio_notional,
+            params,
+            turnover_binding=False,
+            binding_constraints_established=False,
+        )
         return OptimizerResult(weights=weights, diagnostics=diagnostics)
 
     weights, clip_mass_zeroed = _clip_and_renormalize(
@@ -1306,6 +1322,22 @@ def solve_target_weights(
     # is a cost model absent from exactly the artifacts an investigation reads.
     diagnostics["cost_model"] = cost_model.record()
     diagnostics["hard_risk"] = hard_risk_meta
+    diagnostics["per_name"] = _per_name_diagnostics(
+        tickers,
+        weights,
+        w_prev,
+        sigma,
+        omega_diag,
+        alpha_unc_used,
+        effective_caps,
+        eligibility,
+        floors,
+        adv_usd,
+        portfolio_notional,
+        params,
+        turnover_binding=bool(cast("object", governor["turnover_constraint_binding"])),
+        binding_constraints_established=aim_rate is None and not band_meta["held"],
+    )
     return OptimizerResult(weights=weights, diagnostics=diagnostics)
 
 
@@ -2982,6 +3014,74 @@ def _build_diagnostics(
                 params.alpha_uncertainty_penalty * (omega_diag @ (weights**2))
             )
     return out
+
+
+def _per_name_diagnostics(
+    tickers: list[str],
+    weights: np.ndarray,
+    w_prev: np.ndarray,
+    sigma: np.ndarray,
+    omega_diag: np.ndarray,
+    alpha_unc_used: bool,
+    effective_caps: np.ndarray,
+    eligibility: np.ndarray,
+    floors: np.ndarray,
+    adv_usd: np.ndarray | None,
+    portfolio_notional: float | None,
+    params: PortfolioParams,
+    *,
+    turnover_binding: bool,
+    binding_constraints_established: bool,
+) -> dict[str, dict[str, float | str | None]]:
+    """Return JSON-safe, ticker-keyed facts about the reported target.
+
+    Binding labels use the deterministic precedence eligibility, churn floor,
+    name cap, ADV, then portfolio turnover. Post-solve adjustment and fallback
+    paths suppress labels because they do not report the solver's own point.
+    """
+    target = np.asarray(weights, dtype=float)
+    previous = np.asarray(w_prev, dtype=float)
+    marginal_risk = np.asarray(sigma, dtype=float) @ target
+    portfolio_variance = float(target @ marginal_risk)
+    adv = None if adv_usd is None else np.asarray(adv_usd, dtype=float)
+    nav = None if portfolio_notional is None else float(portfolio_notional)
+    adv_cap = params.max_pct_adv
+    adv_bound = 0.0 if adv_cap is None else float(adv_cap)
+    adv_enabled = adv_bound > 0.0
+    tolerance = 1e-6
+    rows: dict[str, dict[str, float | str | None]] = {}
+    for i, ticker in enumerate(tickers):
+        binding = "none"
+        if binding_constraints_established:
+            if not bool(eligibility[i]):
+                binding = "eligibility"
+            elif floors[i] > 0.0 and target[i] <= floors[i] + tolerance:
+                binding = "churn_floor"
+            elif target[i] >= effective_caps[i] - tolerance:
+                binding = "cap"
+            elif (
+                adv_enabled
+                and nav is not None
+                and nav > 0.0
+                and adv is not None
+                and np.isfinite(adv[i])
+                and adv[i] > 0.0
+                and abs(target[i] - previous[i]) >= adv_bound * float(adv[i]) / nav - tolerance
+            ):
+                binding = "ADV"
+            elif turnover_binding and abs(target[i] - previous[i]) > tolerance:
+                binding = "turnover_budget"
+        rows[ticker] = {
+            "risk_contribution_share": (
+                None
+                if portfolio_variance <= 0.0
+                else float(target[i] * marginal_risk[i] / portfolio_variance)
+            ),
+            "alpha_uncertainty": float(math.sqrt(omega_diag[i])) if alpha_unc_used else None,
+            "effective_name_cap": float(effective_caps[i]),
+            "binding_constraint": binding,
+        }
+    return rows
 
 
 def make_cash_sentinel_returns(n_rows: int) -> np.ndarray:

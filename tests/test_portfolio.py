@@ -25,6 +25,8 @@ any field (`repository-tiering-policy` test 2).
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 
@@ -38,6 +40,7 @@ from crucible.portfolio import (
     _apply_turnover_governor,
     _estimate_covariance_daily,
     _mandatory_turnover_floor,
+    _per_name_diagnostics,
     _turnover_diagnostics,
     _validate_covariance,
     compute_conviction_budget_multiplier,
@@ -212,6 +215,97 @@ def test_two_asset_symmetric_alpha_yields_equal_weights():
     assert w[0] == pytest.approx(0.08, abs=1e-3), "Both should hit their 0.08 cap given strong α̂"
 
 
+def test_solve_emits_per_name_optimizer_diagnostics():
+    u = _baseline_universe(n_active=1)
+    u["alpha_hat"][0] = 0.05
+    u["params"] = _params(
+        max_daily_turnover=None,
+        covariance_shrinkage="sample",
+        alpha_uncertainty_penalty=100.0,
+        alpha_uncertainty_min_cv=0.0,
+    )
+    u["alpha_uncertainty_epistemic"] = np.array([0.02, 0.01, 0.0])
+
+    result = _solve(u)
+    rows = result.diagnostics["per_name"]
+
+    assert set(rows) == set(u["tickers"])
+    assert rows["T0"]["alpha_uncertainty"] == pytest.approx(0.02)
+    assert rows["T0"]["effective_name_cap"] == pytest.approx(0.08)
+    assert rows["T0"]["binding_constraint"] == "cap"
+    sigma = np.cov(u["returns_panel"], rowvar=False, ddof=1)
+    expected = (
+        result.weights[0] * (sigma @ result.weights)[0] / (result.weights @ sigma @ result.weights)
+    )
+    assert rows["T0"]["risk_contribution_share"] == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    ("eligible", "floor", "cap", "adv", "turnover", "expected"),
+    [
+        (False, 0.0, 0.0, None, False, "eligibility"),
+        (True, 0.2, 0.2, None, False, "churn_floor"),
+        (True, 0.0, 0.2, None, False, "cap"),
+        (True, 0.0, 0.8, 200_000.0, False, "ADV"),
+        (True, 0.0, 0.8, None, True, "turnover_budget"),
+        (True, 0.0, 0.8, None, False, "none"),
+    ],
+)
+def test_per_name_binding_constraint_categories_and_precedence(
+    eligible: bool,
+    floor: float,
+    cap: float,
+    adv: float | None,
+    turnover: bool,
+    expected: str,
+) -> None:
+    rows = _per_name_diagnostics(
+        ["T0"],
+        np.array([0.2]),
+        np.array([0.1]),
+        np.array([[0.0]]),
+        np.array([0.04]),
+        True,
+        np.array([cap]),
+        np.array([eligible]),
+        np.array([floor]),
+        None if adv is None else np.array([adv]),
+        100_000.0,
+        _params(max_pct_adv=0.05),
+        turnover_binding=turnover,
+        binding_constraints_established=True,
+    )
+
+    assert rows["T0"] == {
+        "risk_contribution_share": None,
+        "alpha_uncertainty": pytest.approx(0.2),
+        "effective_name_cap": cap,
+        "binding_constraint": expected,
+    }
+
+
+def test_per_name_adjusted_path_suppresses_unestablished_binding() -> None:
+    rows = _per_name_diagnostics(
+        ["T0"],
+        np.array([0.2]),
+        np.array([0.1]),
+        np.array([[1.0]]),
+        np.array([0.0]),
+        False,
+        np.array([0.2]),
+        np.array([True]),
+        np.array([0.0]),
+        None,
+        None,
+        _params(),
+        turnover_binding=True,
+        binding_constraints_established=False,
+    )
+
+    assert rows["T0"]["binding_constraint"] == "none"
+    assert rows["T0"]["alpha_uncertainty"] is None
+
+
 def test_vol_target_constraint_binds_with_high_vol_universe():
     """High-vol actives + a vol_target below the cap-filling vol → optimizer backs off caps.
 
@@ -358,6 +452,10 @@ def test_infeasibility_falls_back_to_current_weights_plus_cash():
             "Fallback should preserve the rough current allocation profile "
             "(asset 0 was 0.50, SPY was 0.47)"
         )
+        assert all(
+            row["binding_constraint"] == "none" for row in result.diagnostics["per_name"].values()
+        )
+        json.dumps(result.diagnostics["per_name"], allow_nan=False)
 
 
 # ─── A.1 horizon-scaling tests ──────────────────────────────────────────────
