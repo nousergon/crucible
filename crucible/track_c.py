@@ -63,6 +63,7 @@ from crucible.keys import (
     BOARD_HTML_KEY,
     DRIFT_INPUTS,
     board_key,
+    daily_notice_marker_key,
     drift_input_key,
     drift_metrics_key,
     manifest_key,
@@ -75,7 +76,7 @@ from crucible.runner import (
     run_job,
     spot_interruption_guard,
 )
-from crucible.store import Store, open_store, sha256_hex
+from crucible.store import ETAG_ABSENT, PointerConflictError, Store, open_store, sha256_hex
 
 __all__ = [
     "console_handler",
@@ -918,6 +919,20 @@ def _send_daily_notice(store: Store, ctx: RunContext) -> None:
     and its pages, and a Telegram outage must not fail the one job that pages.
     """
     if ctx.started.astimezone(NYSE_TZ).date() != ctx.trading_day:
+        return
+    # Reserve the day BEFORE sending, create-only, so a rerun of the sweep or a
+    # re-launched process (the in-process retry is covered by the `finally`)
+    # finds the marker and sends nothing. The marker stays if delivery fails:
+    # a missed info message is cheaper than a duplicate, and nothing here is a page.
+    try:
+        store.compare_and_swap(daily_notice_marker_key(ctx.trading_day), ETAG_ABSENT, b"{}\n")
+    except PointerConflictError:
+        return
+    except Exception as exc:  # noqa: BLE001 - see docstring
+        print(
+            f"daily notice marker NOT created: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
         return
     day = previous_trading_day(ctx.trading_day).isoformat()
     try:
