@@ -187,7 +187,10 @@ def _probe_pin_refuses_an_unpublished_sha(store: Store) -> ClosedPath:
 
     expected = "StaleReleasePointerError, raised before any write"
     try:
-        pin(read_only(store), _UNPUBLISHABLE_SHA)
+        # This fixture deliberately probes the stale-pointer guard with a
+        # release shape that cannot carry a wheelhouse.  ``None`` is pin's
+        # explicit fault-fixture path; normal current pins retain the guard.
+        pin(read_only(store), _UNPUBLISHABLE_SHA, target=None)
     except StaleReleasePointerError as exc:
         return ClosedPath(
             path="`releases/current` comes to name a sha whose artifacts are absent",

@@ -1047,7 +1047,7 @@ def pin(
     store: Store,
     sha: str,
     *,
-    target: str = "current",
+    target: str | None = "current",
     expect: str | None = None,
     now: dt.datetime | None = None,
     trader_smoke: TraderSmokeEvidence | None = None,
@@ -1060,6 +1060,10 @@ def pin(
     the off-market-hours window; the check is repeated in this primitive so
     no second caller can move the trader's pin around the gate.
 
+    Current pins require a wheelhouse. ``target=None`` still writes the
+    current pointer but deliberately bypasses that check for fault fixtures
+    which need to construct a stale pre-wheelhouse pointer.
+
     ``expect`` is the version token the caller read. Omitting it means "swap
     against whatever is there right now", which is correct for an operator
     rollback — the operator has just looked — and wrong for an automated
@@ -1071,8 +1075,14 @@ def pin(
     against a v3-shaped path that release never occupied. This is the call
     site the bug actually bit: `release.pin <prior-sha>` IS the rollback
     command, and prior shas are precisely the ones with legacy wheel names.
+    Such a release also predates the wheelhouse, so a ``current`` pin to it
+    is still refused, by :func:`require_wheelhouse` rather than by a wheel
+    lookup against a path it never occupied.
     """
     _assert_sha(sha)
+    validate_wheelhouse = target == "current"
+    if target is None:
+        target = "current"
     if target not in PIN_TARGETS:
         raise ValueError(f"pin target {target!r} not in {PIN_TARGETS}")
     if target == "trader":
@@ -1094,7 +1104,10 @@ def pin(
             "trader smoke evidence was passed for target 'current'. The harness pointer is "
             "gated by the harness smoke (`flip_on_smoke`), never by the trader's."
         )
-    wheel = published_wheel_key(store, sha)
+    published = resolve_published_wheel(store, sha)
+    if validate_wheelhouse:
+        require_wheelhouse(published.record)
+    wheel = published.wheel_key
     if not store.exists(wheel):
         raise StaleReleasePointerError(
             f"refusing to pin {target} to {sha}: no wheel at {wheel}. A "
