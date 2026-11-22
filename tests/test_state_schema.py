@@ -38,7 +38,7 @@ def _render(monkeypatch, *, downgrade: bool = False) -> str:
     cfg = _config()
     cfg.output_buffer = io.StringIO()
     if downgrade:
-        command.downgrade(cfg, "0001:base", sql=True)
+        command.downgrade(cfg, "head:base", sql=True)
     else:
         command.upgrade(cfg, "head", sql=True)
     return cfg.output_buffer.getvalue()
@@ -48,9 +48,10 @@ def _norm(sql: str) -> str:
     return re.sub(r"\s+", " ", sql).strip()
 
 
-def _migration_module():
-    path = MIGRATIONS_DIR / "versions" / "0001_schema_v1.py"
-    spec = importlib.util.spec_from_file_location("crucible_state_0001", path)
+def _migration_module(revision: str = "0001"):
+    filename = {"0001": "0001_schema_v1.py", "0002": "0002_llm_trace_index.py"}[revision]
+    path = MIGRATIONS_DIR / "versions" / filename
+    spec = importlib.util.spec_from_file_location(f"crucible_state_{revision}", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -61,10 +62,11 @@ def _migration_module():
 # --------------------------------------------------------------------------
 
 
-def test_history_has_one_head_and_it_is_0001() -> None:
+def test_history_has_one_head_and_0002_follows_0001() -> None:
     script = ScriptDirectory.from_config(_config())
-    assert script.get_heads() == ["0001"]
+    assert script.get_heads() == ["0002"]
     assert script.get_revision("0001").down_revision is None
+    assert script.get_revision("0002").down_revision == "0001"
 
 
 def test_alembic_ini_carries_no_database_url() -> None:
@@ -88,7 +90,7 @@ def test_upgrade_creates_exactly_the_model_tables(monkeypatch) -> None:
     sql = _render(monkeypatch)
     created = set(re.findall(rf"CREATE TABLE {m.SCHEMA}\.(\w+) \(", sql))
     assert created == {t.name for t in m.metadata.sorted_tables}
-    assert set(_migration_module().TABLES) == created
+    assert set(_migration_module().TABLES) | {_migration_module("0002").TABLE} == created
     assert m.APPEND_ONLY_TABLES and set(m.APPEND_ONLY_TABLES) == created
 
 
@@ -119,6 +121,29 @@ def test_schema_is_plain_postgres(monkeypatch) -> None:
     sql = _render(monkeypatch).upper()
     assert "CREATE EXTENSION" not in sql
     assert "NEON" not in sql
+
+
+def test_llm_trace_index_is_metadata_only_searchable_and_hash_only_capable(monkeypatch) -> None:
+    table = m.llm_trace_index
+    assert [column.name for column in table.primary_key.columns] == ["trace_id", "span_id"]
+    assert table.c.content_s3_key.nullable
+    assert "prompt" not in table.c and "response" not in table.c
+    assert {index.name for index in table.indexes} == {
+        "llm_trace_index_call_site",
+        "llm_trace_index_model",
+        "llm_trace_index_route",
+        "llm_trace_index_input_hash",
+        "llm_trace_index_output_hash",
+    }
+    sql = _norm(_render(monkeypatch))
+    assert "CREATE TRIGGER llm_trace_index_append_only" in sql
+
+
+def test_0002_downgrade_refuses_to_discard_indexed_traces(monkeypatch) -> None:
+    sql = _render(monkeypatch, downgrade=True)
+    refuse = sql.index("downgrade of 0002 refused")
+    drop = sql.index(f"DROP TABLE {m.SCHEMA}.llm_trace_index")
+    assert refuse < drop
 
 
 # --------------------------------------------------------------------------
@@ -230,7 +255,7 @@ def test_money_ledger_shapes_match_the_producer() -> None:
 def test_downgrade_refuses_before_dropping_anything(monkeypatch) -> None:
     sql = _render(monkeypatch, downgrade=True)
     refuse = sql.index("downgrade of 0001 refused")
-    first_drop = sql.index("DROP TABLE")
+    first_drop = sql.index("DROP TABLE", refuse)
     assert refuse < first_drop
     for name in m.APPEND_ONLY_TABLES:
         assert f"EXISTS (SELECT 1 FROM {m.SCHEMA}.{name})" in sql

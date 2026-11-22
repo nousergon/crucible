@@ -23,10 +23,12 @@ from jsonschema import Draft202012Validator
 
 from crucible.deploy import main as deploy_main
 from crucible.release import (
+    POINTER_KEY,
     RELEASE_SCHEMA_VERSION,
     ReleaseHasNoWheelhouseError,
     ReleaseRecord,
     current_release,
+    pin,
     publish_release,
     read_pointer,
     release_json_key,
@@ -201,6 +203,36 @@ class TestTheReleaseV4Contract:
         assert all(k.startswith(f"releases/{SHA}/{WHEELHOUSE_DIRNAME}/") for k in keys)
         with pytest.raises(ValueError):
             wheelhouse_object_key(SHA, "nested/x.whl")
+
+    @pytest.mark.parametrize("target", [pytest.param("omitted", id="omitted"), "current"])
+    def test_current_pin_refuses_a_release_without_a_wheelhouse_before_writing(
+        self, tmp_path: Path, target: str
+    ) -> None:
+        store = LocalStore(tmp_path)
+        publish_release(
+            store, sha=SHA, wheel=b"w", lockfile=b"l", test_summary="", workflow_run_url=""
+        )
+        with pytest.raises(ReleaseHasNoWheelhouseError, match="Re-deploying THIS sha cannot"):
+            if target == "omitted":
+                pin(store, SHA)
+            else:
+                pin(store, SHA, target=target)
+        assert not store.exists(POINTER_KEY)
+
+    def test_current_pin_accepts_a_release_with_a_wheelhouse(self, tmp_path: Path) -> None:
+        store = LocalStore(tmp_path)
+        publish_v4(store, SHA)
+        pin(store, SHA)
+        assert current_release(store) == SHA
+
+    def test_empty_target_is_not_the_unvalidated_fixture_path(self, tmp_path: Path) -> None:
+        store = LocalStore(tmp_path)
+        publish_release(
+            store, sha=SHA, wheel=b"w", lockfile=b"l", test_summary="", workflow_run_url=""
+        )
+        with pytest.raises(ValueError, match="pin target"):
+            pin(store, SHA, target="")
+        assert not store.exists(POINTER_KEY)
 
 
 class TestThePublisherShipsTheWheelhouse:

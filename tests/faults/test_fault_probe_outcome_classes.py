@@ -59,6 +59,13 @@ FRIDAY = dt.date(2026, 8, 28)
 BUS_KEY = "alerts/2026-08-28/failure.fault.probe.json"
 
 
+def _put_bus_row(store: LocalStore, run_id: str) -> None:
+    """Write a valid bus row about ``run_id``: `record_fault` requires the row
+    to name the record's own run, so an empty `{}` row is (correctly) refused."""
+    row = {"alert_id": run_id, "alert_id_is_run_id": True, "members": []}
+    store.put_bytes(BUS_KEY, json.dumps(row).encode("utf-8"))
+
+
 class _StatusError(RuntimeError):
     """What an `openai.APIStatusError` presents to `crucible`: a `status_code`
     attribute and the upstream body in `str(exc)`.
@@ -271,20 +278,20 @@ class TestTheRecordRefusesEverythingButATransportFailure:
     def test_a_transport_failure_is_accepted(self, tmp_path, monkeypatch) -> None:
         store = LocalStore(tmp_path)
         manifest = _probe_manifest(store, monkeypatch, MEASURED_UPSTREAM_503)
-        store.put_bytes(BUS_KEY, b"{}")
+        _put_bus_row(store, manifest["run_id"])
         self._record(store, manifest)
 
     def test_an_upstream_4xx_is_refused(self, tmp_path, monkeypatch) -> None:
         store = LocalStore(tmp_path)
         manifest = _probe_manifest(store, monkeypatch, MEASURED_UPSTREAM_400)
-        store.put_bytes(BUS_KEY, b"{}")
+        _put_bus_row(store, manifest["run_id"])
         with pytest.raises(FaultRecordRefusedError, match="upstream_refusal"):
             self._record(store, manifest)
 
     def test_a_routing_refusal_is_refused(self, tmp_path, monkeypatch) -> None:
         store = LocalStore(tmp_path)
         manifest = _probe_manifest(store, monkeypatch, MEASURED_CONNECT_FAILURE_500)
-        store.put_bytes(BUS_KEY, b"{}")
+        _put_bus_row(store, manifest["run_id"])
         with pytest.raises(FaultRecordRefusedError, match="routing_refusal"):
             self._record(store, manifest)
 
@@ -300,7 +307,7 @@ class TestTheRecordRefusesEverythingButATransportFailure:
         with pytest.raises(ValueError):
             run_job(FAULT_PROBE_JOB, body, store=store, trading_day=FRIDAY, transient_retry=False)
         manifest = json.loads(store.get_bytes(manifest_key(FAULT_PROBE_JOB, FRIDAY.isoformat())))
-        store.put_bytes(BUS_KEY, b"{}")
+        _put_bus_row(store, manifest["run_id"])
         with pytest.raises(FaultRecordRefusedError, match="no fault-probe outcome"):
             self._record(store, manifest)
 
@@ -390,14 +397,14 @@ class TestANonProbeJobRoutedToFaultInjectionClassifiesToo:
     def test_a_4xx_is_refused(self, tmp_path, monkeypatch) -> None:
         store = LocalStore(tmp_path)
         manifest = _non_probe_manifest(store, monkeypatch, MEASURED_UPSTREAM_400)
-        store.put_bytes(BUS_KEY, b"{}")
+        _put_bus_row(store, manifest["run_id"])
         with pytest.raises(FaultRecordRefusedError, match="upstream_refusal"):
             self._record(store, manifest)
 
     def test_a_5xx_is_accepted(self, tmp_path, monkeypatch) -> None:
         store = LocalStore(tmp_path)
         manifest = _non_probe_manifest(store, monkeypatch, MEASURED_UPSTREAM_503)
-        store.put_bytes(BUS_KEY, b"{}")
+        _put_bus_row(store, manifest["run_id"])
         self._record(store, manifest)
 
     def test_a_job_routed_to_the_class_that_never_reached_the_router_is_refused(
@@ -423,7 +430,7 @@ class TestANonProbeJobRoutedToFaultInjectionClassifiesToo:
                 fault_capability_class="chaos_probe",
             )
         manifest = json.loads(store.get_bytes(manifest_key("experiment.run", FRIDAY.isoformat())))
-        store.put_bytes(BUS_KEY, b"{}")
+        _put_bus_row(store, manifest["run_id"])
         with pytest.raises(FaultRecordRefusedError, match="no fault-probe outcome"):
             self._record(store, manifest)
 
@@ -443,5 +450,5 @@ class TestANonProbeJobRoutedToFaultInjectionClassifiesToo:
             run_job("experiment.run", body, store=store, trading_day=FRIDAY, transient_retry=False)
         manifest = json.loads(store.get_bytes(manifest_key("experiment.run", FRIDAY.isoformat())))
         assert "fault_capability_class" not in manifest
-        store.put_bytes(BUS_KEY, b"{}")
+        _put_bus_row(store, manifest["run_id"])
         self._record(store, manifest)

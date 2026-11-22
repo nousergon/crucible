@@ -120,6 +120,20 @@
           "title": "Description",
           "type": "string"
         },
+        "economic_window_trading_days": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The economic window named by a _<N>d_ name segment when it differs from the total history requirement. When absent, the name's window is checked against window_trading_days.",
+          "title": "Economic Window Trading Days"
+        },
         "expression": {
           "description": "How the column is computed, as the registry states it. Lineage is a field, not a comment.",
           "minLength": 1,
@@ -181,7 +195,7 @@
               "type": "null"
             }
           ],
-          "description": "A count of SESSIONS (\u00a74.12), never calendar days. Null for a point-in-time column reading only the current row. Zero and negative are refused -- a window is at least one session.",
+          "description": "The column's total history requirement, as a count of SESSIONS (\u00a74.12), never calendar days. Null for a point-in-time column reading only the current row. Zero and negative are refused -- a window is at least one session.",
           "title": "Window Trading Days"
         }
       },
