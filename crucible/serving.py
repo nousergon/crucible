@@ -53,10 +53,11 @@ guarantee.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Protocol, cast
 
 from pydantic import ValidationError
 
@@ -104,19 +105,19 @@ PREDICTIONS_FEED_SLOT = "m"
 #: check is not applied — a handful of names can legitimately share a sign.
 MIN_NAMES_FOR_SIGN_CHECK = 50
 
-#: Warn before either sign side disappears (`alpha-engine-config-I14283`).
+#: Warn before either sign side disappears and the feed is refused
+#: (`alpha-engine-config-I14283`).
 MINORITY_SIDE_WARN_FRACTION = 0.05
 
 type JsonValue = str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]
 
 
 class _OutputRecorder(Protocol):
+    started: dt.datetime
+
     def record_output(self, key: str, payload: bytes, schema_version: str = "v1") -> None: ...
 
-    def record_metric(
-        self,
-        metric: dict[str, Any],  # pyright: ignore[reportExplicitAny] - runner API
-    ) -> None: ...
+    def record_metric(self, metric: dict[str, JsonValue]) -> None: ...
 
 
 class PredictionsFeedContractError(RuntimeError):
@@ -384,36 +385,57 @@ def _publish(
     _assert_two_sided(feed.predicted_alpha, source_key=source_key, arm_id=arm_id)
     key = predictions_key(trading_day)
     if ctx is not None:
-        below = sum(value < 0 for value in feed.predicted_alpha.values())
-        above = sum(value > 0 for value in feed.predicted_alpha.values())
-        minority_fraction = min(below, above) / max(len(feed.predicted_alpha), 1)
-        metrics = (
-            ("m_feed_names_below_zero", float(below), "count"),
-            ("m_feed_names_above_zero", float(above), "count"),
-            ("m_feed_minority_side_fraction", minority_fraction, "fraction"),
-            (
-                "m_feed_minority_side_thin",
-                float(minority_fraction < MINORITY_SIDE_WARN_FRACTION),
-                "count",
-            ),
-        )
-        for name, value, unit in metrics:
-            ctx.record_metric(
-                {
-                    "name": name,
-                    "module": "crucible.serving",
-                    "metric_type": "gauge",
-                    "value": value,
-                    "unit": unit,
-                    "n_floor": 1,
-                    "status": "OK",
-                    "status_reason": f"M feed contains {below} names below and {above} above zero",
-                }
-            )
         ctx.record_output(key, feed.to_bytes(), schema_version=PREDICTIONS_FEED_SCHEMA_VERSION)
+        _record_sign_side_metrics(ctx, feed.predicted_alpha, source_key=source_key)
     else:
         store.put_bytes(key, feed.to_bytes())
     return key
+
+
+def _record_sign_side_metrics(
+    ctx: _OutputRecorder, predicted_alpha: dict[str, float], *, source_key: str
+) -> None:
+    """Record the M feed's sign balance after its two-sided check passes."""
+    below = sum(1 for value in predicted_alpha.values() if value < 0)
+    above = sum(1 for value in predicted_alpha.values() if value > 0)
+    minority_fraction = min(below, above) / len(predicted_alpha)
+    thin = minority_fraction < MINORITY_SIDE_WARN_FRACTION
+    updated = ctx.started.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    common: dict[str, JsonValue] = {
+        "module": "crucible.serving",
+        "metric_type": "gauge",
+        "n_floor": MIN_NAMES_FOR_SIGN_CHECK,
+        "status": "OK",
+        "source_path": source_key,
+        "last_updated_utc": updated,
+    }
+    for name, value, unit in (
+        ("m_feed_names_below_zero", float(below), "count"),
+        ("m_feed_names_above_zero", float(above), "count"),
+        ("m_feed_minority_side_fraction", minority_fraction, "fraction"),
+    ):
+        ctx.record_metric(
+            {
+                **common,
+                "name": name,
+                "value": value,
+                "unit": unit,
+                "status_reason": f"published M feed has {below} names below and {above} above zero",
+            }
+        )
+    ctx.record_metric(
+        {
+            **common,
+            "name": "m_feed_minority_side_thin",
+            "value": 1.0 if thin else 0.0,
+            "unit": "bool",
+            "status": "BREACH" if thin else "OK",
+            "status_reason": (
+                f"minority sign side is {minority_fraction:.3%}; warning threshold is "
+                f"{MINORITY_SIDE_WARN_FRACTION:.0%}"
+            ),
+        }
+    )
 
 
 def _assert_two_sided(predicted_alpha: dict[str, float], *, source_key: str, arm_id: str) -> None:
