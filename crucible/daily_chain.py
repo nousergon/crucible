@@ -1,4 +1,4 @@
-"""The daily chain: `data.daily`, then `serve.daily` m, u, s, one writer at a time.
+"""The daily chain: `data.daily`, regime recording, then serving m, u, s.
 
 `alpha-engine-config-I12020`. Measured 2026-10-07 and 2026-10-08:
 nousergon-data's EOD collection failed and its heals did not converge until a
@@ -372,6 +372,22 @@ def run_serve_chain(
             "slot's place in DAILY_CHAIN_SERVE_ORDER rather than leave it unserved."
         )
     codes: dict[str, int] = {}
+    regime_argv = ["regime.daily", "--date", trading_day.isoformat()]
+    if run_mode:
+        regime_argv += ["--run-mode", run_mode]
+    if store:
+        regime_argv += ["--store", store]
+    if dry_run:
+        regime_argv.append("--dry-run")
+    try:
+        codes["regime"] = int(main(regime_argv))
+    except SystemExit as exc:
+        codes["regime"] = 0 if exc.code is None else exc.code if isinstance(exc.code, int) else 1
+    except Exception:  # noqa: BLE001 - printed here, surfaced as the caller's exit
+        import traceback  # noqa: PLC0415
+
+        traceback.print_exc()
+        codes["regime"] = 1
     for slot in DAILY_CHAIN_SERVE_ORDER:
         argv = ["serve.daily", "--slot", slot, "--date", trading_day.isoformat(), "--skip-if-ok"]
         if run_mode:

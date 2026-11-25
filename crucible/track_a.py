@@ -20,8 +20,9 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 from crucible.backfill import run_backfill
 from crucible.calendar import is_trading_day, resolve_trading_day
@@ -253,11 +254,185 @@ def handle_data_daily(args: argparse.Namespace) -> int:
     failed = sorted(slot for slot, slot_code in codes.items() if slot_code != 0)
     if failed:
         print(
-            f"--then-serve: serve.daily failed for slot(s) {failed} on {day}; "
+            f"--then-serve: daily chain failed for step(s) {failed} on {day}; "
             "each filed its own manifest."
         )
         return 1
     return code
+
+
+def _regime_metric(ctx: RunContext, name: str, value: float | None, detail: str) -> None:
+    ctx.record_metric(
+        {
+            "name": name,
+            "module": "crucible.regime_store",
+            "metric_type": "gauge",
+            "value": value,
+            "unit": "count" if name != "stress_score" else "z-score",
+            "n_floor": 0,
+            "status": "OK",
+            "status_reason": detail,
+            "source_path": "regime/",
+            "last_updated_utc": ctx.started.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+    )
+
+
+def handle_regime_daily(args: argparse.Namespace) -> int:
+    """Write one bounded-window regime reading before the serving slots run."""
+    from crucible.features import DEFAULT_FEATURE_VERSION  # noqa: PLC0415
+    from crucible.regime import (  # noqa: PLC0415
+        REGIME_HISTORY_SESSIONS,
+        regime_day_for_window,
+        regime_document_bytes,
+    )
+    from crucible.regime_store import (  # noqa: PLC0415
+        assert_no_gaps,
+        compiled_sessions,
+        load_regime_params_from_store,
+        read_regime_frame,
+        select_window,
+        write_regime_document,
+    )
+
+    config = _settings(args)
+    store = config.store()
+    day = args.trading_day.isoformat()
+    result: dict[str, object] = {}
+
+    def job(ctx: RunContext) -> None:
+        params = load_regime_params_from_store(store=store, strategy_dir=config.strategy_dir)
+        window = select_window(compiled_sessions(store, DEFAULT_FEATURE_VERSION), day)
+        if len(window) < REGIME_HISTORY_SESSIONS:
+            raise ValueError(
+                f"regime.daily found {len(window)} compiled sessions for "
+                f"{DEFAULT_FEATURE_VERSION}; requires {REGIME_HISTORY_SESSIONS}"
+            )
+        assert_no_gaps(window)
+        from crucible.regime import Panel  # noqa: PLC0415
+
+        reading = regime_day_for_window(
+            cast(Panel, read_regime_frame(store, DEFAULT_FEATURE_VERSION, window, ctx)), params
+        )
+        outcome = write_regime_document(ctx, store, day, regime_document_bytes(reading))
+        result.update(state=reading.state, stress_score=reading.stress_score, write=outcome)
+        _regime_metric(ctx, "regime_state", None, f"state is {reading.state}")
+        _regime_metric(ctx, "stress_score", reading.stress_score, "daily regime score")
+        _regime_metric(ctx, "regime_write", 1.0 if outcome == "written" else 0.0, outcome)
+
+    with _daily_chain_lease(store, "regime.daily", args):
+        ctx = run_job(
+            "regime.daily",
+            job,
+            store=store,
+            trading_day=args.trading_day,
+            run_mode=getattr(args, "run_mode", None),
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
+    print(json.dumps({"run_id": ctx.run_id, **result}, indent=2))
+    return 0
+
+
+def handle_regime_backfill(args: argparse.Namespace) -> int:
+    """Idempotently write regime readings for every compiled session in a range."""
+    from crucible.backfill import assert_in_region, sessions_in_range  # noqa: PLC0415
+    from crucible.features import DEFAULT_FEATURE_VERSION  # noqa: PLC0415
+    from crucible.keys import regime_key  # noqa: PLC0415
+    from crucible.regime import (  # noqa: PLC0415
+        REGIME_HISTORY_SESSIONS,
+        regime_day_for_window,
+        regime_document_bytes,
+    )
+    from crucible.regime_store import (  # noqa: PLC0415
+        RegimeConflictError,
+        assert_no_gaps,
+        compiled_sessions,
+        load_regime_params_from_store,
+        read_regime_frame,
+        select_window,
+        write_regime_document,
+    )
+
+    config = _settings(args)
+    store = config.store()
+    start = dt.date.fromisoformat(args.from_date)
+    end = dt.date.fromisoformat(args.to_date)
+    wanted = sessions_in_range(start, end)
+    assert_in_region(
+        wanted,
+        slot="regime",
+        arm="state",
+        start=start,
+        end=end,
+        i_am_in_region=bool(args.i_am_in_region),
+    )
+    result: dict[str, int] = {}
+
+    def job(ctx: RunContext) -> None:
+        sessions = compiled_sessions(store, DEFAULT_FEATURE_VERSION)
+        days = [day.isoformat() for day in wanted]
+        for day in days:
+            if day not in sessions:
+                raise ValueError(f"no compiled feature session for {day}")
+        if not days:
+            raise ValueError(f"the range {start}..{end} contains no trading days")
+        first = sessions.index(days[0])
+        read_days = sessions[max(0, first - REGIME_HISTORY_SESSIONS + 1) :]
+        read_days = [day for day in read_days if day <= days[-1]]
+        assert_no_gaps(read_days)
+        frame = read_regime_frame(store, DEFAULT_FEATURE_VERSION, read_days, ctx)
+        params = load_regime_params_from_store(store=store, strategy_dir=config.strategy_dir)
+        bodies: dict[str, bytes] = {}
+        stated = 0
+        for day in days:
+            window = select_window(sessions, day)
+            import pandas as pd  # pyright: ignore[reportMissingTypeStubs]  # noqa: PLC0415
+
+            from crucible.regime import Panel  # noqa: PLC0415
+
+            trading_days = cast(pd.Series, frame["trading_day"])
+            subset = cast(
+                pd.DataFrame,
+                frame.loc[
+                    trading_days.astype(str).isin(window)  # pyright: ignore[reportUnknownMemberType]
+                ],
+            )
+            reading = regime_day_for_window(cast(Panel, subset), params)
+            bodies[day] = regime_document_bytes(reading)
+            stated += int(reading.stress_score is not None and math.isfinite(reading.stress_score))
+        conflicts = [
+            regime_key(day)
+            for day, body in bodies.items()
+            if store.exists(regime_key(day)) and store.get_bytes(regime_key(day)) != body
+        ]
+        if conflicts:
+            raise RegimeConflictError(f"write-once regime documents differ at {conflicts}")
+        written = 0
+        unchanged = 0
+        for day, body in bodies.items():
+            outcome = write_regime_document(ctx, store, day, body)
+            written += outcome == "written"
+            unchanged += outcome == "unchanged"
+        result.update(
+            written=written,
+            unchanged=unchanged,
+            stated=stated,
+            unstated=len(days) - stated,
+        )
+        for name, value in result.items():
+            _regime_metric(ctx, name, float(value), f"regime backfill {name}")
+
+    ctx = run_job(
+        "regime.backfill",
+        job,
+        store=store,
+        trading_day=end,
+        run_mode=getattr(args, "run_mode", None),
+        dry_run=bool(getattr(args, "dry_run", False)),
+        discriminator=invocation_discriminator,
+    )
+    print(json.dumps({"run_id": ctx.run_id, **result}, indent=2))
+    return 0
 
 
 def _daily_chain_lease(store: Any, job: str, args: argparse.Namespace) -> Any:
@@ -1452,6 +1627,8 @@ HANDLERS = {
     "experiment.retire": handle_experiment_retire,
     "experiment.grade": handle_experiment_grade,
     "serve.daily": handle_serve_daily,
+    "regime.daily": handle_regime_daily,
+    "regime.backfill": handle_regime_backfill,
     "explain": handle_explain,
 }
 
@@ -1564,17 +1741,20 @@ def add_track_a_arguments(name: str, sub: argparse.ArgumentParser) -> None:
         sub.add_argument(
             "--i-am-in-region",
             action="store_true",
-            help=(
-                "Override the in-region guard. The ONLY override — same rule and same "
-                "reason as `data.heal`: the failure mode is an operator in a hurry."
-            ),
+            help="Override the in-region guard; the only override.",
         )
+    if name == "regime.backfill":
+        sub.add_argument("--from", dest="from_date", required=True, metavar="YYYY-MM-DD")
+        sub.add_argument("--to", dest="to_date", required=True, metavar="YYYY-MM-DD")
+        sub.add_argument("--i-am-in-region", action="store_true")
     if name in (
         "experiment.new",
         "experiment.register",
         "experiment.run",
         "experiment.backfill",
         "experiment.grade",
+        "regime.daily",
+        "regime.backfill",
     ):
         sub.add_argument(
             "--strategy-dir",

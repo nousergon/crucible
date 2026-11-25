@@ -398,6 +398,50 @@ components:
     dispatch: null
     deadline: null
 
+  regime.daily:
+    description: >-
+      Record the trading day's bounded-window market regime before the serving
+      slots run. A failure files its own manifest and never blocks M, U or S.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs,outputs[regime/{trading_day}.json],rows_in,rows_out,rows_rejected
+      outcome: run.json:metrics[regime_state,stress_score,regime_write]
+    log_location: cloudwatch:/crucible/regime.daily
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/slots
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: weekdays after data.daily
+    dispatch: scheduler
+    deadline:
+      anchor: close_plus
+      cadence: daily
+      offset_hours: 7
+
+  regime.backfill:
+    description: >-
+      Write the same daily regime artifacts over a historical feature-layer range.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs,outputs[regime/{trading_day}.json],rows_in,rows_out,rows_rejected
+      outcome: run.json:metrics[written,unchanged,stated,unstated]
+    log_location: cloudwatch:/crucible/regime.backfill
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/slots
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: null
+    dispatch: null
+    deadline: null
+
   serve.daily:
     description: >-
       One slot's daily output for one trading day, so the weekly arc is not the
