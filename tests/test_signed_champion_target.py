@@ -34,6 +34,7 @@ Asserted here, each against the shape that broke:
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import pytest
 from nousergon_lib.arena import ArmRegister, ArmSeries
@@ -54,6 +55,7 @@ from crucible.keys import (
 from crucible.promote import PromotionRefused, revert_champion, run_promotion
 from crucible.serving import (
     MIN_NAMES_FOR_SIGN_CHECK,
+    MINORITY_SIDE_WARN_FRACTION,
     OneSidedCrossSectionError,
     publish_predictions_feed,
     read_predictions_feed,
@@ -382,6 +384,21 @@ def _alpha(n: int, value: float) -> dict[str, float]:
     return {f"N{i:03d}": value for i in range(n)}
 
 
+class _Recorder:
+    def __init__(self) -> None:
+        self.metrics: list[dict[str, Any]] = []  # pyright: ignore[reportExplicitAny]
+        self.outputs: list[str] = []
+
+    def record_metric(
+        self,
+        metric: dict[str, Any],  # pyright: ignore[reportExplicitAny]
+    ) -> None:
+        self.metrics.append(metric)
+
+    def record_output(self, key: str, payload: bytes, schema_version: str = "v1") -> None:
+        self.outputs.append(key)
+
+
 class TestAOneSidedCrossSectionIsRefused:
     @pytest.fixture
     def seated(self, tmp_path):
@@ -423,4 +440,44 @@ class TestAOneSidedCrossSectionIsRefused:
         alpha["N000"] = -0.01
         _cross_section(store, arm_id, as_of, alpha)
         publish_predictions_feed(store, trading_day=as_of)
+        assert read_predictions_feed(store, as_of).predicted_alpha == alpha
+
+    @pytest.mark.parametrize(("negative_count", "thin"), [(3, 1.0), (10, 0.0)])
+    def test_the_minority_side_is_recorded_before_it_disappears(
+        self, seated, negative_count: int, thin: float
+    ) -> None:
+        store, arm_id, as_of = seated
+        alpha = _alpha(100, 0.01)
+        alpha.update({f"N{i:03d}": -0.01 for i in range(negative_count)})
+        _cross_section(store, arm_id, as_of, alpha)
+        recorder = _Recorder()
+
+        publish_predictions_feed(store, trading_day=as_of, ctx=recorder)
+
+        metrics = {metric["name"]: metric for metric in recorder.metrics}
+        assert metrics["m_feed_names_below_zero"]["value"] == negative_count
+        assert metrics["m_feed_names_above_zero"]["value"] == 100 - negative_count
+        assert metrics["m_feed_minority_side_fraction"]["value"] == negative_count / 100
+        assert metrics["m_feed_minority_side_fraction"]["unit"] == "fraction"
+        assert metrics["m_feed_minority_side_thin"]["value"] == thin
+        assert MINORITY_SIDE_WARN_FRACTION == 0.05
+
+    def test_a_refused_feed_records_no_metric(self, seated) -> None:
+        store, arm_id, as_of = seated
+        _cross_section(store, arm_id, as_of, _alpha(100, 0.01))
+        recorder = _Recorder()
+
+        with pytest.raises(OneSidedCrossSectionError):
+            publish_predictions_feed(store, trading_day=as_of, ctx=recorder)
+
+        assert recorder.metrics == []
+
+    def test_no_context_publishes_without_metrics(self, seated) -> None:
+        store, arm_id, as_of = seated
+        alpha = _alpha(100, 0.01)
+        alpha["N000"] = -0.01
+        _cross_section(store, arm_id, as_of, alpha)
+
+        publish_predictions_feed(store, trading_day=as_of, ctx=None)
+
         assert read_predictions_feed(store, as_of).predicted_alpha == alpha

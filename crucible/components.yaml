@@ -413,7 +413,7 @@ components:
       cost: run.json:cost_usd
       resource: run.json:resource
       lineage: run.json:inputs,outputs[predictions/{trading_day}.json,arm_predictions/*/{trading_day}.json,universe/{trading_day}/members.json,experiments/*/{trading_day}/session_inputs.json],rows_in,rows_out,rows_rejected
-      outcome: run.json:metrics[daily_feed_published,daily_session_inputs_recorded]
+      outcome: run.json:metrics[daily_feed_published,daily_session_inputs_recorded,m_feed_minority_side_fraction]
     log_location: cloudwatch:/crucible/serve.daily
     log_retention_days: 90
     alert_channel: telegram:crucible-pages

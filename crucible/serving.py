@@ -56,7 +56,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 from pydantic import ValidationError
 
@@ -69,6 +69,7 @@ from crucible.store import Store
 
 __all__ = [
     "MIN_NAMES_FOR_SIGN_CHECK",
+    "MINORITY_SIDE_WARN_FRACTION",
     "PREDICTIONS_FEED_SCHEMA_VERSION",
     "PREDICTIONS_FEED_SLOT",
     "OneSidedCrossSectionError",
@@ -103,11 +104,19 @@ PREDICTIONS_FEED_SLOT = "m"
 #: check is not applied — a handful of names can legitimately share a sign.
 MIN_NAMES_FOR_SIGN_CHECK = 50
 
+#: Warn before either sign side disappears (`alpha-engine-config-I14283`).
+MINORITY_SIDE_WARN_FRACTION = 0.05
+
 type JsonValue = str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]
 
 
 class _OutputRecorder(Protocol):
     def record_output(self, key: str, payload: bytes, schema_version: str = "v1") -> None: ...
+
+    def record_metric(
+        self,
+        metric: dict[str, Any],  # pyright: ignore[reportExplicitAny] - runner API
+    ) -> None: ...
 
 
 class PredictionsFeedContractError(RuntimeError):
@@ -375,6 +384,32 @@ def _publish(
     _assert_two_sided(feed.predicted_alpha, source_key=source_key, arm_id=arm_id)
     key = predictions_key(trading_day)
     if ctx is not None:
+        below = sum(value < 0 for value in feed.predicted_alpha.values())
+        above = sum(value > 0 for value in feed.predicted_alpha.values())
+        minority_fraction = min(below, above) / max(len(feed.predicted_alpha), 1)
+        metrics = (
+            ("m_feed_names_below_zero", float(below), "count"),
+            ("m_feed_names_above_zero", float(above), "count"),
+            ("m_feed_minority_side_fraction", minority_fraction, "fraction"),
+            (
+                "m_feed_minority_side_thin",
+                float(minority_fraction < MINORITY_SIDE_WARN_FRACTION),
+                "count",
+            ),
+        )
+        for name, value, unit in metrics:
+            ctx.record_metric(
+                {
+                    "name": name,
+                    "module": "crucible.serving",
+                    "metric_type": "gauge",
+                    "value": value,
+                    "unit": unit,
+                    "n_floor": 1,
+                    "status": "OK",
+                    "status_reason": f"M feed contains {below} names below and {above} above zero",
+                }
+            )
         ctx.record_output(key, feed.to_bytes(), schema_version=PREDICTIONS_FEED_SCHEMA_VERSION)
     else:
         store.put_bytes(key, feed.to_bytes())
