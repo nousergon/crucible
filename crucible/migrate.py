@@ -35,7 +35,7 @@ import datetime as dt
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, TypedDict, cast
+from typing import TYPE_CHECKING, cast
 
 from crucible.calendar import is_trading_day, resolve_trading_day
 from crucible.carryover import V1_ZOO_CHAMPION_NAME, V1_ZOO_LEADERBOARD_KEY, read_production
@@ -54,6 +54,9 @@ if TYPE_CHECKING:
     from crucible.runner import RunContext
     from crucible.slots.model import ModelRecipe, RegisteredModelArm
     from crucible.store import Store
+
+type JsonObject = dict[str, object]
+type MigratableRecipe = ArmSpec | RegisteredModelArm
 
 #: `alpha-engine-config-I10506`/`crucible.promote._PLACEHOLDER_CODE_SHA`:
 #: same value, same reasoning — kept local rather than imported from
@@ -110,7 +113,7 @@ class V1Source:
     #: `champion` key and it is a metrics block, not a name, so the sniff
     #: would have read `{"forward_days": 21, ...}` as an arm the moment M was
     #: admitted (measured 2026-09-17, `alpha-engine-config-I10961`).
-    champion: Callable[[dict[str, object]], str | None] | None = None
+    champion: Callable[[JsonObject], str | None] | None = None
     #: The field of a champion-pointer document that carries the date the
     #: v1 champion was installed, or ``None`` when the v1 document carries no
     #: such date at all. Declared per source rather than assumed to be
@@ -139,7 +142,7 @@ class V1Source:
         return self.key.split("{date}")[0]
 
 
-def _pointer_champion(document: dict[str, object]) -> str | None:
+def _pointer_champion(document: JsonObject) -> str | None:
     """A v1 champion POINTER document names its champion in `champion`."""
     champion = document.get("champion")
     if champion is None:
@@ -152,7 +155,7 @@ def _pointer_champion(document: dict[str, object]) -> str | None:
     return champion
 
 
-def _zoo_champion_arch(document: dict[str, object]) -> str | None:
+def _zoo_champion_arch(document: JsonObject) -> str | None:
     """v1's M champion, which is not a pointer document but a FIELD of the zoo
     leaderboard (`alpha-engine-config-I10961` deliverable 2).
 
@@ -174,8 +177,7 @@ def _zoo_champion_arch(document: dict[str, object]) -> str | None:
     if document.get("champion_arch") is None:
         return None
     serving = document.get("serving_champion")
-    serving_document = cast(dict[object, object], serving) if isinstance(serving, dict) else {}
-    served = serving_document.get("served_version")
+    served = cast(JsonObject, serving).get("served_version") if isinstance(serving, dict) else None
     if not isinstance(served, str) or not served:
         raise MigrationSourceMissing(
             f"the v1 zoo leaderboard names its serving architecture "
@@ -263,13 +265,13 @@ MIGRATABLE_SLOTS: tuple[str, ...] = tuple(
 )
 
 
-def read_v1_json(store: Store, key: str) -> dict[str, object] | None:
+def read_v1_json(store: Store, key: str) -> JsonObject | None:
     """Read one v1 JSON artifact, or ``None`` when it is absent. Never raises on 404."""
     if not store.exists(key):
         return None
     # STRICT face of the one reader: a present v1 artifact that is not an
     # object stops the migration with the key named (rule 5).
-    return cast(dict[str, object], load_store_document(store, key))
+    return cast(JsonObject, load_store_document(store, key))
 
 
 @dataclass(frozen=True)
@@ -288,13 +290,13 @@ class V1ModelTree:
     """
 
     declared: tuple[ModelRecipe, ...] = ()
-    registrable: tuple[ArmSpec | RegisteredModelArm, ...] = ()
+    registrable: tuple[MigratableRecipe, ...] = ()
     refused: Mapping[str, str] = field(default_factory=lambda: {})
 
 
 def served_model_recipe(
     tree: V1ModelTree, *, slot: str, served_version: str
-) -> tuple[ArmSpec | RegisteredModelArm | None, str | None]:
+) -> tuple[RegisteredModelArm | None, str | None]:
     """The registrable v2 recipe that reproduces v1's served model, or why none.
 
     The adapter `alpha-engine-config-I10961` deliverable 2 asks for. v1 names
@@ -367,7 +369,7 @@ def served_model_recipe(
             f"{model.name!r} ({model.arm_id}), and the release registers no arm under that "
             "id, so a pointer at it would never be scored."
         )
-    return registered, None
+    return cast("RegisteredModelArm", registered), None
 
 
 def _bootstrap_spec(
@@ -448,19 +450,6 @@ def admission_refusal(store: Store, *, slot: str, arm_id: str) -> str | None:
     )
 
 
-class _FoundSource(TypedDict, total=False):
-    source: str
-    key: str
-    n_artifacts: int
-    document: dict[str, object]
-
-
-class _MissingSource(TypedDict):
-    source: str
-    key: str
-    reason: str
-
-
 def run_migrate_history(
     ctx: RunContext,
     *,
@@ -470,7 +459,7 @@ def run_migrate_history(
     model_tree: V1ModelTree | None = None,
     allow_missing: bool = False,
     dry_run: bool = False,
-) -> dict[str, object]:
+) -> JsonObject:
     """Import v1 lineage into the v2 register and ledger.
 
     ``arm_recipes`` maps a v1 champion NAME to the v2 recipe that reproduces
@@ -519,8 +508,8 @@ def run_migrate_history(
     hour later, and v1 is being decommissioned underneath the sources.
     """
     recipes = arm_recipes or {}
-    found: list[_FoundSource] = []
-    missing: list[_MissingSource] = []
+    found: list[JsonObject] = []
+    missing: list[JsonObject] = []
 
     for source in SOURCES:
         if "{date}" in source.key:
@@ -571,19 +560,20 @@ def run_migrate_history(
     imported: dict[str, list[str]] = {}
     pointers: dict[str, str] = {}
     deferred: dict[str, str] = {}
-    planned: list[tuple[str, ArmSpec | RegisteredModelArm, V1Source, str, str, str, str, str]] = []
-    documents_by_source: dict[str, dict[str, object]] = {}
+    planned: list[tuple[str, MigratableRecipe, V1Source, str, str, str, str, str]] = []
+    documents_by_source: dict[str, JsonObject] = {}
     for item in found:
-        document = item.get("document")
         source_name = item.get("source")
-        if document is not None and source_name is not None:
-            documents_by_source[source_name] = document
+        document = item.get("document")
+        if isinstance(source_name, str) and isinstance(document, dict):
+            documents_by_source[source_name] = cast(JsonObject, document)
     for slot in slots if slots is not None else MIGRATABLE_SLOTS:
         source = next((s for s in SOURCES if s.slot == slot and s.champion is not None), None)
         pointer = documents_by_source.get(source.name) if source is not None else None
-        champion_name = None
-        if source is not None and source.champion is not None and pointer is not None:
-            champion_name = source.champion(pointer)
+        champion_reader = source.champion if source is not None else None
+        champion_name = (
+            champion_reader(pointer) if champion_reader and pointer is not None else None
+        )
         if champion_name is None:
             why = (
                 f"no v1 champion source is declared for slot {slot!r}"
@@ -600,7 +590,7 @@ def run_migrate_history(
             pointers[slot] = "no_v1_pointer"
             deferred[slot] = why
             continue
-        assert source is not None and pointer is not None
+        assert source is not None and source.champion is not None and pointer is not None
         if source.resolves_by == V1_SERVED_MODEL:
             if model_tree is None:
                 recipe = None
@@ -623,12 +613,12 @@ def run_migrate_history(
                 "provenance. Supply it in `arm_recipes`."
             )
         if recipe is None:
-            refusal_reason = why or "no matching v2 recipe"
+            assert why is not None
             if asserted:
-                raise MigrationSourceMissing(refusal_reason)
+                raise MigrationSourceMissing(why)
             imported[slot] = []
             pointers[slot] = "deferred"
-            deferred[slot] = refusal_reason
+            deferred[slot] = why
             continue
         if recipe.slot != slot:
             why = (
@@ -740,10 +730,10 @@ def run_migrate_history(
         pointer_key = champion_key(slot)
         expected = ctx.store.etag(pointer_key)
         if expected != ETAG_ABSENT:
-            existing = cast(dict[str, object], load_store_document(ctx.store, pointer_key))
+            existing = cast(JsonObject, load_store_document(ctx.store, pointer_key))
             raw_evidence = existing.get("evidence")
             existing_evidence = (
-                cast(dict[object, object], raw_evidence) if isinstance(raw_evidence, dict) else {}
+                cast(JsonObject, raw_evidence) if isinstance(raw_evidence, dict) else {}
             )
             if (
                 existing.get("arm_id") == spec.arm_id
@@ -859,7 +849,7 @@ def run_migrate_history(
         # swap raises `PointerConflictError` rather than being overwritten.
         ctx.record_output_cas(pointer_key, expected, payload, schema_version="champion.v1")
 
-    result: dict[str, object] = {
+    result: JsonObject = {
         "schema_version": "migration.v1",
         "sources_found": [{k: v for k, v in f.items() if k != "document"} for f in found],
         "sources_missing": missing,
@@ -915,9 +905,7 @@ def run_migrate_history(
     return result
 
 
-def _date_of(
-    pointer: dict[str, object], *, source: V1Source, recipe: ArmSpec | RegisteredModelArm
-) -> tuple[str, str]:
+def _date_of(pointer: JsonObject, *, source: V1Source, recipe: MigratableRecipe) -> tuple[str, str]:
     """The imported arm's start date as an ISO date, and where it came from.
 
     Taken from the v1 artifact when the source declares a date field: the OOS
@@ -935,11 +923,8 @@ def _date_of(
     if source.date_field is None:
         # An M arm is a `RegisteredModelArm` wrapping the `ModelRecipe` that
         # carries the provenance; a U/R `ArmSpec` carries it itself.
-        origin = (
-            recipe.source_key
-            if isinstance(recipe, ArmSpec)
-            else recipe.recipe.source_key
-        ) or recipe.name
+        origin_recipe = recipe.recipe if not isinstance(recipe, ArmSpec) else recipe
+        origin = origin_recipe.source_key or recipe.name
         return (
             recipe.registered_at,
             f"the recipe's registered_at ({origin}); {source.key} carries no installation date",
@@ -1062,8 +1047,8 @@ class CodeShaMigrationReport:
 
     migration_run_id: str
     dry_run: bool
-    rewritten: tuple[dict[str, object], ...] = ()
-    refused: tuple[dict[str, object], ...] = ()
+    rewritten: tuple[JsonObject, ...] = ()
+    refused: tuple[JsonObject, ...] = ()
 
     @property
     def counts(self) -> dict[str, int]:
@@ -1073,7 +1058,7 @@ class CodeShaMigrationReport:
         suffix = " (dry run — nothing written)" if self.dry_run else ""
         return f"{len(self.rewritten)} rewritten, {len(self.refused)} refused{suffix}"
 
-    def as_dict(self) -> dict[str, object]:
+    def as_dict(self) -> JsonObject:
         return {
             "schema_version": "migrate_code_sha.v1",
             "migration_run_id": self.migration_run_id,
@@ -1101,7 +1086,7 @@ def _parse_utc_instant(raw: object) -> dt.datetime | None:
 
 
 def _successful_deploy_events(
-    documents: list[tuple[str, dict[str, object]]],
+    documents: list[tuple[str, JsonObject]],
 ) -> list[tuple[dt.datetime, str, str]]:
     """Every successful `deploy` manifest as ``(finished_at, code_sha, key)``,
     oldest first.
@@ -1128,7 +1113,7 @@ def _successful_deploy_events(
 
 
 def _conflicting_same_day_peers(
-    documents: list[tuple[str, dict[str, object]]],
+    documents: list[tuple[str, JsonObject]],
     *,
     trading_day: object,
     exclude_key: str,
@@ -1157,11 +1142,11 @@ def _conflicting_same_day_peers(
 
 def _derive_code_sha(
     key: str,
-    document: dict[str, object],
+    document: JsonObject,
     *,
     store: Store,
     deploy_events: list[tuple[dt.datetime, str, str]],
-    documents: list[tuple[str, dict[str, object]]],
+    documents: list[tuple[str, JsonObject]],
 ) -> tuple[str, str] | tuple[None, str]:
     """The real `code_sha` for ``document`` and the key it was derived from,
     or ``(None, reason)``.
@@ -1240,8 +1225,8 @@ def run_migrate_code_sha(store: Store, *, dry_run: bool = False) -> CodeShaMigra
     documents = list(listing.documents)
     deploy_events = _successful_deploy_events(documents)
 
-    rewritten: list[dict[str, object]] = []
-    refused: list[dict[str, object]] = []
+    rewritten: list[JsonObject] = []
+    refused: list[JsonObject] = []
 
     for key, document in documents:
         if document.get("code_sha") != _PLACEHOLDER_CODE_SHA:
@@ -1495,8 +1480,8 @@ class ArmFilingMigrationReport:
 
     migration_run_id: str
     dry_run: bool
-    corrected: tuple[dict[str, object], ...] = ()
-    refused: tuple[dict[str, object], ...] = ()
+    corrected: tuple[JsonObject, ...] = ()
+    refused: tuple[JsonObject, ...] = ()
 
     @property
     def counts(self) -> dict[str, int]:
@@ -1506,7 +1491,7 @@ class ArmFilingMigrationReport:
         suffix = " (dry run — nothing written)" if self.dry_run else ""
         return f"{len(self.corrected)} corrected, {len(self.refused)} refused{suffix}"
 
-    def as_dict(self) -> dict[str, object]:
+    def as_dict(self) -> JsonObject:
         return {
             "schema_version": "migrate_arm_filed_on.v1",
             "migration_run_id": self.migration_run_id,
@@ -1517,31 +1502,31 @@ class ArmFilingMigrationReport:
         }
 
 
-def _register_rows(raw: bytes, key: str) -> list[dict[str, object]]:
+def _register_rows(raw: bytes, key: str) -> list[JsonObject]:
     """The register's rows, parsed. Raises on anything unreadable.
 
     Not `read_register`: the fold would hand back `ArmEvent` objects and this
     repair rewrites LINES, so that every field it is not correcting survives
     byte-for-byte rather than being re-serialized from a reconstruction.
     """
-    rows: list[dict[str, object]] = []
+    rows: list[JsonObject] = []
     for lineno, line in enumerate(raw.decode("utf-8").splitlines(), start=1):
         if not line.strip():
             continue
-        parsed = json.loads(line)
+        parsed: object = json.loads(line)
         if not isinstance(parsed, dict):
             raise ValueError(f"{key}:{lineno} parsed to {type(parsed).__name__}, not an object")
-        rows.append(cast(dict[str, object], parsed))
+        rows.append(cast(JsonObject, parsed))
     return rows
 
 
-def _serialize_register_rows(rows: list[dict[str, object]]) -> bytes:
+def _serialize_register_rows(rows: list[JsonObject]) -> bytes:
     """The same bytes shape `crucible.slots.arms.write_register` produces."""
     return ("\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n").encode("utf-8")
 
 
 def _apply_filing_correction(
-    rows: list[dict[str, object]], correction: ArmFilingCorrection
+    rows: list[JsonObject], correction: ArmFilingCorrection
 ) -> tuple[bool, str]:
     """Correct ``correction``'s row IN ``rows``. Returns ``(changed, detail)``.
 
@@ -1594,8 +1579,8 @@ def run_migrate_arm_filed_on(store: Store, *, dry_run: bool = False) -> ArmFilin
     """
     now = dt.datetime.now(dt.UTC)
     migration_run_id = now.strftime("%Y%m%dT%H%M%S%fZ")
-    corrected: list[dict[str, object]] = []
-    refused: list[dict[str, object]] = []
+    corrected: list[JsonObject] = []
+    refused: list[JsonObject] = []
 
     by_slot: dict[str, list[ArmFilingCorrection]] = {}
     for correction in ARM_FILING_CORRECTIONS:
