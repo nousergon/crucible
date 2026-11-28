@@ -952,6 +952,44 @@ class TestTheHeadline:
         store = _seed(tmp_path, **seed_kwargs)
         return read_inputs(store, trading_day=DAY, now=FIRED_AT)
 
+    def test_registry_resolutions_are_in_both_report_renderings(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        _seed(tmp_path, previous=_board())
+        store = _DeniedKeyStore(
+            tmp_path,
+            denied={"ops/daily-summaries/weekly-issue-resolutions.json": "AccessDenied"},
+        )
+        inputs = read_inputs(store, trading_day=DAY, now=FIRED_AT)
+        message = render_message(
+            inputs, now=FIRED_AT, update_url=UPDATE_URL, history_url=HISTORY_URL
+        )
+        update = render_full_update(inputs, now=FIRED_AT)
+
+        for rendered in (message, update):
+            assert "Resolution: alpha-engine-config#14458" in rendered
+            assert "Resolution: none tracked yet" in rendered
+
+    def test_store_registry_takes_precedence_in_both_report_renderings(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        store = _seed(tmp_path, previous=_board())
+        store.put_bytes(
+            "ops/daily-summaries/weekly-issue-resolutions.json",
+            json.dumps(
+                {"resolutions": [{"pattern": "b_unmet", "issue": "alpha-engine-config#999"}]}
+            ).encode(),
+        )
+        inputs = read_inputs(store, trading_day=DAY, now=FIRED_AT)
+
+        message = render_message(
+            inputs, now=FIRED_AT, update_url=UPDATE_URL, history_url=HISTORY_URL
+        )
+        update = render_full_update(inputs, now=FIRED_AT)
+        for rendered in (message, update):
+            assert "Resolution: alpha-engine-config#999" in rendered
+            assert "Resolution: alpha-engine-config#14458" not in rendered
+
     def test_it_is_short_titled_and_links_the_update_and_the_board(self, tmp_path):
         inputs = self._inputs(tmp_path, previous=_board())
         message = render_message(

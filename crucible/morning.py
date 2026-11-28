@@ -86,7 +86,10 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fnmatch
+import importlib.resources
 import json
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, TypeGuard, cast
@@ -559,6 +562,55 @@ class MorningInputs:
     #: reading is stale however young it is.
     ladder_generated_utc: str | None = None
     ladder_reason: str | None = "the ladder was not read by this caller"
+    issue_resolutions: tuple[tuple[str, str], ...] = ()
+
+
+_WEEKLY_ISSUE_RESOLUTIONS_KEY = "ops/daily-summaries/weekly-issue-resolutions.json"
+_ISSUE_REFERENCE = re.compile(r"^[A-Za-z0-9_.-]+#[1-9][0-9]*$")
+
+
+def _resolution_entries(document: object) -> tuple[tuple[str, str], ...]:
+    """Return valid registry rows, preserving their declared match order."""
+    if not isinstance(document, list):
+        return ()
+    entries: list[tuple[str, str]] = []
+    for item in cast("list[object]", document):
+        row = cast("dict[str, object]", item) if isinstance(item, dict) else None
+        if row is None:
+            continue
+        pattern, issue = row.get("pattern"), row.get("issue")
+        if (
+            isinstance(pattern, str)
+            and isinstance(issue, str)
+            and _ISSUE_REFERENCE.fullmatch(issue)
+        ):
+            entries.append((pattern, issue))
+    return tuple(entries)
+
+
+def _read_issue_resolutions(store: Store) -> tuple[tuple[str, str], ...]:
+    """Load the bundled weekly seed, with readable store rows taking precedence."""
+    seed_text = (
+        importlib.resources.files("crucible")
+        .joinpath("weekly_issue_resolutions.json")
+        .read_text(encoding="utf-8")
+    )
+    seed_document = json.loads(seed_text)
+    seed_object = (
+        cast("dict[str, object]", seed_document) if isinstance(seed_document, dict) else {}
+    )
+    seed = _resolution_entries(seed_object.get("resolutions"))
+    overlay = _read_json(store, _WEEKLY_ISSUE_RESOLUTIONS_KEY)
+    if overlay.document is None:
+        return seed
+    return _resolution_entries(overlay.document.get("resolutions")) + seed
+
+
+def _resolution(problem: str, entries: tuple[tuple[str, str], ...]) -> str:
+    for pattern, issue in entries:
+        if fnmatch.fnmatchcase(problem, pattern):
+            return issue
+    return "none tracked yet"
 
 
 def _is_object(value: object) -> TypeGuard[dict[str, object]]:
@@ -790,6 +842,7 @@ def read_inputs(
         acceptance_denied_code=acceptance_read.denied_code,
         ladder_generated_utc=ladder_generated_utc,
         ladder_reason=ladder_reason,
+        issue_resolutions=_read_issue_resolutions(store),
     )
 
 
@@ -873,7 +926,7 @@ def _staleness(generated_at: str, now: dt.datetime) -> str | None:
     )
 
 
-def _phase_table_rows(board: dict[str, Any]) -> list[str]:
+def _phase_table_rows(board: dict[str, Any], resolutions: tuple[tuple[str, str], ...]) -> list[str]:
     """The ladder as Markdown table rows: phase, state, clauses met, holding.
 
     A phase row that vanished from the board is NOT silently absent: an empty
@@ -898,6 +951,8 @@ def _phase_table_rows(board: dict[str, Any]) -> list[str]:
             unmet = [str(c.get("name", "?")) for c in clauses if not c.get("met")]
             holding = _md_cell(_plain_withhold(", ".join(unmet))) if unmet else ""
             out.append(f"| {row['id']} | {row['state']} | {met}/{len(clauses)} | {holding} |")
+            for problem in unmet:
+                out.append(f"| | | | Resolution: {_resolution(problem, resolutions)} |")
         elif _is_clause_list(clauses):
             # Read, and it declares nothing. `0/0` would read as a measurement.
             out.append(
@@ -1137,7 +1192,7 @@ def render_full_update(inputs: MorningInputs, *, now: dt.datetime) -> str:
     lines.append("## Ladder")
     lines.append("| phase | state | clauses met | holding |")
     lines.append("|---|---|---|---|")
-    lines += _phase_table_rows(board)
+    lines += _phase_table_rows(board, inputs.issue_resolutions)
     lines.append("")
     lines.append(_ladder_comparison_line(inputs))
     lines.append("")
@@ -1249,6 +1304,11 @@ def render_message(
         )
         state = report.escape(str(row.get("state")))
         line = f"Phase {phase.number}  {state:<{_STATE_COLUMN_WIDTH}} {fraction}"
+        problems = (
+            [str(clause.get("name", "?")) for clause in clauses if not clause.get("met")]
+            if _is_clause_list(clauses)
+            else [str(row.get("detail", row.get("id", "?")))]
+        )
         # A phase latched by its closing record reads MET for good; its live
         # fraction can then be below total, and the line says why rather
         # than leaving "MET 3/6" to be decoded (`crucible.board._regression_row`).
@@ -1257,6 +1317,11 @@ def render_message(
             line = f"{line} latched"
             if latch.get("state") != "MET":
                 line = f"{line} — {report.escape(str(latch.get('state')))} regression"
+        if problems:
+            references = dict.fromkeys(
+                _resolution(problem, inputs.issue_resolutions) for problem in problems
+            )
+            line += " Resolution: " + ", ".join(references)
         lines.append(line)
 
     lines.append(
