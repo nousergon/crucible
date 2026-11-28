@@ -165,11 +165,14 @@ class TestMarketWideDeclaration:
         rest of the phase-1 catalogue varies per ticker. A future column
         that IS constant across tickers must say so explicitly here.
         `sector_earliest_snapshot_backfill_raw` is one: the sector source mode
-        is a property of the session (alpha-engine-config-I10733)."""
+        is a property of the session (alpha-engine-config-I10733).
+        `market_stress_zscore` is one: the day's stress score
+        (alpha-engine-config-I14084)."""
         market_wide = {spec.name for spec in CATALOG if spec.market_wide}
         assert market_wide == {
             "market_return_1d_log_return",
             "sector_earliest_snapshot_backfill_raw",
+            "market_stress_zscore",
         }
 
 
@@ -298,9 +301,14 @@ class TestPanelDepthIsDeclaredByTheProducer:
             "sessions deep"
         )
 
-    def test_the_deepest_column_is_the_residual_momentum_ratio_at_313(self) -> None:
+    def test_the_deepest_column_is_the_market_stress_score_at_331(self) -> None:
+        """The residual-momentum ratio was the deepest at 313 until the regime
+        columns (alpha-engine-config-I14084): `market_stress_zscore` composes
+        the regime module's 252-session level window and 60-observation
+        z-score over inputs that are themselves 21 sessions deep."""
         depths = catalog_column_depths()
-        assert min_panel_trading_days() == 313
+        assert min_panel_trading_days() == 331
+        assert depths["market_stress_zscore"] == 331
         assert depths["residual_momentum_252d_skip21d_ratio"] == 313
         assert depths["residual_momentum_252d_skip21d_zscore"] == 313
         assert depths["mom_12_1_log_return"] == 253
@@ -331,13 +339,20 @@ class TestPanelDepthIsDeclaredByTheProducer:
         days = sorted({d for d in panel["trading_day"].unique()})
         short = panel[panel["trading_day"] >= days[-(min_panel_trading_days() - 1)]]
         features, _ = build_features(short, point_in_time=_no_point_in_time(short))
-        assert features["residual_momentum_252d_skip21d_ratio"].isna().all()
+        assert features["market_stress_zscore"].isna().all()
+        residual_depth = catalog_column_depths()["residual_momentum_252d_skip21d_ratio"]
+        short_residual = panel[panel["trading_day"] >= days[-(residual_depth - 1)]]
+        residual, _ = build_features(
+            short_residual, point_in_time=_no_point_in_time(short_residual)
+        )
+        assert residual["residual_momentum_252d_skip21d_ratio"].isna().all()
 
     def test_at_the_declared_depth_the_column_has_values(self, source, cycle_date) -> None:
         panel = source.load_panel(end=cycle_date, lookback_days=1200)
         days = sorted({d for d in panel["trading_day"].unique()})
         exact = panel[panel["trading_day"] >= days[-min_panel_trading_days()]]
         features, _ = build_features(exact, point_in_time=_no_point_in_time(exact))
+        assert features["market_stress_zscore"].notna().any()
         assert features["residual_momentum_252d_skip21d_ratio"].notna().any(), (
             "one more session than the test above, and the column measures something — "
             "which is the whole of the defect: the producer was asked for 275"

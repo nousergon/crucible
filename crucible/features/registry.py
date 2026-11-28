@@ -33,6 +33,7 @@ from typing import TypedDict, cast, overload
 from pydantic import ValidationError
 
 from crucible.models import FeatureRegistryDocument
+from crucible.regime import LEVEL_WINDOW_SESSIONS
 
 __all__ = [
     "CATALOG",
@@ -913,6 +914,84 @@ CATALOG: tuple[FeatureSpec, ...] = (
             "dist_from_52w_high_ratio",
             "return_60d_log_return",
         ),
+        cross_sectional=True,
+    ),
+    # -- regime-conditioned columns (alpha-engine-config-I14084) ------------
+    #
+    # v1's lesson (EXPERIMENTS 2026-05-10): routing to per-regime sub-models
+    # produced degenerate output, and CONTINUOUS conditioning worked. A
+    # market-wide column alone is constant across a day's cross-section and
+    # cannot change a ranking, so the useful form is an INTERACTION with a
+    # per-name z-score. These columns are inert: no arm recipe reads them and
+    # nothing seats or sizes on them until a recipe declares them.
+    FeatureSpec(
+        name="market_stress_zscore",
+        market_wide=True,
+        unit="zscore",
+        expression="stress_score(panel) on the day (crucible.regime)",
+        description=(
+            "The day's market-state stress score (`crucible.regime.stress_score`): "
+            "the mean of five signed trailing z-scores (drawdown, volatility, two "
+            "breadth measures, dispersion), higher = more stress. Identical for "
+            "every ticker on a day, by construction. Carried for the record and "
+            "for the interaction columns below; null until the score exists, "
+            "which needs a full 252-session level window under each input plus 60 "
+            "observations to z-score it."
+        ),
+        inputs=(
+            "market_return_1d_log_return",
+            "momentum_20d_log_return",
+            "close_to_sma50_ratio",
+            "close_to_sma200_ratio",
+        ),
+        window_trading_days=LEVEL_WINDOW_SESSIONS,
+    ),
+    FeatureSpec(
+        name="momentum_20d_zscore_x_stress_zscore",
+        market_wide=False,
+        unit="zscore",
+        expression="momentum_20d_zscore * market_stress_zscore",
+        description=(
+            "Cross-sectional 20-session momentum z-score times the day's stress "
+            "score. Null where either factor is null."
+        ),
+        inputs=("momentum_20d_zscore", "market_stress_zscore"),
+        cross_sectional=True,
+    ),
+    FeatureSpec(
+        name="mom_12_1_zscore_x_stress_zscore",
+        market_wide=False,
+        unit="zscore",
+        expression="mom_12_1_zscore * market_stress_zscore",
+        description=(
+            "Cross-sectional 12-1 momentum z-score times the day's stress score. "
+            "Null where either factor is null."
+        ),
+        inputs=("mom_12_1_zscore", "market_stress_zscore"),
+        cross_sectional=True,
+    ),
+    FeatureSpec(
+        name="residual_momentum_252d_skip21d_zscore_x_stress_zscore",
+        market_wide=False,
+        unit="zscore",
+        expression="residual_momentum_252d_skip21d_zscore * market_stress_zscore",
+        description=(
+            "Cross-sectional residual-momentum z-score times the day's stress "
+            "score. Null where either factor is null."
+        ),
+        inputs=("residual_momentum_252d_skip21d_zscore", "market_stress_zscore"),
+        cross_sectional=True,
+    ),
+    FeatureSpec(
+        name="volatility_20d_x_stress_zscore",
+        market_wide=False,
+        unit="zscore",
+        expression="zscore(volatility_20d_ratio) * market_stress_zscore",
+        description=(
+            "Cross-sectional z-score of 20-session volatility, over the liquid "
+            "set, times the day's stress score. Null where either factor is null."
+        ),
+        inputs=("volatility_20d_ratio", "liquidity_pass_raw", "market_stress_zscore"),
         cross_sectional=True,
     ),
 )

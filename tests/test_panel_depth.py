@@ -71,7 +71,7 @@ class TestAShallowPanelFailsTheDayRatherThanWritingANullColumn:
     def test_the_refusal_names_the_column_that_would_be_dead(
         self, store, source, frames, cycle_date
     ) -> None:
-        with pytest.raises(PanelDepthError, match="residual_momentum_252d_skip21d_ratio"):
+        with pytest.raises(PanelDepthError, match="market_stress_zscore"):
             run_job(
                 "data.daily",
                 lambda c: run_daily(

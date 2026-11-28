@@ -84,7 +84,7 @@ __all__ = [
 
 #: Sessions of history the feature layer needs before EVERY catalogue column
 #: is computable, read from the producer that declares it
-#: (`crucible.features.min_panel_trading_days`) rather than restated here. 313
+#: (`crucible.features.min_panel_trading_days`) rather than restated here. 331
 #: today, and it moves on its own the day a window constant does.
 MIN_PANEL_TRADING_DAYS = min_panel_trading_days()
 
