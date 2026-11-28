@@ -36,7 +36,7 @@ import os
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, cast
+from typing import Literal, Protocol, cast
 
 from pydantic import ValidationError
 
@@ -175,6 +175,27 @@ __all__ = [
 #: rather than as prose in a runbook.
 PageCondition = Literal["absence", "failure"]
 PAGE_CONDITIONS: tuple[str, ...] = ("absence", "failure")
+
+
+class _EC2Client(Protocol):
+    def describe_instances(self, *, InstanceIds: list[str]) -> dict[str, object]: ...
+
+
+class _LogsClient(Protocol):
+    def get_log_events(
+        self, *, logGroupName: str, logStreamName: str, limit: int, startFromHead: bool
+    ) -> dict[str, object]: ...
+
+
+class _SNSClient(Protocol):
+    def list_subscriptions_by_topic(self, **request: object) -> dict[str, object]: ...
+
+
+class _PublishResult(Protocol):
+    any_ok: object
+
+
+JsonObject = dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -700,8 +721,10 @@ def _arc_declared_members(
     if not isinstance(inputs, list):
         return None
     members: set[str] = set()
-    for entry in inputs:
-        parsed = parse_manifest_key(entry.get("key", "")) if isinstance(entry, dict) else None
+    for entry in cast("list[object]", inputs):
+        fields = cast("JsonObject", entry) if isinstance(entry, dict) else None
+        key_value = fields.get("key", "") if fields is not None else ""
+        parsed = parse_manifest_key(key_value) if isinstance(key_value, str) else None
         if parsed is None:
             # One malformed input means the declared set cannot be read
             # whole; a partial set would narrow a member it merely failed to
@@ -976,14 +999,32 @@ def _default_describe_instance_state_reason(instance_id: str) -> InstanceReading
     not to chase this window): the durable evidence is the exit record and
     the CloudWatch stream, and both are read before this.
     """
-    import boto3  # noqa: PLC0415 - lazy on purpose
+    import boto3  # pyright: ignore[reportMissingTypeStubs] # boto3 has no bundled stubs
 
-    ec2 = boto3.client("ec2")
+    ec2 = cast(
+        "_EC2Client",
+        boto3.client("ec2"),  # pyright: ignore[reportUnknownMemberType] # untyped boto3
+    )
     response = ec2.describe_instances(InstanceIds=[instance_id])
-    for reservation in response.get("Reservations", ()):
-        for instance in reservation.get("Instances", ()):
-            message = instance.get("StateReason", {}).get("Message")
-            return InstanceReading(True, message or None)
+    reservations = response.get("Reservations")
+    if isinstance(reservations, list):
+        for raw_reservation in cast("list[object]", reservations):
+            if not isinstance(raw_reservation, dict):
+                continue
+            reservation = cast("JsonObject", raw_reservation)
+            instances = reservation.get("Instances")
+            if not isinstance(instances, list):
+                continue
+            for raw_instance in cast("list[object]", instances):
+                if not isinstance(raw_instance, dict):
+                    continue
+                instance = cast("JsonObject", raw_instance)
+                raw_reason = instance.get("StateReason")
+                reason = cast("JsonObject", raw_reason) if isinstance(raw_reason, dict) else {}
+                message = reason.get("Message")
+                return InstanceReading(
+                    True, message if isinstance(message, str) and message else None
+                )
     return InstanceReading(False, None)
 
 
@@ -1009,16 +1050,26 @@ def _default_read_box_log_tail(job: str, instance_id: str) -> str | None:
     that knows its exit code before the process ends. The exit record is read
     first.
     """
-    import boto3  # noqa: PLC0415 - lazy on purpose
+    import boto3  # pyright: ignore[reportMissingTypeStubs] # boto3 has no bundled stubs
 
-    logs = boto3.client("logs")
+    logs = cast(
+        "_LogsClient",
+        boto3.client("logs"),  # pyright: ignore[reportUnknownMemberType] # untyped boto3
+    )
     response = logs.get_log_events(
         logGroupName=BOX_LOG_GROUP_TEMPLATE.format(job=job),
         logStreamName=instance_id,
         limit=_BOX_LOG_TAIL_EVENTS,
         startFromHead=False,
     )
-    lines = [event.get("message", "").rstrip() for event in response.get("events", ())]
+    events = response.get("events")
+    lines: list[str] = []
+    if isinstance(events, list):
+        for raw_event in cast("list[object]", events):
+            if isinstance(raw_event, dict):
+                message = cast("JsonObject", raw_event).get("message", "")
+                if isinstance(message, str):
+                    lines.append(message.rstrip())
     text = "\n".join(line for line in lines if line)
     return text or None
 
@@ -1040,7 +1091,9 @@ _BOX_LOG_TAIL_EVENTS = 60
 _SPOT_RECLAMATION_MARKER = "Server.SpotInstanceTermination"
 
 
-def _read_dispatch_exit_record(store: Store, job: str, dispatch_id: str) -> Any:
+def _read_dispatch_exit_record(
+    store: Store, job: str, dispatch_id: str
+) -> DispatchExitDocument | str | None:
     """The dispatch's own terminal record, or ``None`` when there is none.
 
     Returns a validated :class:`crucible.models.DispatchExitDocument`, a
@@ -1067,7 +1120,9 @@ def _read_dispatch_exit_record(store: Store, job: str, dispatch_id: str) -> Any:
         return f"the exit record {key} does not conform ({exc})"
 
 
-def _exit_record_classification(record: Any, successor_present: bool | None) -> str:
+def _exit_record_classification(
+    record: DispatchExitDocument, successor_present: bool | None
+) -> str:
     """An absence page's cause sentence, built from the box's own account."""
     detail = (
         f"the box recorded its own exit: {record.exit_class} (code {record.exit_code}), "
@@ -1477,7 +1532,7 @@ def indistinguishable_invocation_metric(
     *,
     graded_jobs: Sequence[str],
     now: dt.datetime,
-) -> dict[str, Any]:
+) -> JsonObject:
     """A MetricRecord over :func:`indistinguishable_invocation_findings`.
 
     `unmeasurable`, not OK and not BREACH, and that is the whole point. A key
@@ -1800,7 +1855,7 @@ def _successor_dispatch_present(store: Store, job: str, dispatch_id: str) -> boo
 def _gap_fanout_detail(
     store: Store,
     job: str,
-    args: Any,
+    args: object,
     dispatched_at: dt.datetime,
     moment: dt.datetime,
     horizon: dt.timedelta,
@@ -1887,7 +1942,7 @@ _dispatch_target_trading_day = dispatch_target_trading_day
 _flag_value = flag_value
 
 
-def _parse_dispatch_time(raw: Any) -> dt.datetime | None:
+def _parse_dispatch_time(raw: object) -> dt.datetime | None:
     """`dispatched_at_utc` as a timezone-aware datetime, or ``None`` if it
     is not one — never a raise here, since a corrupt field is exactly the
     "cannot be graded" case :func:`evaluate_dispatch_absence` folds into a
@@ -2009,7 +2064,7 @@ _UNPARSEABLE_RUN_ID = "0" * 26
 MIN_ACTIVE_ARMS_LOOKBACK_TRADING_DAYS = 60
 
 
-def _read_arena_cycle(store: Store, slot: str, day: dt.date) -> dict[str, Any] | None:
+def _read_arena_cycle(store: Store, slot: str, day: dt.date) -> JsonObject | None:
     """The `arena_cycle` document for ``slot`` on ``day``, or None if absent.
 
     A present-but-unreadable document is surfaced through ``read_listed_document``'s
@@ -2065,7 +2120,7 @@ def evaluate_min_active_arms(
     pages: list[Page] = []
     for slot in sorted(SLOTS):
         day = today
-        latest: dict[str, Any] | None = None
+        latest: JsonObject | None = None
         latest_day: dt.date | None = None
         for _ in range(MIN_ACTIVE_ARMS_LOOKBACK_TRADING_DAYS):
             cycle = _read_arena_cycle(store, slot, day)
@@ -2084,7 +2139,8 @@ def evaluate_min_active_arms(
                 raise StoreAccessError(str(latest["__unreadable__"]))
             access_faults.append(str(latest["__unreadable__"]))
             continue
-        finding = latest.get(MIN_ACTIVE_ARMS_FINDING_METRIC)
+        raw_finding = latest.get(MIN_ACTIVE_ARMS_FINDING_METRIC)
+        finding = cast("JsonObject", raw_finding) if isinstance(raw_finding, dict) else None
         if not finding or finding.get("status") != "BELOW_FLOOR":
             continue
 
@@ -2133,7 +2189,12 @@ def evaluate_min_active_arms(
                 continue
             if "__unreadable__" in prior:
                 break
-            prior_finding = prior.get(MIN_ACTIVE_ARMS_FINDING_METRIC)
+            raw_prior_finding = prior.get(MIN_ACTIVE_ARMS_FINDING_METRIC)
+            prior_finding = (
+                cast("JsonObject", raw_prior_finding)
+                if isinstance(raw_prior_finding, dict)
+                else None
+            )
             if not prior_finding or prior_finding.get("status") != "BELOW_FLOOR":
                 break
             anchor = probe
@@ -2854,7 +2915,7 @@ def bus_row(
     first_observed_utc: str,
     last_observed_utc: str,
     observations: int = 1,
-) -> dict[str, Any]:
+) -> JsonObject:
     """The machine-readable row. §7.3: a human-only alert is invisible.
 
     ``sent`` records what actually happened on the transport, not what was
@@ -2897,7 +2958,7 @@ def bus_row(
     }
 
 
-def _members(group: PageGroup) -> list[dict[str, Any]]:
+def _members(group: PageGroup) -> list[JsonObject]:
     return [
         {"job": m.job, "run_id": m.run_id, "reason": m.reason, "synthetic": m.synthetic}
         for m in sorted(group.members, key=lambda x: x.job)
@@ -3058,7 +3119,7 @@ def send(
     *,
     alert_id: str | None,
     legacy: bool = False,
-    transport: Callable[..., Any] | None = None,
+    transport: Callable[..., object] | None = None,
     dedup_key: str | None = None,
 ) -> tuple[bool, str]:
     """Deliver one page group through `krepis.alerts`. Returns ``(sent, destination)``.
@@ -3123,7 +3184,7 @@ DESTINATION_SNS_ONLY = "sns_only"
 NON_OPERATOR_DESTINATIONS: frozenset[str] = frozenset({DESTINATION_SUPPRESSED, DESTINATION_MUTED})
 
 
-def _transport_outcome(result: Any, *, legacy: bool) -> tuple[bool, str]:
+def _transport_outcome(result: object, *, legacy: bool) -> tuple[bool, str]:
     """What the transport ACTUALLY did — never what was asked of it.
 
     `PublishResult.any_ok` is True on a DEDUP-SUPPRESSED and on a MUTED
@@ -3155,10 +3216,11 @@ def _transport_outcome(result: Any, *, legacy: bool) -> tuple[bool, str]:
             "cannot say whether the page was delivered cannot be recorded as delivered. "
             "`krepis.alerts.PublishResult` is the contract."
         )
+    publish_result = cast("_PublishResult", result)
     suppressed = bool(getattr(result, "dedup_skipped", False)) or bool(
         getattr(result, "muted", False)
     )
-    sent = bool(result.any_ok) and not suppressed
+    sent = bool(publish_result.any_ok) and not suppressed
     # krepis names it `telegram_destination` and leaves it None when the
     # Telegram leg was not reached; the previous `getattr(result,
     # "destination", ...)` read an attribute `PublishResult` has never had,
@@ -3178,7 +3240,7 @@ def _transport_outcome(result: Any, *, legacy: bool) -> tuple[bool, str]:
     return sent, str(destination)
 
 
-def _krepis_publish(*args: Any, **kwargs: Any) -> Any:
+def _krepis_publish(*args: object, **kwargs: object) -> object:
     """The real transport, imported at call time.
 
     Lazy because `crucible --help`, the tests and every laptop run import
@@ -3198,8 +3260,9 @@ def _krepis_publish(*args: Any, **kwargs: Any) -> Any:
             f"PagesTopicArn output. Falling through would publish to "
             f"the v1 fleet topic, where this role has no grant."
         )
-    from krepis.alerts import publish  # noqa: PLC0415
+    from krepis.alerts import publish as typed_publish  # noqa: PLC0415
 
+    publish = cast("Callable[..., object]", typed_publish)
     return publish(*args, **kwargs)
 
 
@@ -3209,7 +3272,7 @@ def emit(
     *,
     sweep_run_id: str | None,
     legacy: bool = False,
-    transport: Callable[..., Any] | None = None,
+    transport: Callable[..., object] | None = None,
     now: dt.datetime | None = None,
 ) -> list[str]:
     """Send each INCIDENT once and write its bus row. Returns the bus keys.
@@ -3399,7 +3462,7 @@ def _remember_back_office_members(row: dict[str, object], group: PageGroup) -> N
     subsequent restoration of the same identities look like a gain.
     """
     prior = cast("list[dict[str, object]]", row["members_now"])
-    current = cast("list[dict[str, object]]", _members(group))
+    current = _members(group)
     for members in (prior, current):
         facts, count, incomplete = _back_office_snapshot(members)
         if facts and not incomplete:
@@ -3455,7 +3518,7 @@ def _back_office_gain(store: Store, key: str, group: PageGroup) -> str | None:
     return f"{incident_key(group)}:update:{fingerprint}"
 
 
-def _dump_row(row: dict[str, Any]) -> bytes:
+def _dump_row(row: JsonObject) -> bytes:
     return json.dumps(row, indent=2, sort_keys=True).encode("utf-8")
 
 
@@ -3583,7 +3646,7 @@ def _row_is_synthetic(store: Store, key: str) -> bool:
     return bool(document.get("synthetic"))
 
 
-def ceiling_metric(count: int, *, now: dt.datetime) -> dict[str, Any]:
+def ceiling_metric(count: int, *, now: dt.datetime) -> JsonObject:
     """Pages-per-window as a MetricRecord with its ceiling as the baseline.
 
     `status` is BREACH rather than a soft word when the ceiling is exceeded:
@@ -3653,7 +3716,7 @@ class SubscriberReading:
         """
         return bool(self.confirmed_human_legs) and self.lambda_legs >= 1
 
-    def metric(self, *, now: dt.datetime) -> dict[str, Any]:
+    def metric(self, *, now: dt.datetime) -> JsonObject:
         if self.met:
             reason = (
                 f"{len(self.confirmed_human_legs)} confirmed human leg(s) "
@@ -3661,7 +3724,7 @@ class SubscriberReading:
                 f"leg(s) on {pages_topic()}."
             )
         else:
-            missing = []
+            missing: list[str] = []
             if not self.confirmed_human_legs:
                 missing.append(
                     "no CONFIRMED human leg"
@@ -3685,9 +3748,7 @@ class SubscriberReading:
         )
 
 
-def _subscribers_metric(
-    *, value: float, status: str, reason: str, now: dt.datetime
-) -> dict[str, Any]:
+def _subscribers_metric(*, value: float, status: str, reason: str, now: dt.datetime) -> JsonObject:
     return {
         "name": SUBSCRIBERS_METRIC,
         "module": "crucible.alerts",
@@ -3702,20 +3763,23 @@ def _subscribers_metric(
     }
 
 
-def _subscribers_unmeasurable(reason: str, *, now: dt.datetime) -> dict[str, Any]:
+def _subscribers_unmeasurable(reason: str, *, now: dt.datetime) -> JsonObject:
     """The row when the list could not be read. `unmeasurable`, never `OK`
     and never a zero: no data about subscribers is not "no subscribers"."""
     return _subscribers_metric(value=0.0, status="unmeasurable", reason=reason, now=now)
 
 
-def _default_sns() -> Any:
+def _default_sns() -> _SNSClient:
     """An SNS client, constructed lazily — same reason as `crucible.cost.default_client`."""
-    import boto3  # noqa: PLC0415 - lazy on purpose
+    import boto3  # pyright: ignore[reportMissingTypeStubs] # boto3 has no bundled stubs
 
-    return boto3.client("sns")
+    return cast(
+        "_SNSClient",
+        boto3.client("sns"),  # pyright: ignore[reportUnknownMemberType] # untyped boto3
+    )
 
 
-def pages_topic_subscribers(topic: str, *, sns: Any) -> SubscriberReading:
+def pages_topic_subscribers(topic: str, *, sns: _SNSClient) -> SubscriberReading:
     """Read every subscription on ``topic`` and sort it into legs.
 
     Raises whatever the client raises. A denied `ListSubscriptionsByTopic` is
@@ -3729,11 +3793,17 @@ def pages_topic_subscribers(topic: str, *, sns: Any) -> SubscriberReading:
     lambdas = 0
     token: str | None = None
     while True:
-        request: dict[str, Any] = {"TopicArn": topic}
+        request: JsonObject = {"TopicArn": topic}
         if token:
             request["NextToken"] = token
         response = sns.list_subscriptions_by_topic(**request)
-        for sub in response.get("Subscriptions", []):
+        subscriptions = response.get("Subscriptions")
+        for raw_sub in (
+            cast("list[object]", subscriptions) if isinstance(subscriptions, list) else []
+        ):
+            if not isinstance(raw_sub, dict):
+                continue
+            sub = cast("JsonObject", raw_sub)
             protocol = str(sub.get("Protocol", "")).lower()
             arn = str(sub.get("SubscriptionArn", ""))
             if protocol in _MACHINE_PROTOCOLS:
@@ -3744,7 +3814,8 @@ def pages_topic_subscribers(topic: str, *, sns: Any) -> SubscriberReading:
                 pending.append(protocol)
             else:
                 confirmed.append(protocol)
-        token = response.get("NextToken")
+        raw_token = response.get("NextToken")
+        token = raw_token if isinstance(raw_token, str) else None
         if not token:
             break
     return SubscriberReading(
@@ -3759,12 +3830,12 @@ def heartbeat(
     store: Store,
     *,
     now: dt.datetime | None = None,
-    transport: Callable[..., Any] | None = None,
+    transport: Callable[..., object] | None = None,
     run_id: str | None = None,
     dry_run: bool = False,
-    sns: Any | None = None,
-    s3: Any | None = None,
-) -> dict[str, Any]:
+    sns: _SNSClient | None = None,
+    s3: object | None = None,
+) -> JsonObject:
     """Emit proof that the alerting path itself ran, and return its summary.
 
     Not a third page condition. It is the number that distinguishes "nothing
@@ -3865,7 +3936,7 @@ def heartbeat(
     cost_reconciliation = _week_cost_reconciliation(
         week_manifests, now=moment, s3=s3, access_faults=access_faults
     )
-    summary = {
+    summary: JsonObject = {
         "trading_day": trading_day.isoformat(),
         "runs_ok": runs_ok,
         "runs_failed": runs_failed,
@@ -3957,11 +4028,14 @@ def _week_summary(store: Store, trading_day: dt.date) -> tuple[int, int, float]:
     documents, unreadable = _week_manifests(store, trading_day)
     ok = sum(1 for m in documents if m.get("status") == "ok")
     failed = unreadable + sum(1 for m in documents if m.get("status") != "ok")
-    spend = sum(float(m.get("cost_usd", 0.0)) for m in documents)
+    spend = sum(
+        float(value) if isinstance((value := m.get("cost_usd", 0.0)), (int, float, str)) else 0.0
+        for m in documents
+    )
     return ok, failed, spend
 
 
-def _week_manifests(store: Store, trading_day: dt.date) -> tuple[list[dict[str, Any]], int]:
+def _week_manifests(store: Store, trading_day: dt.date) -> tuple[list[JsonObject], int]:
     """Every readable manifest of the trailing trading week, and the count of
     keys under a manifest prefix that could not be read as one.
 
@@ -3974,7 +4048,7 @@ def _week_manifests(store: Store, trading_day: dt.date) -> tuple[list[dict[str, 
     for _ in range(TRADING_DAYS_PER_WEEK - 1):
         day = previous_trading_day(day)
         days.add(day)
-    documents: list[dict[str, Any]] = []
+    documents: list[JsonObject] = []
     unreadable = 0
     for key in store.list_keys(RUNS_ROOT):
         parsed = parse_manifest_key(key)
@@ -4009,12 +4083,12 @@ def _week_manifests(store: Store, trading_day: dt.date) -> tuple[list[dict[str, 
 
 
 def _week_cost_reconciliation(
-    manifests: list[dict[str, Any]],
+    manifests: list[JsonObject],
     *,
     now: dt.datetime,
-    s3: Any,
+    s3: object,
     access_faults: list[str],
-) -> dict[str, Any]:
+) -> JsonObject:
     """The week's manifest-vs-sink reconciliation row (`alpha-engine-config-I9986`).
 
     The sink's location arrives from the environment under the names
@@ -4079,12 +4153,12 @@ def sweep(
     *,
     now: dt.datetime | None = None,
     registry: dict[str, Component] | None = None,
-    transport: Callable[..., Any] | None = None,
+    transport: Callable[..., object] | None = None,
     sweep_run_id: str,
     dry_run: bool = False,
     describe_instance_state_reason: Callable[[str], InstanceReading] | None = None,
     read_box_log_tail: Callable[[str, str], str | None] | None = None,
-) -> dict[str, Any]:
+) -> JsonObject:
     """Evaluate both conditions, group by cause, page once per group.
 
     The whole alerting pass, in one function, so "what does the alerter do"
