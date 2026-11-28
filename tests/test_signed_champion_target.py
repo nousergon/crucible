@@ -33,7 +33,9 @@ Asserted here, each against the shape that broke:
 
 from __future__ import annotations
 
+import datetime as dt
 import json
+from typing import Any
 
 import pytest
 from nousergon_lib.arena import ArmRegister, ArmSeries
@@ -54,6 +56,7 @@ from crucible.keys import (
 from crucible.promote import PromotionRefused, revert_champion, run_promotion
 from crucible.serving import (
     MIN_NAMES_FOR_SIGN_CHECK,
+    MINORITY_SIDE_WARN_FRACTION,
     OneSidedCrossSectionError,
     publish_predictions_feed,
     read_predictions_feed,
@@ -382,6 +385,20 @@ def _alpha(n: int, value: float) -> dict[str, float]:
     return {f"N{i:03d}": value for i in range(n)}
 
 
+class _RecordingContext:
+    def __init__(self, store: LocalStore) -> None:
+        self.store = store
+        self.started = dt.datetime(2026, 11, 25, tzinfo=dt.UTC)
+        self.metrics: list[dict[str, Any]] = []
+
+    def record_output(self, key: str, payload: bytes, schema_version: str = "v1") -> None:
+        del schema_version
+        self.store.put_bytes(key, payload)
+
+    def record_metric(self, metric: dict[str, Any]) -> None:
+        self.metrics.append(metric)
+
+
 class TestAOneSidedCrossSectionIsRefused:
     @pytest.fixture
     def seated(self, tmp_path):
@@ -423,4 +440,61 @@ class TestAOneSidedCrossSectionIsRefused:
         alpha["N000"] = -0.01
         _cross_section(store, arm_id, as_of, alpha)
         publish_predictions_feed(store, trading_day=as_of)
+        assert read_predictions_feed(store, as_of).predicted_alpha == alpha
+
+
+class TestTheFeedRecordsSignSideMetrics:
+    @pytest.fixture
+    def seated(self, tmp_path):
+        store = LocalStore(tmp_path)
+        as_of = trading_days(5)[-1]
+        arm_id = seed_m_recipe(store, "champ")
+        _seat(store, arm_id, as_of)
+        return store, arm_id, as_of
+
+    @staticmethod
+    def _values(ctx: _RecordingContext) -> dict[str, float]:
+        return {str(metric["name"]): float(metric["value"]) for metric in ctx.metrics}
+
+    @pytest.mark.parametrize(("negative_count", "thin"), [(3, 1.0), (10, 0.0)])
+    def test_published_feed_records_counts_and_thin_warning(
+        self, seated, negative_count: int, thin: float
+    ) -> None:
+        store, arm_id, as_of = seated
+        alpha = _alpha(100, 0.01)
+        for index in range(negative_count):
+            alpha[f"N{index:03d}"] = -0.01
+        _cross_section(store, arm_id, as_of, alpha)
+        ctx = _RecordingContext(store)
+
+        publish_predictions_feed(store, trading_day=as_of, ctx=ctx)
+
+        assert read_predictions_feed(store, as_of).predicted_alpha == alpha
+        assert self._values(ctx) == {
+            "m_feed_names_below_zero": float(negative_count),
+            "m_feed_names_above_zero": float(100 - negative_count),
+            "m_feed_minority_side_fraction": negative_count / 100,
+            "m_feed_minority_side_thin": thin,
+        }
+        assert MINORITY_SIDE_WARN_FRACTION == 0.05
+
+    def test_zero_percent_still_refuses_and_records_nothing(self, seated) -> None:
+        store, arm_id, as_of = seated
+        _cross_section(store, arm_id, as_of, _alpha(100, 0.01))
+        ctx = _RecordingContext(store)
+
+        with pytest.raises(OneSidedCrossSectionError):
+            publish_predictions_feed(store, trading_day=as_of, ctx=ctx)
+
+        assert ctx.metrics == []
+        assert not store.exists(predictions_key(as_of))
+
+    def test_no_context_publishes_without_metrics(self, seated) -> None:
+        store, arm_id, as_of = seated
+        alpha = _alpha(100, 0.01)
+        alpha["N000"] = -0.01
+        _cross_section(store, arm_id, as_of, alpha)
+
+        publish_predictions_feed(store, trading_day=as_of, ctx=None)
+
         assert read_predictions_feed(store, as_of).predicted_alpha == alpha
