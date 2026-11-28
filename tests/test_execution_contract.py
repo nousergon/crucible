@@ -29,6 +29,7 @@ from crucible.execution import (
     DECISION_PRICE_BASIS,
     EXECUTION_METRIC_NAME,
     EXECUTION_N_FLOOR,
+    EXECUTION_SHORTFALL_SCHEMA_V1,
     EXECUTION_SHORTFALL_SCHEMA_VERSION,
     FILL_SOURCE_BROKER,
     FILL_SOURCE_SIMULATED_CLOSE,
@@ -127,7 +128,7 @@ def _shortfall_doc(day: str = DAY, orders: list[dict] | None = None, **overrides
     shortfall = sum(o["shortfall_usd"] for o in orders)
     weighted = shortfall / decision_notional * 1e4 if decision_notional > 0 else None
     doc = {
-        "schema_version": EXECUTION_SHORTFALL_SCHEMA_VERSION,
+        "schema_version": EXECUTION_SHORTFALL_SCHEMA_V1,
         "trading_day": day,
         "calendar_date": day,
         "champion": "m:ridge_21d:0123456789ab",
@@ -169,13 +170,92 @@ def _no_orders_doc(day: str) -> dict:
     )
 
 
+def _v2_doc(
+    day: str = DAY, *, arrival: float | None = 100.1, terminal: float | None = 100.4
+) -> dict:
+    complete = arrival is not None and terminal is not None
+    components = (
+        {
+            "delay_usd": 1.0,
+            "execution_usd": 0.5,
+            "fees_usd": 0.25,
+            "unfilled_opportunity_usd": 2.0,
+            "gross_shortfall_usd": 3.5,
+            "net_shortfall_usd": 3.75,
+        }
+        if complete
+        else {
+            name: None
+            for name in (
+                "delay_usd",
+                "execution_usd",
+                "fees_usd",
+                "unfilled_opportunity_usd",
+                "gross_shortfall_usd",
+                "net_shortfall_usd",
+            )
+        }
+    )
+    summary = {
+        "complete": complete,
+        "intended_decision_notional_usd": 1000.0 if complete else None,
+        **components,
+        "gross_shortfall_bps": 35.0 if complete else None,
+        "net_shortfall_bps": 37.5 if complete else None,
+    }
+    return {
+        "schema_version": EXECUTION_SHORTFALL_SCHEMA_VERSION,
+        "trading_day": day,
+        "decision_id": "decision-1",
+        "band": dict(BAND),
+        "terminal_mark": {
+            "price": terminal,
+            "observed_at_utc": "2026-09-11T20:05:00Z" if terminal is not None else None,
+            "horizon_seconds": 600,
+        },
+        "orders": [
+            {
+                "decision_id": "decision-1",
+                "order_id": "order-1",
+                "symbol": "AAA",
+                "side": "buy",
+                "status": "partially_filled",
+                "decided_at_utc": "2026-09-11T19:55:00Z",
+                "submitted_at_utc": "2026-09-11T19:55:02Z",
+                "decision_price": 100.0,
+                "arrival_price": arrival,
+                "intended_quantity": 10.0,
+                "filled_quantity": 5.0,
+                "executions": [
+                    {
+                        "execution_id": "execution-1",
+                        "order_id": "order-1",
+                        "executed_at_utc": "2026-09-11T19:55:03Z",
+                        "quantity": 5.0,
+                        "price": 100.2,
+                        "fee_usd": 0.25,
+                    }
+                ],
+                "fees_usd": 0.25,
+                "components": components,
+            }
+        ],
+        "summary": summary,
+    }
+
+
 def _put(store: LocalStore, key: str, doc: dict) -> None:
     store.put_bytes(key, json.dumps(doc).encode("utf-8"))
 
 
 class TestTheSchemasArePublishedAndVersioned:
     @pytest.mark.parametrize(
-        "version", [EXECUTION_SHORTFALL_SCHEMA_VERSION, SHADOW_BOOKS_SCHEMA_VERSION]
+        "version",
+        [
+            EXECUTION_SHORTFALL_SCHEMA_V1,
+            EXECUTION_SHORTFALL_SCHEMA_VERSION,
+            SHADOW_BOOKS_SCHEMA_VERSION,
+        ],
     )
     def test_each_schema_is_valid_draft_2020_12_and_names_its_version(self, version) -> None:
         schema = json.loads((SCHEMAS / f"{version}.json").read_text())
@@ -201,6 +281,28 @@ class TestTheSchemasArePublishedAndVersioned:
 
 
 class TestExecutionShortfallValidator:
+    def test_v2_validates_partial_fill_and_complete_cost_components(self) -> None:
+        doc = validate_execution_shortfall(_v2_doc())
+        assert doc["summary"]["gross_shortfall_bps"] == 35.0
+        assert doc["summary"]["net_shortfall_bps"] == 37.5
+
+    def test_v2_preserves_missing_observations_as_unavailable(self) -> None:
+        doc = validate_execution_shortfall(_v2_doc(arrival=None))
+        assert doc["summary"]["complete"] is False
+        assert doc["summary"]["net_shortfall_bps"] is None
+
+    def test_v2_rejects_an_inconsistent_execution_identity(self) -> None:
+        doc = _v2_doc()
+        doc["orders"][0]["executions"][0]["order_id"] = "another-order"
+        with pytest.raises(ExecutionArtifactError, match="names another order"):
+            validate_execution_shortfall(doc)
+
+    def test_v2_rejects_an_inconsistent_summary_total(self) -> None:
+        doc = _v2_doc()
+        doc["summary"]["fees_usd"] = 0.0
+        with pytest.raises(ExecutionArtifactError, match="summary.fees_usd"):
+            validate_execution_shortfall(doc)
+
     def test_a_computed_document_validates(self) -> None:
         assert validate_execution_shortfall(_shortfall_doc())["outcome"] == "computed"
 
@@ -369,6 +471,24 @@ def _many_orders(n: int, fill: float) -> list[dict]:
 
 
 class TestTheFifthRow:
+    def test_v2_reports_gross_net_and_signed_components(self, tmp_path) -> None:
+        row = _execution_row(_week_store(tmp_path, {day: _v2_doc(day) for day in WEEK}))
+        assert row["gross_shortfall_bps"] == pytest.approx(35.0)
+        assert row["net_shortfall_bps"] == pytest.approx(37.5)
+        assert row["delay_usd"] == pytest.approx(5.0)
+        assert row["execution_usd"] == pytest.approx(2.5)
+        assert row["fees_usd"] == pytest.approx(1.25)
+        assert row["unfilled_opportunity_usd"] == pytest.approx(10.0)
+        assert row["complete_cost"] is True
+
+    def test_mixed_versions_remain_readable_but_not_complete_or_green(self, tmp_path) -> None:
+        docs = {day: _v2_doc(day) for day in WEEK}
+        docs[WEEK[0]] = _shortfall_doc(WEEK[0], orders=_many_orders(5, 100.01))
+        row = _execution_row(_week_store(tmp_path, docs))
+        assert row["complete_cost"] is False
+        assert row["legacy_v1_sessions"] == [WEEK[0]]
+        assert row["status"] != "GREEN"
+
     def test_a_traded_week_populates_the_row_with_baseline_band_and_absolutes(
         self, tmp_path
     ) -> None:
