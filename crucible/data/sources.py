@@ -59,12 +59,60 @@ from __future__ import annotations
 
 import datetime as dt
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Protocol, cast
 
 if TYPE_CHECKING:
     import numpy as np
-    import pandas as pd
+    import pandas as pd  # pyright: ignore[reportMissingTypeStubs] - pandas has no bundled stubs
+
+
+class _SymbolDescription(Protocol):
+    date_range: tuple[object, object]
+
+
+class _ArcticLibrary(Protocol):
+    def list_symbols(self) -> Iterable[str]: ...
+
+    def has_symbol(self, symbol: str) -> bool: ...
+
+    def get_description(self, symbol: str) -> _SymbolDescription: ...
+
+    def get_description_batch(self, symbols: list[str]) -> Iterable[_SymbolDescription]: ...
+
+
+class _ArcticClient(Protocol):
+    def get_library(self, name: str, *, create_if_missing: bool = False) -> _ArcticLibrary: ...
+
+
+class _LoadArcticFrames(Protocol):
+    def __call__(
+        self,
+        library: _ArcticLibrary,
+        symbols: Iterable[str],
+        *,
+        lookback_days: int,
+        end: str,
+        columns: None,
+        label: str,
+    ) -> dict[str, pd.DataFrame]: ...
+
+
+class _LoadUniverseFrames(Protocol):
+    def __call__(
+        self,
+        bucket: str,
+        *,
+        symbols: list[str] | None,
+        lookback_days: int,
+        end: str,
+        region: str | None,
+    ) -> dict[str, pd.DataFrame]: ...
+
+
+_OpenArctic = Callable[..., _ArcticClient]
+_OpenUniverseLibrary = Callable[..., _ArcticLibrary]
 
 __all__ = [
     "PANEL_COLUMNS",
@@ -144,7 +192,7 @@ def _classify_absent_symbols(
     return sorted(missing), sorted(unlisted)
 
 
-def _frame_dates(frame: Any) -> np.ndarray:
+def _frame_dates(frame: pd.DataFrame) -> np.ndarray:
     """Every date a source frame carries, as a numpy array of `dt.date`.
 
     Mirrors `normalize_panel`'s own index handling exactly (``trading_day``
@@ -152,18 +200,18 @@ def _frame_dates(frame: Any) -> np.ndarray:
     can never disagree with what `normalize_panel` would have read from the
     same frame.
     """
-    import pandas as pd
+    import pandas as pd  # pyright: ignore[reportMissingTypeStubs] - pandas stubs are incomplete here
 
-    values = frame["trading_day"] if "trading_day" in frame.columns else frame.index
-    index = pd.to_datetime(values)
+    values = frame["trading_day"] if "trading_day" in frame.columns else frame.index  # pyright: ignore[reportUnknownVariableType] - pandas stubs are incomplete here
+    index = pd.to_datetime(values)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType] - pandas stubs are incomplete here
     try:
-        index = index.tz_localize(None)
+        index = index.tz_localize(None)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType] - pandas stubs are incomplete here
     except TypeError:
-        index = index.tz_convert(None)
-    return index.date
+        index = index.tz_convert(None)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType] - pandas stubs are incomplete here
+    return index.date  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType] - pandas stubs are incomplete here
 
 
-def _frame_date_bounds(frame: Any) -> tuple[dt.date, dt.date] | None:
+def _frame_date_bounds(frame: pd.DataFrame | None) -> tuple[dt.date, dt.date] | None:
     """The ``(first, last)`` date carried by a source frame, or ``None`` if empty."""
     if frame is None or len(frame) == 0:
         return None
@@ -182,7 +230,7 @@ def _overlaps_window(
 
 
 def _empty_panel() -> pd.DataFrame:
-    import pandas as pd
+    import pandas as pd  # pyright: ignore[reportMissingTypeStubs] - pandas stubs are incomplete here
 
     return pd.DataFrame({column: [] for column in PANEL_COLUMNS})
 
@@ -280,7 +328,9 @@ class PriceSource(ABC):
         """
 
 
-def normalize_panel(frames: dict[str, Any], *, end: dt.date, lookback_days: int) -> pd.DataFrame:
+def normalize_panel(
+    frames: Mapping[str, pd.DataFrame | None], *, end: dt.date, lookback_days: int
+) -> pd.DataFrame:
     """A ``{ticker: OHLCV frame}`` mapping to the canonical long panel.
 
     Shared by every source so the dedup, the tz-flattening, the column
@@ -300,7 +350,7 @@ def normalize_panel(frames: dict[str, Any], *, end: dt.date, lookback_days: int)
     ``symbols``) or raise before handing this function a frame it knows is
     empty — never carry the empty value in silently.
     """
-    import pandas as pd
+    import pandas as pd  # pyright: ignore[reportMissingTypeStubs] - pandas stubs are incomplete here
 
     start = end - dt.timedelta(days=lookback_days)
     dropped = sorted(t for t, f in frames.items() if f is None or len(f) == 0)
@@ -315,14 +365,15 @@ def normalize_panel(frames: dict[str, Any], *, end: dt.date, lookback_days: int)
         )
     rows: list[pd.DataFrame] = []
     for ticker, frame in sorted(frames.items()):
+        assert frame is not None
         block = frame.rename(columns=_OHLCV_RENAME).copy()
         if "trading_day" not in block.columns:
-            index = pd.to_datetime(block.index)
+            index = pd.to_datetime(block.index)  # pyright: ignore[reportUnknownMemberType] - pandas stubs are incomplete here
             try:
-                index = index.tz_localize(None)
+                index = index.tz_localize(None)  # pyright: ignore[reportUnknownMemberType] - pandas stubs are incomplete here
             except TypeError:
-                index = index.tz_convert(None)
-            block["trading_day"] = index.date
+                index = index.tz_convert(None)  # pyright: ignore[reportUnknownMemberType] - pandas stubs are incomplete here
+            block["trading_day"] = index.date  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType] - pandas stubs are incomplete here
         block["ticker"] = ticker
         missing = [c for c in PANEL_COLUMNS if c not in block.columns]
         if missing:
@@ -332,7 +383,7 @@ def normalize_panel(frames: dict[str, Any], *, end: dt.date, lookback_days: int)
                 "read as a zero column downstream, which is the zero-fill this layer "
                 "exists to refuse."
             )
-        rows.append(block[list(PANEL_COLUMNS)])
+        rows.append(block[list(PANEL_COLUMNS)])  # pyright: ignore[reportArgumentType] - pandas stubs are incomplete here
 
     if not rows:
         raise MissingSourceError(
@@ -341,17 +392,17 @@ def normalize_panel(frames: dict[str, Any], *, end: dt.date, lookback_days: int)
         )
 
     panel = pd.concat(rows, ignore_index=True)
-    panel["trading_day"] = pd.to_datetime(panel["trading_day"]).dt.date
-    panel = panel[(panel["trading_day"] > start) & (panel["trading_day"] <= end)]
-    panel = panel.drop_duplicates(subset=["trading_day", "ticker"], keep="last")
-    panel = panel.sort_values(["trading_day", "ticker"]).reset_index(drop=True)
-    if panel.empty:
+    panel["trading_day"] = pd.to_datetime(panel["trading_day"]).dt.date  # pyright: ignore[reportUnknownArgumentType, reportUnknownMemberType] - pandas stubs are incomplete here
+    panel = panel[(panel["trading_day"] > start) & (panel["trading_day"] <= end)]  # pyright: ignore[reportUnknownVariableType] - pandas stubs are incomplete here
+    panel = panel.drop_duplicates(subset=["trading_day", "ticker"], keep="last")  # pyright: ignore[reportCallIssue, reportUnknownMemberType, reportUnknownVariableType] - pandas stubs are incomplete here
+    panel = panel.sort_values(["trading_day", "ticker"]).reset_index(drop=True)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType] - pandas stubs are incomplete here
+    if panel.empty:  # pyright: ignore[reportUnknownMemberType] - pandas stubs are incomplete here
         raise MissingSourceError(
             f"no rows fall inside the window ({start}, {end}] after normalization. "
             "The source returned data, but none of it covers the requested trading "
             "days — a stale source, not an empty one, and the two must not read alike."
         )
-    return panel
+    return panel  # pyright: ignore[reportUnknownVariableType] - pandas stubs are incomplete here
 
 
 class FramePriceSource(PriceSource):
@@ -366,9 +417,9 @@ class FramePriceSource(PriceSource):
 
     def __init__(
         self,
-        frames: dict[str, Any],
+        frames: dict[str, pd.DataFrame],
         *,
-        retained: dict[str, Any] | None = None,
+        retained: dict[str, pd.DataFrame] | None = None,
         snapshot: str = "frames:in-memory",
     ) -> None:
         self._frames = frames
@@ -392,7 +443,7 @@ class FramePriceSource(PriceSource):
         self, *, end: dt.date, lookback_days: int, symbols: list[str]
     ) -> DepartedHistory:
         window_start = end - dt.timedelta(days=lookback_days)
-        present: dict[str, Any] = {}
+        present: dict[str, pd.DataFrame] = {}
         without: list[str] = []
         overlapping_but_empty: list[str] = []
         for ticker in sorted(set(symbols)):
@@ -403,6 +454,7 @@ class FramePriceSource(PriceSource):
             if bounds is None:
                 without.append(ticker)
                 continue
+            assert frame is not None
             dates = _frame_dates(frame)
             if ((dates > window_start) & (dates <= end)).any():
                 present[ticker] = frame
@@ -448,6 +500,7 @@ class FramePriceSource(PriceSource):
                 bounds[ticker] = b
                 if b is None:
                     continue
+                assert frame is not None
                 dates = _frame_dates(frame)
                 if ((dates > window_start) & (dates <= end)).any():
                     present.add(ticker)
@@ -539,7 +592,7 @@ class ArcticPriceSource(PriceSource):
 
     def _load_dedicated_library_frames(
         self, *, end: dt.date, lookback_days: int, symbols: list[str] | None
-    ) -> dict[str, Any]:
+    ) -> dict[str, pd.DataFrame]:
         """The generic read path a dedicated `library` override takes.
 
         Never calls `load_universe_ohlcv`/`open_universe_lib` — both are
@@ -547,15 +600,21 @@ class ArcticPriceSource(PriceSource):
         silently read the production library from a call that named a
         different one.
         """
-        from nousergon_lib.arcticdb import _load_arctic_frames, open_arctic
+        import nousergon_lib.arcticdb as arcticdb
+
+        load_frames = cast(
+            _LoadArcticFrames,
+            getattr(arcticdb, "_load_arctic_frames"),  # noqa: B009
+        )
+        open_client = cast(_OpenArctic, arcticdb.open_arctic)
 
         library = self.library
         if not library:
             raise MissingSourceError("a dedicated-library read needs a named library")
-        arctic = open_arctic(self.bucket, region=self.region)
+        arctic = open_client(self.bucket, region=self.region)
         lib = arctic.get_library(library, create_if_missing=True)
         resolved_symbols = symbols if symbols is not None else sorted(lib.list_symbols())
-        return _load_arctic_frames(
+        return load_frames(
             lib,
             resolved_symbols,
             lookback_days=lookback_days,
@@ -573,9 +632,9 @@ class ArcticPriceSource(PriceSource):
     ) -> pd.DataFrame:
         try:
             if self.library:
-                from nousergon_lib.arcticdb import _load_arctic_frames, open_arctic  # noqa: F401
+                import nousergon_lib.arcticdb as arcticdb  # noqa: F401
             else:
-                from nousergon_lib.arcticdb import load_universe_ohlcv
+                import nousergon_lib.arcticdb as arcticdb
         except ImportError as exc:
             raise MissingSourceError(
                 "the ArcticDB price source needs the `arcticdb` extra: install "
@@ -589,7 +648,8 @@ class ArcticPriceSource(PriceSource):
                     end=end, lookback_days=lookback_days, symbols=symbols
                 )
             else:
-                frames = load_universe_ohlcv(
+                load_frames = cast(_LoadUniverseFrames, arcticdb.load_universe_ohlcv)
+                frames = load_frames(
                     self.bucket,
                     symbols=symbols,
                     lookback_days=lookback_days,
@@ -670,9 +730,12 @@ class ArcticPriceSource(PriceSource):
         unlisted. Anything else, including a retention library that cannot
         be opened or read, is left to the caller's outage error.
         """
-        import pandas as pd  # pyright: ignore[reportMissingTypeStubs]
-        from nousergon_lib.arcticdb import (
-            _load_arctic_frames,  # pyright: ignore[reportUnknownVariableType, reportPrivateUsage]
+        import nousergon_lib.arcticdb as arcticdb
+        import pandas as pd  # pyright: ignore[reportMissingTypeStubs] - pandas stubs are incomplete here
+
+        load_frames = cast(
+            _LoadArcticFrames,
+            getattr(arcticdb, "_load_arctic_frames"),  # noqa: B009
         )
 
         try:
@@ -682,7 +745,7 @@ class ArcticPriceSource(PriceSource):
             held = [s for s in symbols if retention.has_symbol(s)]
             if not held:
                 return {}, []
-            frames: dict[str, pd.DataFrame] = _load_arctic_frames(
+            frames = load_frames(
                 retention,
                 held,
                 lookback_days=lookback_days,
@@ -696,8 +759,8 @@ class ArcticPriceSource(PriceSource):
                 if sym in frames:
                     continue
                 start_ts, end_ts = retention.get_description(sym).date_range
-                start, stop = pd.Timestamp(start_ts), pd.Timestamp(end_ts)
-                if not isinstance(start, pd.Timestamp) or not isinstance(stop, pd.Timestamp):
+                start, stop = pd.Timestamp(start_ts), pd.Timestamp(end_ts)  # pyright: ignore[reportArgumentType] - pandas stubs are incomplete here
+                if not isinstance(start, pd.Timestamp) or not isinstance(stop, pd.Timestamp):  # pyright: ignore[reportUnnecessaryIsInstance] - pandas stubs are incomplete here
                     continue  # NaT bounds: undecidable, left to the outage error
                 bounds = (start.date(), stop.date())
                 if not _overlaps_window(bounds, window_start=window_start, window_end=end):
@@ -706,7 +769,7 @@ class ArcticPriceSource(PriceSource):
             return {}, []
         return frames, unlisted
 
-    def _retention_lib(self) -> Any:
+    def _retention_lib(self) -> _ArcticLibrary | None:
         """The retention library, opened read-only (never created).
 
         ``None`` under a dedicated-``library`` override: that override names
@@ -719,10 +782,12 @@ class ArcticPriceSource(PriceSource):
         """
         if self.library:
             return None
-        from nousergon_lib.arcticdb import open_arctic
+        import nousergon_lib.arcticdb as arcticdb
+
+        open_client = cast(_OpenArctic, arcticdb.open_arctic)
 
         try:
-            return open_arctic(self.bucket, region=self.region).get_library(RETENTION_LIBRARY)
+            return open_client(self.bucket, region=self.region).get_library(RETENTION_LIBRARY)
         except Exception as exc:
             raise MissingSourceError(
                 f"ArcticDB retention library {RETENTION_LIBRARY!r} on bucket {self.bucket!r} "
@@ -730,17 +795,20 @@ class ArcticPriceSource(PriceSource):
                 "delisted name's history is invisible and the panel is survivors-only."
             ) from exc
 
-    def _live_lib(self) -> Any:
-        from nousergon_lib.arcticdb import open_arctic, open_universe_lib
+    def _live_lib(self) -> _ArcticLibrary:
+        import nousergon_lib.arcticdb as arcticdb
+
+        open_client = cast(_OpenArctic, arcticdb.open_arctic)
+        open_live = cast(_OpenUniverseLibrary, arcticdb.open_universe_lib)
 
         if self.library:
-            return open_arctic(self.bucket, region=self.region).get_library(
+            return open_client(self.bucket, region=self.region).get_library(
                 self.library, create_if_missing=True
             )
-        return open_universe_lib(self.bucket, region=self.region)
+        return open_live(self.bucket, region=self.region)
 
     def retained_symbols(self, *, end: dt.date, lookback_days: int) -> list[str]:
-        import pandas as pd
+        import pandas as pd  # pyright: ignore[reportMissingTypeStubs] - pandas stubs are incomplete here
 
         retention = self._retention_lib()
         if retention is None:
@@ -748,7 +816,9 @@ class ArcticPriceSource(PriceSource):
         window_start = end - dt.timedelta(days=lookback_days)
         try:
             symbols = sorted(retention.list_symbols())
-            descriptions = retention.get_description_batch(symbols) if symbols else []
+            descriptions: Iterable[_SymbolDescription] = (
+                retention.get_description_batch(symbols) if symbols else ()
+            )
         except Exception as exc:
             raise MissingSourceError(
                 f"ArcticDB retention library {RETENTION_LIBRARY!r} on bucket {self.bucket!r} "
@@ -757,13 +827,13 @@ class ArcticPriceSource(PriceSource):
         out: list[str] = []
         for sym, description in zip(symbols, descriptions, strict=True):
             start_ts, end_ts = description.date_range
-            if pd.isna(start_ts) or pd.isna(end_ts):
+            if pd.isna(start_ts) or pd.isna(end_ts):  # pyright: ignore[reportGeneralTypeIssues, reportUnknownMemberType] - pandas stubs are incomplete here
                 raise MissingSourceError(
                     f"retained symbol {sym!r} carries no date range in {RETENTION_LIBRARY!r}; "
                     "whether its history reaches this window cannot be decided, and "
                     "guessing either way would add or drop a name silently."
                 )
-            bounds = (pd.Timestamp(start_ts).date(), pd.Timestamp(end_ts).date())
+            bounds = (pd.Timestamp(start_ts).date(), pd.Timestamp(end_ts).date())  # pyright: ignore[reportArgumentType] - pandas stubs are incomplete here
             if _overlaps_window(bounds, window_start=window_start, window_end=end):
                 out.append(sym)
         return out
@@ -771,8 +841,13 @@ class ArcticPriceSource(PriceSource):
     def load_departed(
         self, *, end: dt.date, lookback_days: int, symbols: list[str]
     ) -> DepartedHistory:
-        import pandas as pd
-        from nousergon_lib.arcticdb import _load_arctic_frames
+        import nousergon_lib.arcticdb as arcticdb
+        import pandas as pd  # pyright: ignore[reportMissingTypeStubs] - pandas stubs are incomplete here
+
+        load_frames = cast(
+            _LoadArcticFrames,
+            getattr(arcticdb, "_load_arctic_frames"),  # noqa: B009
+        )
 
         wanted = sorted(set(symbols))
         if not wanted:
@@ -789,13 +864,14 @@ class ArcticPriceSource(PriceSource):
                     by_lib["retained"].append(sym)
                 else:
                     without.append(sym)
-            frames: dict[str, Any] = {}
+            frames: dict[str, pd.DataFrame] = {}
             bounds: dict[str, tuple[dt.date, dt.date] | None] = {}
             for key, lib in (("live", live), ("retained", retention)):
                 if not by_lib[key]:
                     continue
+                assert lib is not None
                 frames.update(
-                    _load_arctic_frames(
+                    load_frames(
                         lib,
                         by_lib[key],
                         lookback_days=lookback_days,
@@ -810,8 +886,8 @@ class ArcticPriceSource(PriceSource):
                     start_ts, end_ts = lib.get_description(sym).date_range
                     bounds[sym] = (
                         None
-                        if pd.isna(start_ts) or pd.isna(end_ts)
-                        else (pd.Timestamp(start_ts).date(), pd.Timestamp(end_ts).date())
+                        if pd.isna(start_ts) or pd.isna(end_ts)  # pyright: ignore[reportGeneralTypeIssues, reportUnknownMemberType] - pandas stubs are incomplete here
+                        else (pd.Timestamp(start_ts).date(), pd.Timestamp(end_ts).date())  # pyright: ignore[reportArgumentType] - pandas stubs are incomplete here
                     )
         except MissingSourceError:
             raise
@@ -852,19 +928,21 @@ class ArcticPriceSource(PriceSource):
         `MissingSourceError` by `_classify_absent_symbols` — resolving to
         ``None`` here never itself decides "unlisted", only "unresolved".
         """
-        import pandas as pd
+        import pandas as pd  # pyright: ignore[reportMissingTypeStubs] - pandas stubs are incomplete here
 
         try:
             if self.library:
-                from nousergon_lib.arcticdb import open_arctic
+                import nousergon_lib.arcticdb as arcticdb
 
-                lib = open_arctic(self.bucket, region=self.region).get_library(
+                open_client = cast(_OpenArctic, arcticdb.open_arctic)
+                lib = open_client(self.bucket, region=self.region).get_library(
                     self.library, create_if_missing=True
                 )
             else:
-                from nousergon_lib.arcticdb import open_universe_lib
+                import nousergon_lib.arcticdb as arcticdb
 
-                lib = open_universe_lib(self.bucket, region=self.region)
+                open_live = cast(_OpenUniverseLibrary, arcticdb.open_universe_lib)
+                lib = open_live(self.bucket, region=self.region)
         except Exception:
             # The library itself could not be opened: every symbol is equally
             # unresolved (`None`), so `_classify_absent_symbols` classifies all
@@ -880,10 +958,10 @@ class ArcticPriceSource(PriceSource):
                     bounds[sym] = None
                     continue
                 start_ts, end_ts = lib.get_description(sym).date_range
-                if pd.isna(start_ts) or pd.isna(end_ts):
+                if pd.isna(start_ts) or pd.isna(end_ts):  # pyright: ignore[reportGeneralTypeIssues, reportUnknownMemberType] - pandas stubs are incomplete here
                     bounds[sym] = None
                     continue
-                bounds[sym] = (pd.Timestamp(start_ts).date(), pd.Timestamp(end_ts).date())
+                bounds[sym] = (pd.Timestamp(start_ts).date(), pd.Timestamp(end_ts).date())  # pyright: ignore[reportArgumentType] - pandas stubs are incomplete here
             except Exception:
                 # A `has_symbol`/`get_description` failure for THIS symbol is not
                 # swallowed: it resolves to `None` (unresolved), and
