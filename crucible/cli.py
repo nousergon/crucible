@@ -794,6 +794,12 @@ JOBS: dict[str, JobSpec] = {
         "Publish one slot's daily output for one trading day: M feed, U cut, or S inputs",
         True,
     ),
+    "regime.daily": JobSpec(
+        "regime.daily", "Record one trading day's bounded-window market regime", True
+    ),
+    "regime.backfill": JobSpec(
+        "regime.backfill", "Backfill write-once daily market-regime documents", False
+    ),
     # `promote` and `explain` are weekly ARC stages (`components.yaml`,
     # `dispatch: arc`), so both are scheduled. Both read `False` here until
     # `alpha-engine-config-I11041` compared this table with the registry.

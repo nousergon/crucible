@@ -417,9 +417,10 @@ class TestRunServeChain:
             main=lambda argv: argvs.append(argv) or 0,
             servers=dict.fromkeys("mus"),
         )
-        assert codes == {"m": 0, "u": 0, "s": 0}
-        assert [argv[2] for argv in argvs] == ["m", "u", "s"]
-        for argv in argvs:
+        assert codes == {"regime": 0, "m": 0, "u": 0, "s": 0}
+        assert argvs[0][:3] == ["regime.daily", "--date", "2026-10-08"]
+        assert [argv[2] for argv in argvs[1:]] == ["m", "u", "s"]
+        for argv in argvs[1:]:
             assert argv[:2] == ["serve.daily", "--slot"]
             assert argv[argv.index("--date") + 1] == "2026-10-08"
             assert "--skip-if-ok" in argv
@@ -434,7 +435,20 @@ class TestRunServeChain:
         codes = run_serve_chain(
             THURSDAY, store=None, run_mode=None, main=_main, servers=dict.fromkeys("mus")
         )
-        assert codes == {"m": 1, "u": 0, "s": 0}
+        assert codes == {"regime": 0, "m": 1, "u": 0, "s": 0}
+
+    def test_a_failed_regime_step_still_serves_every_slot(self) -> None:
+        calls: list[str] = []
+
+        def _main(argv: list[str]) -> int:
+            calls.append(argv[0])
+            return 1 if argv[0] == "regime.daily" else 0
+
+        codes = run_serve_chain(
+            THURSDAY, store=None, run_mode=None, main=_main, servers=dict.fromkeys("mus")
+        )
+        assert codes == {"regime": 1, "m": 0, "u": 0, "s": 0}
+        assert calls == ["regime.daily", "serve.daily", "serve.daily", "serve.daily"]
 
     def test_a_new_daily_server_cannot_be_left_out_silently(self) -> None:
         with pytest.raises(RuntimeError, match="DAILY_CHAIN_SERVE_ORDER"):

@@ -142,6 +142,7 @@ __all__ = [
     "parse_migration_key",
     "parse_weekly_backstop_exhausted_key",
     "predictions_key",
+    "regime_key",
     "reopen_record_key",
     "retirement_log_key",
     "review_key",
@@ -613,6 +614,17 @@ def features_prefix(version: str) -> str:
     return f"features/{version}/"
 
 
+def regime_key(day: str) -> str:
+    """The write-once market-regime reading for an ISO calendar day."""
+    if ISO_DATE_RE.fullmatch(day) is None:
+        raise ValueError(f"regime day {day!r} must be YYYY-MM-DD")
+    try:
+        dt.date.fromisoformat(day)
+    except ValueError as exc:
+        raise ValueError(f"regime day {day!r} must be YYYY-MM-DD") from exc
+    return f"regime/{day}.json"
+
+
 # -- arms and slots ---------------------------------------------------------
 
 
@@ -762,7 +774,9 @@ def manifest_key(job: str, trading_day: str, *, discriminator: str | None = None
 #: these two rebound to `--date`, fails that test rather than silently
 #: re-opening this defect. A membership fact that only a human keeps true is
 #: the shape every detector in this fleet has had to be repaired from.
-RANGE_BOUND_JOBS: frozenset[str] = frozenset({"data.heal", "experiment.backfill"})
+RANGE_BOUND_JOBS: frozenset[str] = frozenset(
+    {"data.heal", "experiment.backfill", "regime.backfill"}
+)
 
 
 def manifest_prefix(job: str, trading_day: str) -> str:

@@ -39,6 +39,10 @@ VOL_WINDOW_SESSIONS: Final = 20
 LEVEL_WINDOW_SESSIONS: Final = 252
 #: Trailing window each input is z-scored against.
 ZSCORE_WINDOW_SESSIONS: Final = 504
+#: Enough source sessions to reproduce the last day's trailing input and z-score windows.
+REGIME_HISTORY_SESSIONS: Final = (
+    ZSCORE_WINDOW_SESSIONS + LEVEL_WINDOW_SESSIONS + VOL_WINDOW_SESSIONS
+)
 
 #: Fewest observations of an input a z-score is taken over. The windowed inputs
 #: (vol ratio, dispersion) are themselves NaN for their first ~270 sessions, so
@@ -141,6 +145,10 @@ class _Panel(Protocol):
     def columns(self) -> Iterable[object]: ...
 
     def __getitem__(self, key: str, /) -> object: ...
+
+
+# Public structural type for I/O adapters handing pandas frames to this pure module.
+Panel = _Panel
 
 
 Floats = npt.NDArray[np.float64]
@@ -334,3 +342,16 @@ def regime_days(frame: _Panel, params: RegimeParams) -> list[RegimeDay]:
             )
         )
     return out
+
+
+def regime_day_for_window(frame: _Panel, params: RegimeParams) -> RegimeDay:
+    """Return the final reading in a bounded history window."""
+    days = regime_days(frame, params)
+    if not days:
+        raise ValueError("the regime frame is empty")
+    return days[-1]
+
+
+def regime_document_bytes(day: RegimeDay) -> bytes:
+    """Canonical bytes shared by the daily and backfill writers."""
+    return json.dumps(day.to_document(), sort_keys=True, indent=2, allow_nan=False).encode("utf-8")

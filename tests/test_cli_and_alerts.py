@@ -80,6 +80,8 @@ def _minimal_argv(job: str) -> list[str]:
         # are required — a backfill that defaulted one end would produce a
         # range nobody named.
         argv += ["--from", "2026-08-24", "--to", "2026-08-28"]
+    if job == "regime.backfill":
+        argv += ["--from", "2026-08-24", "--to", "2026-08-28"]
     if job == "explain":
         argv += ["01JG0000000000000000000000"]
     if job == "release.pin":
@@ -211,6 +213,8 @@ class TestJobSurface:
             # history, and a stacked arm's training window is unreachable
             # from the weekly cadence alone.
             "experiment.backfill",
+            "regime.daily",
+            "regime.backfill",
             # On-demand: one operator retirement of one arm on a named ruling.
             "experiment.retire",
             "experiment.grade",
@@ -712,6 +716,10 @@ class TestDryRunNeverWrites:
             # into the excluded set: a dry run that could not refuse an arm
             # the job would refuse is the gap this issue closed.
             "experiment.backfill",
+            # Covered directly by tests/test_regime_store.py with a seeded
+            # feature layer and strategy parameter document.
+            "regime.daily",
+            "regime.backfill",
             # alpha-engine-config-I10721: `experiment.grade` left the
             # fresh-store set above for `experiment.run`'s reason, one issue
             # after it. Its dry run no longer prints a sentence restating its
