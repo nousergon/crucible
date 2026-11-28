@@ -49,7 +49,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Protocol, cast
 
 import yaml
 from pydantic import ValidationError
@@ -59,17 +59,25 @@ from crucible.calendar import resolve_trading_day
 from crucible.components import Component, load_registry
 from crucible.console.classify import STATES as COMPONENT_STATES
 from crucible.console.classify import Classification, not_yet_due
-from crucible.documents import read_store_document
+from crucible.documents import DocumentRead, read_store_document
 from crucible.features.depth import (
     FEATURES_PREFIX,
     check_feature_layer_completeness,
     check_feature_layer_depth,
     check_feature_layer_provenance,
 )
-from crucible.gate import LADDER_STATES, STANDING_SLOS, Ladder, PhaseRow
+from crucible.gate import LADDER_STATES, STANDING_SLOS, GateResult, Ladder, Phase, PhaseRow
 from crucible.keys import ALERTS_ROOT, champion_key, reopen_record_key, slot_bench_key
 from crucible.models import BoardCurrentDocument, BoardDeclarationRow
 from crucible.store import Store
+
+
+class _IssueRead(Protocol):
+    """The tracker fields the board consumes, independent of its adapter."""
+
+    problem: str | None
+    closed: bool
+
 
 __all__ = [
     "BOARD_CONSOLE_STATE",
@@ -414,7 +422,7 @@ class Declarations:
         return {**self.objectives, **self.cutover}
 
 
-def _declaration(row_id: str, source: str, body: dict[str, Any]) -> Declaration:
+def _declaration(row_id: str, source: str, body: dict[str, object]) -> Declaration:
     """`alpha-engine-config-I10045` row 11: the raw YAML body is validated
     once, whole, through `crucible.models.BoardDeclarationRow` — replacing
     the previous hand-rolled `known`/`missing` set-difference checks. The
@@ -456,16 +464,27 @@ def _declaration(row_id: str, source: str, body: dict[str, Any]) -> Declaration:
 
 @lru_cache(maxsize=1)
 def load_declarations(path: Path | None = None) -> Declarations:
-    document = yaml.safe_load((path or DECLARATION_PATH).read_text())
+    loaded: object = yaml.safe_load((path or DECLARATION_PATH).read_text())
+    if not isinstance(loaded, dict):
+        raise ValueError("board.yaml is not an object")
+    document = cast("dict[str, object]", loaded)
     if document.get("version") != 1:
         raise ValueError(f"board.yaml version {document.get('version')!r} is not 1")
+    raw_objectives: object = document.get("objectives")
+    raw_cutover: object = document.get("cutover")
+    if raw_objectives is None:
+        raw_objectives = dict[str, object]()
+    if raw_cutover is None:
+        raw_cutover = dict[str, object]()
+    if not isinstance(raw_objectives, dict) or not isinstance(raw_cutover, dict):
+        raise ValueError("board.yaml objectives and cutover must be objects")
     objectives = {
         row_id: _declaration(row_id, "objective", body)
-        for row_id, body in (document.get("objectives") or {}).items()
+        for row_id, body in cast("dict[str, dict[str, object]]", raw_objectives).items()
     }
     cutover = {
         row_id: _declaration(row_id, "cutover", body)
-        for row_id, body in (document.get("cutover") or {}).items()
+        for row_id, body in cast("dict[str, dict[str, object]]", raw_cutover).items()
     }
     if not objectives:
         raise ValueError("board.yaml declares no objectives — the board would be blind")
@@ -500,7 +519,7 @@ class Reading:
 
 def _fetch(
     store: Store, key: str, trading_day: str
-) -> tuple[dict[str, Any] | None, Reading | None]:
+) -> tuple[dict[str, object] | None, Reading | None]:
     """Read one day-keyed JSON document. Returns `(document, None)` or `(None, reading)`.
 
     Every failure mode is a DIFFERENT red, and three of them are about us
@@ -550,7 +569,7 @@ def _fetch(
     return document, None
 
 
-def _provenance(document: dict[str, Any]) -> str | None:
+def _provenance(document: dict[str, object]) -> str | None:
     for field_name in ("generated_utc", "generated_at", "trading_day"):
         value = document.get(field_name)
         if isinstance(value, str) and value.strip():
@@ -598,6 +617,7 @@ def _read_attribution(store: Store, trading_day: str) -> Reading:
             "question, which is not the same as answering it 'no'.",
             last_read=_provenance(document),
         )
+    rows = cast("list[dict[str, object]]", rows)
     provenance = _provenance(document)
     if len(rows) != len(ROWS):
         return Reading(
@@ -631,7 +651,7 @@ def _read_attribution(store: Store, trading_day: str) -> Reading:
     )
 
 
-def read_acceptance(store: Store, trading_day: str) -> tuple[dict[str, Any] | None, str]:
+def read_acceptance(store: Store, trading_day: str) -> tuple[dict[str, object] | None, str]:
     """The §2 acceptance reading for ``trading_day``, or `None` and why not.
 
     Routed through :func:`_fetch` so an absent artifact, an unreadable one and
@@ -649,11 +669,11 @@ def read_acceptance(store: Store, trading_day: str) -> tuple[dict[str, Any] | No
     return document, ""
 
 
-def _row_name(row: Any) -> str:
-    return str(row.get("name", "?")) if isinstance(row, dict) else "?"
+def _row_name(row: object) -> str:
+    return str(cast("dict[str, object]", row).get("name", "?")) if isinstance(row, dict) else "?"
 
 
-def _row_measured_nothing(row: Any) -> bool:
+def _row_measured_nothing(row: object) -> bool:
     """Whether one attribution row carries no measurement.
 
     Two conditions, because either alone is beatable. `report.py` writes the
@@ -665,6 +685,7 @@ def _row_measured_nothing(row: Any) -> bool:
     """
     if not isinstance(row, dict):
         return True
+    row = cast("dict[str, object]", row)
     if str(row.get("status", "")).startswith("N/A"):
         return True
     return row.get("value") is None
@@ -741,7 +762,7 @@ class BoardRow:
     #: (`alpha-engine-config-I9921`), and the alternative is parsing them back
     #: out of an English sentence — a contract restated as a regex, which is
     #: the bug class this repository has already paid for twice.
-    clauses: tuple[dict[str, Any], ...] | None = None
+    clauses: tuple[dict[str, object], ...] | None = None
     #: `alpha-engine-config-I10494` deliverable 3: the recorded comparison
     #: when THIS render's `earliest_satisfiable` moved backward against the
     #: previous one — `crucible.gate.EarliestSatisfiableSetback.to_dict()`,
@@ -750,7 +771,7 @@ class BoardRow:
     #: STRUCTURED field rather than folded into `detail` alone, so a future
     #: page condition (deliberately not wired yet — see the PR body) reads it
     #: rather than parsing an English sentence back out.
-    setback: dict[str, Any] | None = None
+    setback: dict[str, object] | None = None
     #: `alpha-engine-config-I10872`: the classifier state behind a
     #: `component:*` row (`crucible.console.classify.STATES`), or `None` on
     #: every other row. `state` collapses `RUNNING`, `ARMED`, `MISSED` and
@@ -782,7 +803,7 @@ class BoardRow:
     def red(self) -> bool:
         return self.state in RED_STATES
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "id": self.id,
             "source": self.source,
@@ -804,7 +825,7 @@ class BoardRow:
         }
 
 
-def _autonomy_s3_client() -> Any:
+def _autonomy_s3_client() -> object:
     """An S3 client for the CloudTrail archive read.
 
     A separate lazy constructor from `crucible.gate._s3_client`, not a call
@@ -814,9 +835,9 @@ def _autonomy_s3_client() -> Any:
     nothing to keep local. Both exist so importing this module never requires
     an AWS SDK or a credential chain.
     """
-    import boto3  # noqa: PLC0415 - lazy on purpose
+    import boto3  # pyright: ignore[reportMissingTypeStubs]  # boto3 ships no inline types
 
-    return boto3.client("s3")
+    return cast("object", boto3.client("s3"))  # pyright: ignore[reportUnknownMemberType]
 
 
 @dataclass(frozen=True)
@@ -832,11 +853,11 @@ class HumanTouchReading:
 
     month: str
     count: int
-    actions: tuple[dict[str, Any], ...]
+    actions: tuple[dict[str, object], ...]
     detail: str
     measured: bool
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "month": self.month,
             "count": self.count,
@@ -846,7 +867,7 @@ class HumanTouchReading:
         }
 
 
-def _read_human_touch_count(render_day: dt.date, *, cfn: Any | None = None) -> HumanTouchReading:
+def _read_human_touch_count(render_day: dt.date, *, cfn: object | None = None) -> HumanTouchReading:
     """The trailing-calendar-month human-touch count, read once per render.
 
     `alpha-engine-config-I10416`: generalises the SAME archive reader the
@@ -965,7 +986,7 @@ class Board:
     #: `HumanTouchReading`, `measured` or not.
     human_touch: HumanTouchReading | None = None
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "schema_version": BOARD_SCHEMA_VERSION,
             "trading_day": self.trading_day,
@@ -994,8 +1015,8 @@ def build_board(
     classifications: dict[str, Classification] | None = None,
     ladder: Ladder | None = None,
     declarations: Declarations | None = None,
-    readings: dict[str, Any] | None = None,
-    tracker_reader: Callable[[str, int], Any] | None = None,
+    readings: dict[str, GateResult] | None = None,
+    tracker_reader: Callable[[str, int], _IssueRead] | None = None,
     human_touch: HumanTouchReading | None = None,
 ) -> Board:
     """Assemble every declared row and read each one. Reads; never runs.
@@ -1104,7 +1125,7 @@ def _declared_row(
     )
 
 
-def _clause_views(reading: Any | None) -> tuple[dict[str, Any], ...] | None:
+def _clause_views(reading: GateResult | None) -> tuple[dict[str, object], ...] | None:
     """One gate's clauses as plain dicts, or `None` when nothing was read.
 
     Plain dicts rather than `Clause` objects because this travels onto
@@ -1128,14 +1149,14 @@ def _clause_views(reading: Any | None) -> tuple[dict[str, Any], ...] | None:
 def _phase_rows(
     ladder: Ladder | None,
     trading_day: str,
-    readings: dict[str, Any] | None = None,
+    readings: dict[str, GateResult] | None = None,
 ) -> list[BoardRow]:
     """One row per §6 phase, from `gate.PHASES` — never from a second list."""
     from crucible.gate import PHASES, gate_key  # noqa: PLC0415 - avoids a module import cycle
 
     supplied = readings or {}
 
-    def artifact(phase: Any) -> str:
+    def artifact(phase: Phase) -> str:
         # `phase.gate or phase.id` FABRICATES a key for every unregistered
         # phase: `gate_key` is keyed by the REGISTERED gate name, so
         # `gates/phase2/…` is a path no producer will ever write. Copying it
@@ -1145,7 +1166,7 @@ def _phase_rows(
             return "(no gate is registered for this phase)"
         return gate_key(phase.gate, trading_day)
 
-    def means_when_red(phase: Any) -> str:
+    def means_when_red(phase: Phase) -> str:
         if phase.gate is None:
             return (
                 f"no clause list is registered for phase {phase.number}, so its gate "
@@ -1184,7 +1205,7 @@ def _phase_rows(
             "gate.PHASES. A board that silently drops a declared row is the defect "
             "this board exists to make impossible."
         )
-    rows = []
+    rows: list[BoardRow] = []
     for phase in PHASES:
         ladder_row = by_id[phase.id]
         rows.append(
@@ -1207,7 +1228,7 @@ def _phase_rows(
     return rows
 
 
-def _regression_row(phase: Any, ladder_row: PhaseRow) -> BoardRow:
+def _regression_row(phase: Phase, ladder_row: PhaseRow) -> BoardRow:
     """A LATCHED phase's live clauses, as their own row.
 
     A phase latched by its closing record reads `MET` on the ladder for good
@@ -1277,7 +1298,7 @@ def _regression_row(phase: Any, ladder_row: PhaseRow) -> BoardRow:
 def _earliest_satisfiable_rows(
     store: Store,
     trading_day: str,
-    readings: dict[str, Any] | None,
+    readings: dict[str, GateResult] | None,
 ) -> list[BoardRow]:
     """One row per §6 phase carrying a registered gate: the earliest day it
     can next read MET, and the clause setting that floor.
@@ -1558,7 +1579,9 @@ def _gate_readings_fresh_row(store: Store, trading_day: str) -> BoardRow:
     )
 
 
-def _closing_rows(store: Store, tracker_reader: Callable[[str, int], Any] | None) -> list[BoardRow]:
+def _closing_rows(
+    store: Store, tracker_reader: Callable[[str, int], _IssueRead] | None
+) -> list[BoardRow]:
     """One row per §6 phase: do the tracker and the store agree it exited?
 
     `alpha-engine-config-I9967` deliverable 2's teeth. The phase rows above
@@ -1585,11 +1608,11 @@ def _closing_rows(store: Store, tracker_reader: Callable[[str, int], Any] | None
     )
     from crucible.keys import closing_record_key  # noqa: PLC0415 - symmetry with the above
 
-    def read_issue(repo: str, issue: int) -> Any:
+    def read_issue(repo: str, issue: int) -> _IssueRead:
         # The lib adapter's lenient face: never raises, and an access fault
         # is its own third fact (`IssueRead.access_problem`), rendered
         # UNMEASURABLE below rather than as a met-or-unmet verdict.
-        return tracker_adapter(repo).read_issue(issue)
+        return cast("_IssueRead", tracker_adapter(repo).read_issue(issue))
 
     reader = tracker_reader if tracker_reader is not None else read_issue
     return [
@@ -1605,10 +1628,10 @@ def _closing_rows(store: Store, tracker_reader: Callable[[str, int], Any] | None
 
 
 def _closing_row(
-    phase: Any,
+    phase: Phase,
     key: str,
-    record: Any,
-    issue: Any,
+    record: DocumentRead,
+    issue: _IssueRead,
     refusals: Callable[..., list[str]],
 ) -> BoardRow:
     """The reading for one phase's exit record. Four inputs, one closed state."""
@@ -2256,7 +2279,7 @@ class RowDelta:
         return f"{self.id}: {self.was} -> {self.now}"
 
 
-def board_delta(previous: dict[str, Any] | None, current: Board) -> list[RowDelta]:
+def board_delta(previous: dict[str, object] | None, current: Board) -> list[RowDelta]:
     """What changed since the last board.
 
     **The digest reports deltas, not absolute state.** A board reading almost
@@ -2318,7 +2341,7 @@ def render_board_html(
     board: Board,
     deltas: list[RowDelta] | None = None,
     *,
-    acceptance: dict[str, Any] | None = None,
+    acceptance: dict[str, object] | None = None,
     acceptance_note: str = "",
 ) -> str:
     """One page, every declared row, grouped by source.
@@ -2450,7 +2473,7 @@ def _clause_list_html(row: BoardRow) -> str:
     )
 
 
-def _acceptance_section(acceptance: dict[str, Any] | None, note: str) -> list[str]:
+def _acceptance_section(acceptance: dict[str, object] | None, note: str) -> list[str]:
     """§12 rule 3's one progress figure, and the clauses behind it.
 
     Never omitted. When the artifact cannot be read the section states that
@@ -2515,13 +2538,13 @@ def _acceptance_section(acceptance: dict[str, Any] | None, note: str) -> list[st
     return parts
 
 
-def _esc(value: Any) -> str:
+def _esc(value: object) -> str:
     import html  # noqa: PLC0415 - one call site, kept local to the renderer
 
     return html.escape("" if value is None else str(value))
 
 
-def pointer_may_move(previous: dict[str, Any] | None, board: Board) -> tuple[bool, str]:
+def pointer_may_move(previous: dict[str, object] | None, board: Board) -> tuple[bool, str]:
     """Whether `board/current.json` may be repointed at this board.
 
     **A replay must not clobber the pointer with an older board.** Measured on
