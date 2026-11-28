@@ -57,10 +57,13 @@ from pydantic import ValidationError as PydanticValidationError
 
 from crucible.documents import load_store_document
 from crucible.keys import (  # noqa: F401 - manifest_key/manifest_prefix re-exported
+    MONEY_PATH_CLAIMS_PREFIX,
     RUNS_ROOT,
     champion_key,
     execution_shortfall_key,
     holdout_unseal_prefix,
+    invocation_manifest_key,
+    is_invocation_manifest_key,
     is_manifest_key,
     manifest_key,
     manifest_prefix,
@@ -412,16 +415,29 @@ def money_path_manifests(store: Store) -> list[tuple[str, dict[str, Any]]]:
     store two different chains on two reads — the verifier would then call one
     of them broken at random.
     """
-    found: list[tuple[str, dict[str, Any]]] = []
+    immutable_claims = {
+        claim.get("run_id")
+        for claim_key in store.list_keys(MONEY_PATH_CLAIMS_PREFIX)
+        for claim in (load_store_document(store, claim_key),)
+        if isinstance(claim.get("manifest_key"), str)
+        and is_invocation_manifest_key(claim["manifest_key"])
+    }
+    found_by_run: dict[str, tuple[str, dict[str, Any]]] = {}  # pyright: ignore[reportExplicitAny]
     for candidate in store.list_keys(RUNS_ROOT):
-        if not is_manifest_key(candidate):
+        if not (is_manifest_key(candidate) or is_invocation_manifest_key(candidate)):
             continue
         document = load_store_document(store, candidate)
         if not money_path_writes(document):
             continue
         validate(document)
-        found.append((candidate, document))
-    return sorted(found, key=lambda pair: (pair[1]["finished"], pair[1]["run_id"]))
+        if is_manifest_key(candidate) and document["run_id"] in immutable_claims:
+            # Its claim proves this is an alias for an immutable-layout run.
+            # Do not let the alias conceal deletion of the chain record.
+            continue
+        previous = found_by_run.get(document["run_id"])
+        if previous is None or is_invocation_manifest_key(candidate):
+            found_by_run[document["run_id"]] = (candidate, document)
+    return sorted(found_by_run.values(), key=lambda pair: (pair[1]["finished"], pair[1]["run_id"]))
 
 
 def digest_of_stored(store: Store, key: str) -> str:
@@ -470,14 +486,6 @@ def _next_link(
     """The link ``manifest`` would carry against the chain as it reads NOW,
     and the head manifest it chains to (``None`` for the genesis)."""
     chain = money_path_manifests(store)
-    # A rerun of the same job on the same trading day writes the SAME key, so
-    # a predecessor that is this very manifest's key would be chaining a
-    # record to the bytes it is about to overwrite. Drop it: this run replaces
-    # that record rather than following it.
-    key = manifest_key(
-        manifest["job"], manifest["trading_day"], discriminator=manifest.get("discriminator")
-    )
-    chain = [pair for pair in chain if pair[0] != key]
     if not chain:
         genesis = {
             "index": 0,
@@ -648,7 +656,7 @@ def _claim_index(store: Store, key: str, candidate: dict[str, Any]) -> dict[str,
         )
     except PointerConflictError:
         holder = load_store_document(store, claim_key)
-        if holder.get("manifest_key") == key and not store.exists(money_path_claim_key(index + 1)):
+        if holder.get("manifest_key") == key and not store.exists(key):
             return None
         return holder
     return None
@@ -683,12 +691,34 @@ def write_manifest(
 
     Returns the manifest as written, link included.
     """
+    immutable_key = invocation_manifest_key(
+        manifest["job"],
+        manifest["trading_day"],
+        manifest["run_id"],
+        discriminator=manifest.get("discriminator"),
+    )
     writes = money_path_writes(manifest)
     if writes:
-        manifest = _claim_chain_link(store, key, manifest, writes, sleep=sleep, clock=clock)
+        manifest = _claim_chain_link(
+            store, immutable_key, manifest, writes, sleep=sleep, clock=clock
+        )
     else:
         validate(manifest)
-    store.put_bytes(key, json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8"))
+    payload = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
+    # The durable record lands first. A duplicate run id is a caller defect,
+    # even when its bytes happen to agree: create-if-absent is the contract.
+    store.compare_and_swap(immutable_key, ETAG_ABSENT, payload)
+
+    # ``key`` is the compatible latest document. Publish it with bounded CAS
+    # retries; a conflict can never roll back the immutable record above.
+    for attempt in range(6):
+        expected = store.etag(key) if store.exists(key) else ETAG_ABSENT
+        try:
+            store.compare_and_swap(key, expected, payload)
+            break
+        except PointerConflictError:
+            if attempt == 5:
+                raise
     return manifest
 
 

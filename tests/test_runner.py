@@ -21,6 +21,7 @@ import os
 
 import pytest
 
+from crucible.keys import invocation_manifest_key
 from crucible.manifest import ManifestValidationError, manifest_key, validate
 from crucible.runner import CodeShaError, ReleaseManifestError, RunContext, run_job
 from crucible.store import LocalStore
@@ -39,6 +40,33 @@ def _read_manifest_discriminated(store: LocalStore, job: str, discriminator: str
 
 
 class TestSuccessPath:
+    def test_rerun_preserves_both_invocations_and_updates_latest(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        run_ids: list[str] = []
+
+        def fail(ctx: RunContext) -> None:
+            run_ids.append(ctx.run_id)
+            raise RuntimeError("first attempt failed")
+
+        with pytest.raises(RuntimeError, match="first attempt failed"):
+            run_job("smoke", fail, store=store, trading_day=TRADING_DAY)
+
+        run_job(
+            "smoke",
+            lambda ctx: run_ids.append(ctx.run_id),
+            store=store,
+            trading_day=TRADING_DAY,
+        )
+
+        histories = [
+            json.loads(
+                store.get_bytes(invocation_manifest_key("smoke", TRADING_DAY.isoformat(), run_id))
+            )
+            for run_id in run_ids
+        ]
+        assert [document["status"] for document in histories] == ["failed", "ok"]
+        assert _read_manifest(store, "smoke")["run_id"] == run_ids[1]
+
     def test_a_clean_job_writes_an_ok_manifest(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
 

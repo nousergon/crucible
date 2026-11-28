@@ -119,12 +119,14 @@ __all__ = [
     "inst_ownership_key",
     "integration_store_key",
     "is_manifest_key",
+    "is_invocation_manifest_key",
     "ledger_key",
     "legacy_dead_lambdas_key",
     "legacy_weekly_executions_key",
     "legacy_weekly_ruling_key",
     "manifest_calendar_day",
     "manifest_key",
+    "invocation_manifest_key",
     "manifest_prefix",
     "manifest_ran_on",
     "migration_key",
@@ -742,6 +744,25 @@ def manifest_key(job: str, trading_day: str, *, discriminator: str | None = None
     return f"runs/{job}/{trading_day}/{discriminator}/{MANIFEST_BASENAME}"
 
 
+def invocation_manifest_key(
+    job: str,
+    trading_day: str,
+    run_id: str,
+    *,
+    discriminator: str | None = None,
+) -> str:
+    """The immutable record for one invocation.
+
+    ``manifest_key`` remains the compatible latest alias.  History is below
+    that alias' job/day (and optional discriminator) namespace so slot
+    histories cannot collide.
+    """
+    if not run_id or not _DISCRIMINATOR_RE.fullmatch(run_id):
+        raise ValueError(f"run_id {run_id!r} must be 1-64 characters of [A-Za-z0-9_.-]")
+    latest = manifest_key(job, trading_day, discriminator=discriminator)
+    return f"{latest.removesuffix(MANIFEST_BASENAME)}history/{run_id}/{MANIFEST_BASENAME}"
+
+
 #: The jobs whose ONE manifest is bound to the END of a range rather than to
 #: a `--date` (`alpha-engine-config-I11048`). Both handlers pass
 #: `trading_day=end` to `crucible.runner.run_job`:
@@ -972,6 +993,16 @@ def is_manifest_key(key: str) -> bool:
     discriminated manifest (`alpha-engine-config-I9879`).
     """
     return parse_manifest_key(key) is not None
+
+
+def is_invocation_manifest_key(key: str) -> bool:
+    """Whether ``key`` is a v2 immutable invocation record (not its alias)."""
+    if not key.startswith(RUNS_ROOT) or not key.endswith(f"/{MANIFEST_BASENAME}"):
+        return False
+    parts = key.split("/")
+    return (len(parts) == 6 and parts[3] == "history") or (
+        len(parts) == 7 and parts[4] == "history"
+    )
 
 
 def runs_prefix(job: str) -> str:
