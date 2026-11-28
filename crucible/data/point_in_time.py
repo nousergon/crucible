@@ -143,7 +143,7 @@ import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from crucible.data.sources import MissingSourceError
 from crucible.documents import read_document
@@ -155,7 +155,7 @@ from crucible.keys import (
 )
 
 if TYPE_CHECKING:
-    import pandas as pd
+    import pandas as pd  # pyright: ignore[reportMissingTypeStubs] -- pandas ships incomplete typing
 
 __all__ = [
     "EARLIEST_SNAPSHOT_BACKFILL_MODE",
@@ -221,7 +221,7 @@ class GicsReclassification:
     tickers: tuple[str, ...]
     source: str
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "effective_session": self.effective_session.isoformat(),
             "change": self.change,
@@ -418,7 +418,7 @@ class GroupReading:
             return "unmeasurable"
         return "FAIL"
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "group": self.group,
             "state": self.state,
@@ -463,7 +463,7 @@ class PointInTimeInputs:
         sector = next(r for r in self.readings if r.group == "sector")
         return sector.source_mode if sector.state == "measured" else None
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "sector_source_mode": self.sector_source_mode,
             "source": self.source,
@@ -482,7 +482,7 @@ _GROUP_COLUMNS: dict[str, tuple[str, ...]] = {
 
 
 def _empty_frame(symbols: Sequence[str]) -> pd.DataFrame:
-    import pandas as pd
+    import pandas as pd  # pyright: ignore[reportMissingTypeStubs] -- pandas ships incomplete typing
 
     frame = pd.DataFrame({"ticker": sorted(set(symbols))})
     frame[SECTOR_COLUMN] = pd.Series([None] * len(frame), dtype="object")
@@ -572,8 +572,8 @@ class SnapshotPointInTimeSource(PointInTimeSource):
         self._reader = reader
         self._label = label
         self._listing: dict[str, list[str]] = {}
-        self._parquet_cache: dict[str, Any] = {}
-        self._json_cache: dict[str, Any] = {}
+        self._parquet_cache: dict[str, pd.DataFrame] = {}
+        self._json_cache: dict[str, dict[str, object]] = {}
         self._sector_names_cache: dict[str, frozenset[str]] = {}
 
     def snapshot_id(self) -> str:
@@ -588,7 +588,7 @@ class SnapshotPointInTimeSource(PointInTimeSource):
 
     def _parquet(self, key: str) -> pd.DataFrame:
         if key not in self._parquet_cache:
-            import pandas as pd
+            import pandas as pd  # pyright: ignore[reportMissingTypeStubs] -- pandas ships incomplete typing
 
             try:
                 payload = self._reader.get_bytes(key)
@@ -597,10 +597,10 @@ class SnapshotPointInTimeSource(PointInTimeSource):
                     f"point-in-time snapshot {key!r} is listed but could not be read: "
                     f"{type(exc).__name__}: {exc}"
                 ) from exc
-            self._parquet_cache[key] = pd.read_parquet(io.BytesIO(payload))
+            self._parquet_cache[key] = pd.read_parquet(io.BytesIO(payload))  # pyright: ignore[reportUnknownMemberType] -- pandas read_parquet parameters are partially untyped
         return self._parquet_cache[key]
 
-    def _json(self, key: str) -> dict[str, Any]:
+    def _json(self, key: str) -> dict[str, object]:
         if key not in self._json_cache:
             read = read_document(key, lambda: self._reader.get_bytes(key))
             if read.document is None:
@@ -608,7 +608,7 @@ class SnapshotPointInTimeSource(PointInTimeSource):
                     f"point-in-time snapshot {key!r} is listed but could not be read as an "
                     f"object: {read.problem}"
                 )
-            self._json_cache[key] = read.document
+            self._json_cache[key] = cast(dict[str, object], read.document)
         return self._json_cache[key]
 
     # -- resolution ------------------------------------------------------------
@@ -617,7 +617,7 @@ class SnapshotPointInTimeSource(PointInTimeSource):
         wanted = sorted(set(symbols))
         if not wanted:
             raise ValueError("point-in-time inputs need a declared set of symbols")
-        frame = _empty_frame(wanted).set_index("ticker")
+        frame = _empty_frame(wanted).set_index("ticker")  # pyright: ignore[reportUnknownMemberType] -- pandas set_index key is untyped
         readings = (
             self._load_fundamentals(trading_day, wanted, frame),
             self._load_sector(trading_day, wanted, frame),
@@ -717,8 +717,9 @@ class SnapshotPointInTimeSource(PointInTimeSource):
         # unmeasured on the session, by name, rather than the snapshot refused.
         if "ticker" in missing:
             raise MissingSourceError(f"{key!r} carries no `ticker` column")
-        block = snapshot.drop_duplicates("ticker", keep="last").set_index("ticker")
-        covered_names = sorted(set(block.index) & set(wanted))
+        block = snapshot.drop_duplicates("ticker", keep="last").set_index("ticker")  # pyright: ignore[reportUnknownMemberType] -- pandas set_index key is untyped
+        block_names = cast("Sequence[str]", block.index)
+        covered_names = sorted(set(block_names) & set(wanted))
         reading = _coverage_reading("fundamental", key, label, covered_names, wanted)
         if reading is not None:
             return reading
@@ -728,7 +729,7 @@ class SnapshotPointInTimeSource(PointInTimeSource):
             if v1_field not in block.columns:
                 unmeasured[column] = f"{key} does not carry `{v1_field}`"
                 continue
-            values = block.loc[covered_names, v1_field].astype(float)
+            values = cast("pd.Series", block.loc[covered_names, v1_field]).astype(float)  # pyright: ignore[reportUnknownMemberType] -- pandas dtype accepts third-party dtype objects
             distinct = int(values.dropna().nunique())
             if distinct < floor:
                 unmeasured[column] = (
@@ -737,7 +738,7 @@ class SnapshotPointInTimeSource(PointInTimeSource):
                     "non-null, and not informative"
                 )
                 continue
-            frame.loc[covered_names, column] = values.to_numpy()
+            frame.loc[covered_names, column] = values.to_numpy()  # pyright: ignore[reportUnknownMemberType] -- pandas exposes numpy's partially typed dtype
         return GroupReading(
             group="fundamental",
             state="measured",
@@ -758,7 +759,7 @@ class SnapshotPointInTimeSource(PointInTimeSource):
         # D, so only labels up to a week past `day` can possibly be admissible;
         # the knowledge date itself is read from each candidate document.
         candidates = [label for label in labels if label <= day + dt.timedelta(days=7)]
-        chosen: tuple[str, dt.date, dict[str, Any]] | None = None
+        chosen: tuple[str, dt.date, dict[str, object]] | None = None
         for label in reversed(candidates):
             key = constituents_key(label)
             knowledge_date, document = self._sector_knowledge_date(key)
@@ -802,8 +803,9 @@ class SnapshotPointInTimeSource(PointInTimeSource):
         sector_map = document.get("sector_map")
         if not isinstance(sector_map, dict):
             raise MissingSourceError(f"{key!r} carries no `sector_map` object")
+        sector_map = cast(dict[str, object], sector_map)
         covered_names = sorted(
-            t for t in wanted if isinstance(sector_map.get(t), str) and sector_map[t].strip()
+            t for t in wanted if isinstance((sector := sector_map.get(t)), str) and sector.strip()
         )
         reading = _coverage_reading("sector", key, knowledge_date, covered_names, wanted)
         if reading is not None:
@@ -819,8 +821,8 @@ class SnapshotPointInTimeSource(PointInTimeSource):
             detail=f"{key} (fetched {document['fetched_at']}): {len(covered_names)} names",
         )
 
-    def _sector_knowledge_date(self, key: str) -> tuple[dt.date, dict[str, Any]]:
-        import pandas as pd
+    def _sector_knowledge_date(self, key: str) -> tuple[dt.date, dict[str, object]]:
+        import pandas as pd  # pyright: ignore[reportMissingTypeStubs] -- pandas ships incomplete typing
 
         document = self._json(key)
         fetched = document.get("fetched_at")
@@ -833,11 +835,14 @@ class SnapshotPointInTimeSource(PointInTimeSource):
         known = pd.Timestamp(fetched)
         if known.tzinfo is None:
             raise MissingSourceError(f"{key!r} `fetched_at`={fetched!r} carries no timezone")
-        return known.tz_convert(_NEW_YORK).date(), document
+        known_date = known.tz_convert(_NEW_YORK).date()
+        if not isinstance(known_date, dt.date):
+            raise MissingSourceError(f"{key!r} `fetched_at`={fetched!r} is not a date")
+        return known_date, document
 
     def _earliest_adequate_sector_snapshot(
         self, labels: list[dt.date], wanted: list[str]
-    ) -> tuple[str, dt.date, dict[str, Any]] | None:
+    ) -> tuple[str, dt.date, dict[str, object]] | None:
         """The earliest-FETCHED constituents snapshot covering the coverage floor.
 
         "Adequate" is the same :data:`GROUP_COVERAGE_FLOOR_RATIO` a
@@ -847,7 +852,7 @@ class SnapshotPointInTimeSource(PointInTimeSource):
         folder label (the two disagree, see the module docstring).
         """
         wanted_set = frozenset(wanted)
-        best: tuple[str, dt.date, dict[str, Any]] | None = None
+        best: tuple[str, dt.date, dict[str, object]] | None = None
         for label in labels:
             # A document labelled L is fetched no earlier than the evening
             # before L, so once labels pass the best knowledge date by a week
@@ -863,12 +868,13 @@ class SnapshotPointInTimeSource(PointInTimeSource):
                 best = (key, knowledge_date, document)
         return best
 
-    def _sector_names(self, key: str, document: dict[str, Any]) -> frozenset[str]:
+    def _sector_names(self, key: str, document: dict[str, object]) -> frozenset[str]:
         """The tickers a map labels, cached: a heal asks this once per session."""
         if key not in self._sector_names_cache:
             sector_map = document.get("sector_map")
             if not isinstance(sector_map, dict):
                 raise MissingSourceError(f"{key!r} carries no `sector_map` object")
+            sector_map = cast(dict[str, object], sector_map)
             self._sector_names_cache[key] = frozenset(
                 t for t, v in sector_map.items() if isinstance(v, str) and v.strip()
             )
@@ -881,11 +887,14 @@ class SnapshotPointInTimeSource(PointInTimeSource):
         frame: pd.DataFrame,
         key: str,
         knowledge_date: dt.date,
-        document: dict[str, Any],
+        document: dict[str, object],
     ) -> GroupReading:
         sector_map = document["sector_map"]
+        if not isinstance(sector_map, dict):
+            raise MissingSourceError(f"{key!r} carries no `sector_map` object")
+        sector_map = cast(dict[str, object], sector_map)
         covered_names = sorted(
-            t for t in wanted if isinstance(sector_map.get(t), str) and sector_map[t].strip()
+            t for t in wanted if isinstance((sector := sector_map.get(t)), str) and sector.strip()
         )
         frame.loc[covered_names, SECTOR_COLUMN] = [sector_map[t] for t in covered_names]
         look_ahead = tuple(
@@ -960,15 +969,16 @@ class SnapshotPointInTimeSource(PointInTimeSource):
         absent = [c for c in needed if c not in table.columns]
         if absent:
             raise MissingSourceError(f"{key!r} is missing column(s) {absent}")
-        block = table.drop_duplicates("ticker", keep="last").set_index("ticker")
-        covered_names = sorted(set(block.index) & set(wanted))
+        block = table.drop_duplicates("ticker", keep="last").set_index("ticker")  # pyright: ignore[reportUnknownMemberType] -- pandas set_index key is untyped
+        block_names = cast("Sequence[str]", block.index)
+        covered_names = sorted(set(block_names) & set(wanted))
         reading = _coverage_reading("institutional", key, known, covered_names, wanted)
         if reading is not None:
             return reading
         floor = distinctness_floor(len(covered_names))
         unmeasured: dict[str, str] = {}
         for v1_field, column in INSTITUTIONAL_COLUMNS.items():
-            values = block.loc[covered_names, v1_field].astype(float)
+            values = cast("pd.Series", block.loc[covered_names, v1_field]).astype(float)  # pyright: ignore[reportUnknownMemberType] -- pandas dtype accepts third-party dtype objects
             distinct = int(values.dropna().nunique())
             if distinct < floor:
                 unmeasured[column] = (
@@ -976,7 +986,7 @@ class SnapshotPointInTimeSource(PointInTimeSource):
                     f"{len(covered_names)} names in {key}, below the floor of {floor}"
                 )
                 continue
-            frame.loc[covered_names, column] = values.to_numpy()
+            frame.loc[covered_names, column] = values.to_numpy()  # pyright: ignore[reportUnknownMemberType] -- pandas exposes numpy's partially typed dtype
         return GroupReading(
             group="institutional",
             state="measured",
@@ -1030,39 +1040,54 @@ class FilingDatePointInTimeSource(SnapshotPointInTimeSource):
     ) -> None:
         if "schema_version" not in snapshot.columns:
             raise MissingSourceError(f"{key!r} carries no `schema_version` column")
-        versions = snapshot["schema_version"]
-        if versions.isna().any() or set(versions.dropna().unique().tolist()) != {
+        versions = _column_values(snapshot, "schema_version")
+        nonnull_versions = [value for value in versions if not _is_null(value)]
+        if len(nonnull_versions) != len(versions) or set(nonnull_versions) != {
             EDGAR_SESSION_SCHEMA_VERSION
         }:
             raise MissingSourceError(
                 f"{key!r} `schema_version` is not exactly [{EDGAR_SESSION_SCHEMA_VERSION}] "
-                f"for every row (found {sorted(versions.dropna().unique().tolist())!r}, "
-                f"{int(versions.isna().sum())} null)"
+                f"for every row (found {sorted(set(nonnull_versions), key=str)!r}, "
+                f"{len(versions) - len(nonnull_versions)} null)"
             )
         if "knowledge_date" not in snapshot.columns:
             raise MissingSourceError(f"{key!r} carries no `knowledge_date` column")
-        knowledge = snapshot["knowledge_date"]
+        knowledge = _column_values(snapshot, "knowledge_date")
         label_iso = label.isoformat()
-        if knowledge.isna().any() or set(knowledge.dropna().unique().tolist()) != {label_iso}:
+        nonnull_knowledge = [value for value in knowledge if not _is_null(value)]
+        if len(nonnull_knowledge) != len(knowledge) or set(nonnull_knowledge) != {label_iso}:
             raise MissingSourceError(
                 f"{key!r} `knowledge_date` does not equal its own label {label_iso} for "
-                f"every row (found {sorted(knowledge.dropna().unique().tolist())!r})"
+                f"every row (found {sorted(set(nonnull_knowledge), key=str)!r})"
             )
         if "latest_filed" not in snapshot.columns:
             raise MissingSourceError(f"{key!r} carries no `latest_filed` column")
-        filed = snapshot["latest_filed"]
-        if filed.isna().any():
+        filed = _column_values(snapshot, "latest_filed")
+        if any(_is_null(value) for value in filed):
             raise MissingSourceError(
                 f"{key!r} carries a null `latest_filed` for at least one row — a filing "
                 "date of unknown knowledge time cannot be admitted to any session"
             )
-        look_ahead = filed[filed > label_iso]
-        if not look_ahead.empty:
+        look_ahead = [value for value in filed if isinstance(value, str) and value > label_iso]
+        if look_ahead:
             raise MissingSourceError(
                 f"{key!r} carries `latest_filed` > its own label {label_iso} "
-                f"(e.g. {look_ahead.iloc[0]!r}) — a look-ahead in the producer, refused "
+                f"(e.g. {look_ahead[0]!r}) — a look-ahead in the producer, refused "
                 "rather than silently admitted"
             )
+
+
+def _column_values(frame: pd.DataFrame, column: str) -> list[object]:
+    """Return one pandas column behind a typed boundary."""
+    series = cast("pd.Series", frame[column])
+    return cast(list[object], series.tolist())
+
+
+def _is_null(value: object) -> bool:
+    """Apply pandas' scalar null semantics behind a typed boundary."""
+    import pandas as pd  # pyright: ignore[reportMissingTypeStubs] -- pandas ships incomplete typing
+
+    return cast(bool, pd.isna(value))  # pyright: ignore[reportUnknownMemberType] -- pandas scalar null overload includes partially typed arrays
 
 
 #: The point-in-time source PRODUCTION compiles the feature layer from.
